@@ -399,6 +399,90 @@ POST /v1/tenant/erase       →  {"tenant":"tenant-a","sessions_erased":2,"token
 
 ---
 
+## 遥测防火墙 / Telemetry firewall
+
+网关脱敏的是**模型看到的东西**。它管不到同一段提示词在 span 属性里、正飞往
+Datadog 的那份副本。
+
+而遥测里的那份更糟：模型厂商有合同、有留存策略，而可观测性后端**对每一个有看板
+账号的人可读**、留存一年、并被复制进财务当初选的那一档日志分析服务里。
+
+```
+processors: [piiredaction, batch]     # 正确
+processors: [batch, piiredaction]     # 已经晚了
+```
+
+放在 `batch` 之后照样能脱敏，但未脱敏的 span 已经在一个队列里待过，而堆转储、
+debug exporter 或崩溃日志都读得到它 —— **「我们最终会脱敏」不是任何人能作证的
+属性。**
+
+### 白名单在这里不适用
+
+文档清洗器基于**七条 JSON 路径的白名单**，因为 OpenAI 请求 schema 是有限且已知的。
+遥测恰恰相反：属性键由依赖树里每一个库自行发明，而下个季度携带 PII 的那个键现在
+还不存在。在这里用白名单，等于列出一份「已经被人发现过的泄露」清单。
+
+所以这里**扫描一切**，只跳过那些取值由 OTel 语义约定枚举出来的键
+（`http.status_code`、`rpc.system`……）—— 而跳过的理由只能是吞吐，绝不能是安全。
+`http.url`、`db.statement`、`enduser.id`、`exception.message` 一个都不在跳过清单里，
+有专门的用例钉住这件事。
+
+覆盖范围：span 名（常是带客户 ID 的 URL 路径）、属性、`status.message`、
+**span 事件**（异常消息是用运行时变量拼出来的，是一条链路里最富含 PII 的地方）、
+链接属性、日志正文、日志属性、资源属性、指标标签、exemplar 属性、以及全部**嵌套
+值**（`kvlistValue` / `arrayValue`）。
+
+`traceId` / `spanId` / `parentSpanId` **从不改写** —— 它们是不透明标识，改写脱不掉
+任何东西，却会打断它们所属的每一条链路：泄露还在，可观测性没了。
+
+### 遥测不许用 mask
+
+这是配置层的硬约束，构造期就拒绝：
+
+```
+遥测链路不得使用 mask 算子：占位符按不同值在会话保险库中铸造，
+而遥测没有会话——每个不同的值都会留下一条永不被解析的记录，
+保险库随流量增长；用在指标标签上还会让基数炸弹原样存活。
+请改用 hash（保住聚合）或 drop
+```
+
+`hash` 在**有界基数**下保住了聚合能力 —— 同一个用户是同一个摘要，`group by` 仍能
+统计去重用户数：
+
+```
+13812345678  →  [hash:phone:3ab040e5]
+13812345678  →  [hash:phone:3ab040e5]      同一条时间序列
+13900001111  →  [hash:phone:1131773c]
+```
+
+### 两个模块
+
+| 模块 | 依赖 | 用途 |
+|---|---|---|
+| `pii/telemetry` | 零外部依赖 | 防火墙 + OTLP/JSON 遍历器 |
+| `otelprocessor/` | collector pdata | 真正的 Collector 处理器 |
+
+分开是因为 collector 的 pdata 会带进一棵庞大的依赖树，而一个做 PII 脱敏的库不该把
+它强加给只想扫自己那份 JSON 的调用方。CI 里两个模块**分别跑** —— 「单独成模块」在
+CI 里最容易变成「没人跑」。
+
+`pii/telemetry` 的 OTLP/JSON 遍历器同时认 `traceId` 与 `trace_id`、`stringValue` 与
+`string_value`：两种拼写都是合法 OTLP/JSON，真实 SDK 依编码器不同各自输出，
+**只认一种会在一半流量上静默地什么都不访问，然后报告成功。**
+
+### 失败的方向是反的
+
+请求路径上阻断一个请求代价高昂且可见。这里的取舍反过来：丢一个 span 的代价是看板
+上少一段，而漏一个 span 会被复制进一个留存一年、人人可读的后端。所以
+`failure_mode: drop` 是默认值，检测器故障时批次不到达 exporter。
+
+`forward` 存在，是因为少数部署宁可失去这个保证也不愿失去遥测 —— 而这个选择应当
+写在配置里，而不是由某个回退行为暗示。
+
+实测：**10 个 span / 每个 3 个文本字段 ≈ 101µs**（约 3.4µs/字段）。
+
+---
+
 ## 设计决策
 
 几个不那么显然、但踩过坑才定下来的选择。
@@ -428,6 +512,11 @@ POST /v1/tenant/erase       →  {"tenant":"tenant-a","sessions_erased":2,"token
 packs），新增意大利/德国/西班牙识别器后，跑起来的二进制用的仍是老副本 ——
 包装好了，业务上一个也没生效，且没有任何报错。
 
+**pdata 的 MoveTo/CopyTo 会产出独立副本。** OTel 处理器的第一版用它来隔离每个
+资源，结果：能编译、能运行、还会报告自己脱敏了多少字段 —— 然后原样转发了原批次。
+探针用例当场坐实了这一点（`改写副本后，原批次里的 span 名 = "原始名"`），
+现在遍历器一律就地改写。
+
 **这个越权漏洞曾经是活的。** 在引入租户之前，会话保险库只以调用方提供的
 `session_id` 作键。租户 B 拿同一个 `session_id` 调 `/v1/restore`，会原样拿回
 租户 A 的姓名和手机号**明文** —— 不是令牌、不是摘要，是值本身。这比令牌层的
@@ -450,6 +539,8 @@ packs），新增意大利/德国/西班牙识别器后，跑起来的二进制�
 
 **未验证**
 
+- OTel 处理器只在进程内用 `consumertest` sink 验证，未在真实 Collector 二进制里
+  用 `ocb` 构建并接入过真实后端
 - Testcontainers 集成用例（开发机无 Docker，代码写好但容器行为未实测）
 - 生产规模压测
 
@@ -463,6 +554,8 @@ packs），新增意大利/德国/西班牙识别器后，跑起来的二进制�
 ```
 pii/          脱敏引擎（公开 API，零外部依赖）
 pii/detect/packs/    国家合规包 + 租户 YAML 规则加载器
+pii/telemetry/       遥测防火墙（零外部依赖，含 OTLP/JSON 遍历器）
+otelprocessor/       OTel Collector 处理器（独立模块，依赖 pdata）
 gpuload/      GPU 显存感知准入（公开 API）
 sidecar/      HTTP 服务实现
 cmd/airlock-agent/   sidecar 二进制

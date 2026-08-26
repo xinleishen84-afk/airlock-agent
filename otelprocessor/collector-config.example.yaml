@@ -1,0 +1,73 @@
+# OpenTelemetry Collector 配置示例 / Example Collector configuration
+#
+# 处理器的位置是这份配置里最要紧的一行。
+# The processor's position is the most important line in this file.
+receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: 0.0.0.0:4317}
+      http: {endpoint: 0.0.0.0:4318}
+
+processors:
+  piiredaction:
+    # 必填，无默认值。默认值只能选定一个本土市场，在别处都静默地错：
+    # 用美国包扫意大利链路会报告零 PII，读起来像「遥测很干净」。
+    # Required, no default: a default would pick a home market and be
+    # silently wrong everywhere else.
+    jurisdictions: [GEN, CN]
+
+    # 单实例单租户用 tenant；共享 collector 用 tenant_attribute，
+    # 让同一批次内不同资源各自归属自己的租户。
+    # tenant for a dedicated collector; tenant_attribute for a shared one.
+    tenant: acme
+    # tenant_attribute: tenant.id
+
+    # hash 保住聚合（同一个用户是同一个摘要，group-by 仍能去重计数）；
+    # drop 用在连这层关联都嫌多的场合。
+    # 不提供 mask：占位符按不同值在会话保险库中铸造，而遥测没有会话。
+    # hash preserves aggregation; drop is for when even that link is too much.
+    strategy: hash
+
+    # 密钥不在这里。collector 配置会以 ConfigMap 挂载、被复制进镜像、
+    # 被粘进工单；密钥属于一个单独流转的密钥卷。
+    # The key is not in this file: a collector config travels everywhere.
+    hash_key_file: /var/run/secrets/airlock/hash-key
+
+    # 一段堆栈可以有几百 KB，而正则层耗时与输入长度成线性。
+    # 超长的值被截断而非跳过——跳过等于把整段原样转发。
+    # Oversized values are truncated, never skipped.
+    max_value_bytes: 32768
+
+    # drop：丢一个 span 的代价是看板上少一段；
+    # 漏一个 span 会被复制进一个留存一年、人人可读的后端。
+    # drop: a lost span costs a dashboard gap; a leaked one is forever.
+    failure_mode: drop
+
+  batch: {}
+
+exporters:
+  otlphttp:
+    endpoint: https://observability.example.com
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      # piiredaction 必须在 batch 之前。
+      #
+      # 放在 batch 之后照样能脱敏，但未脱敏的 span 已经在一个队列里待过，
+      # 而堆转储、debug exporter 或崩溃日志都读得到它——
+      # 「我们最终会脱敏」不是任何人能作证的属性。
+      #
+      # piiredaction must come before batch. After batch it still redacts, but
+      # the unredacted spans have already sat in a queue a heap dump can read.
+      processors: [piiredaction, batch]
+      exporters: [otlphttp]
+    logs:
+      receivers: [otlp]
+      processors: [piiredaction, batch]
+      exporters: [otlphttp]
+    metrics:
+      receivers: [otlp]
+      processors: [piiredaction, batch]
+      exporters: [otlphttp]

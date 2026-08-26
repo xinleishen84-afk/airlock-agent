@@ -36,6 +36,38 @@ jobs:
           go test ./... -coverprofile=coverage.out -covermode=atomic
           go tool cover -func=coverage.out | tail -1
 
+  # OTel 处理器：单独成模块，因此需要单独跑
+  #
+  # 分开的理由与集成测试相同：collector 的 pdata 会带进一棵庞大的依赖树，
+  # 而主模块的卖点之一是零外部依赖。但「单独成模块」在 CI 里最容易变成
+  # 「没人跑」——主模块的 go test ./... 根本走不进这个目录，
+  # 于是它可以坏上几个月而全绿依旧。
+  otel-processor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache-dependency-path: otelprocessor/go.sum
+
+      - name: 格式检查
+        working-directory: otelprocessor
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化：" && echo "$out"
+            exit 1
+          fi
+
+      - name: vet
+        working-directory: otelprocessor
+        run: go vet ./...
+
+      - name: 单元测试（含竞态检测）
+        working-directory: otelprocessor
+        run: go test ./... -race -count=1 -timeout 5m
+
   # 配置自检：验证装配结果
   #
   # 与单元测试的分工：单元测试跑的是组件逻辑，dry-run 跑的是装配结果。
