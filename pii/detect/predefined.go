@@ -122,6 +122,18 @@ func predefinedSpecs() []predefinedSpec {
 			},
 		},
 		{
+			// IBAN carries its own check digits, so a false positive is nearly
+			// impossible once mod-97 passes — hence the high base score.
+			// IBAN 自带校验位，一旦通过 mod-97 几乎不可能是误报，故基线分很高。
+			name: "iban", entityType: TypeIBAN, score: 0.95,
+			expr: `[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]{4}){2,7}[A-Z0-9]{0,4}`,
+			opts: []PatternOption{
+				WithBoundary(boundaryAlnum),
+				WithValidator(IBANValid, true),
+				WithContext(contextBoost, "iban", "账号", "account", "银行"),
+			},
+		},
+		{
 			name: "cn_uscc", entityType: TypeUSCC, score: 0.90,
 			expr: `[0-9A-HJ-NPQRTUWXY]{2}[0-9]{6}[0-9A-HJ-NPQRTUWXY]{10}`,
 			opts: []PatternOption{

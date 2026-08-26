@@ -31,7 +31,8 @@ const (
 	// it exists so a custom recognizer has a type to report.
 	// 涵盖部署特有的标识：工号、合同编号、客户代码。
 	// 没有内置识别器产出它——它的存在是为了让自定义识别器有类型可报。
-	TypeAccount EntityType = "ACCOUNT" // unified social credit code / 统一社会信用代码
+	TypeAccount EntityType = "ACCOUNT"
+	TypeIBAN    EntityType = "IBAN" // international bank account / 国际银行账号 // unified social credit code / 统一社会信用代码
 )
 
 // NERDependentTypes are the types regexes cannot find, requiring a gazetteer or

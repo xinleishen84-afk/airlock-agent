@@ -136,3 +136,83 @@ func stripSeparators(s string) string {
 	}
 	return b.String()
 }
+
+// ibanLengths maps a country code to the exact total IBAN length for that
+// country. Length is part of the standard, not a convention — a 22-character
+// string claiming to be a German IBAN is invalid regardless of its check digits.
+// 把国家代码映射到该国 IBAN 的确切总长度。长度是标准的一部分而非约定——
+// 一个自称德国 IBAN 的 22 字符串，无论校验位如何都是非法的。
+var ibanLengths = map[string]int{
+	"AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28, "BA": 20, "BE": 16,
+	"BG": 22, "BH": 22, "BR": 29, "BY": 28, "CH": 21, "CR": 22, "CY": 28,
+	"CZ": 24, "DE": 22, "DK": 18, "DO": 28, "EE": 20, "EG": 29, "ES": 24,
+	"FI": 18, "FO": 18, "FR": 27, "GB": 22, "GE": 22, "GI": 23, "GL": 18,
+	"GR": 27, "GT": 28, "HR": 21, "HU": 28, "IE": 22, "IL": 23, "IQ": 23,
+	"IS": 26, "IT": 27, "JO": 30, "KW": 30, "KZ": 20, "LB": 28, "LC": 32,
+	"LI": 21, "LT": 20, "LU": 20, "LV": 21, "LY": 25, "MC": 27, "MD": 24,
+	"ME": 22, "MK": 19, "MR": 27, "MT": 31, "MU": 30, "NL": 18, "NO": 15,
+	"PK": 24, "PL": 28, "PS": 29, "PT": 25, "QA": 29, "RO": 24, "RS": 22,
+	"SA": 24, "SC": 31, "SE": 24, "SI": 19, "SK": 24, "SM": 27, "ST": 25,
+	"SV": 28, "TL": 23, "TN": 24, "TR": 26, "UA": 29, "VA": 22, "VG": 24,
+	"XK": 20,
+}
+
+// IBANValid validates an IBAN per ISO 13616 / ISO 7064 mod-97-10.
+// 按 ISO 13616 / ISO 7064 mod-97-10 校验 IBAN。
+//
+// The algorithm: move the first four characters to the end, map each letter to
+// two digits (A=10 … Z=35), then read the result as one large integer and
+// require it to be congruent to 1 modulo 97.
+// 算法：把前四个字符移到末尾，每个字母映射为两位数字（A=10…Z=35），
+// 再把结果当作一个大整数，要求它模 97 余 1。
+//
+// The number can reach 34 characters, far beyond int64, so the modulus is taken
+// incrementally digit by digit. Trying to parse it as an integer first would
+// overflow silently and validate garbage.
+// 这个数最长可达 34 位，远超 int64，因此按位增量取模。
+// 先解析成整数会静默溢出，从而放行垃圾数据。
+func IBANValid(value string) bool {
+	v := strings.ToUpper(strings.Map(func(r rune) rune {
+		if r == ' ' || r == '-' {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(value)))
+
+	if len(v) < 15 || len(v) > 34 {
+		return false
+	}
+	// First two characters are the country code, next two the check digits.
+	// 前两位是国家代码，接下来两位是校验位。
+	country := v[:2]
+	want, known := ibanLengths[country]
+	if !known || len(v) != want {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		if v[i] < 'A' || v[i] > 'Z' {
+			return false
+		}
+		if v[i+2] < '0' || v[i+2] > '9' {
+			return false
+		}
+	}
+
+	rearranged := v[4:] + v[:4]
+	remainder := 0
+	for i := 0; i < len(rearranged); i++ {
+		c := rearranged[i]
+		switch {
+		case c >= '0' && c <= '9':
+			remainder = (remainder*10 + int(c-'0')) % 97
+		case c >= 'A' && c <= 'Z':
+			// A letter expands to two digits, so the modulus advances twice.
+			// 字母展开为两位数字，因此取模要推进两次。
+			n := int(c-'A') + 10
+			remainder = (remainder*100 + n) % 97
+		default:
+			return false
+		}
+	}
+	return remainder == 1
+}
