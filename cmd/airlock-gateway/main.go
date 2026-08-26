@@ -1,4 +1,4 @@
-// Command gateway 是企业级 AI 统一网关。
+// Command airlock-gateway 是企业级 AI 统一网关。
 //
 // 职责（第 ① 层）：极速拦截 Prompt、PII 双向脱敏、零信任凭证注入、
 // 会话安全审计、Token 滑窗限流，全链路 SSE 流式推流。

@@ -157,11 +157,16 @@ type CRDOptions struct {
 // DefaultCRDOptions 返回默认的 CRD 元数据。
 func DefaultCRDOptions() CRDOptions {
 	return CRDOptions{
-		Group:    "gateway.ai.enterprise.io",
+		// CRD group 是集群内的永久标识：一旦有资源用它创建过，
+		// 改 group 等于换一个全新的 CRD，旧资源全部失效。发布前必须定死。
+		// The CRD group is a permanent cluster-wide identifier: once resources
+		// exist under it, changing it means a brand-new CRD and every existing
+		// resource becomes orphaned. It must be settled before release.
+		Group:    "airlock.sh",
 		Version:  "v1alpha1",
-		Kind:     "AIGatewayConfig",
-		Plural:   "aigatewayconfigs",
-		Singular: "aigatewayconfig",
+		Kind:     "AirlockConfig",
+		Plural:   "airlockconfigs",
+		Singular: "airlockconfig",
 	}
 }
 

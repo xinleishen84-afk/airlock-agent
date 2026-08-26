@@ -50,7 +50,7 @@ jobs:
           go-version: '1.27'
 
       - name: 构建
-        run: go build -o /tmp/airlock ./cmd/gateway
+        run: go build -o /tmp/airlock ./cmd/airlock-gateway
 
       # CI 里没有真实的 Vault/K8s Secret 挂载，用 fixture 顶上。
       # 校验的是「装配流程能否走通」，不是「密钥内容是否正确」。
@@ -65,8 +65,8 @@ jobs:
       - name: CRD 未漂移
         run: |
           /tmp/airlock --print-crd > /tmp/crd.yaml
-          if ! diff -u configs/aigatewayconfig-crd.yaml /tmp/crd.yaml; then
-            echo "::error::CRD 与代码不一致，请运行 go run ./cmd/gateway --print-crd > configs/aigatewayconfig-crd.yaml"
+          if ! diff -u configs/airlockconfig-crd.yaml /tmp/crd.yaml; then
+            echo "::error::CRD 与代码不一致，请运行 go run ./cmd/airlock-gateway --print-crd > configs/airlockconfig-crd.yaml"
             exit 1
           fi
 

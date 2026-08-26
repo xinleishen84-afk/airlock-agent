@@ -100,7 +100,7 @@ vLLM 开始抢占换出，在途请求被反复重算，整个后端进入活锁
 ```bash
 docker run -p 8888:8888 \
   -v ./names.txt:/rosters/names.txt \
-  ghcr.io/<your-org>/ai-gateway-shield \
+  ghcr.io/xinleishen84-afk/airlock-agent \
   --name-roster /rosters/names.txt \
   --ner http://ner-service:8000/v1/detect
 ```
@@ -134,26 +134,40 @@ curl -X POST localhost:8888/v1/restore -d '{
 # -> {"payload":{"choices":[{"delta":{"content":"已通知 张伟"}}]},"restored":1}
 ```
 
-### 作为 Go 库
+### 作为 Go 库 / As a Go library
 
 ```go
-import "github.com/xinleishen84-afk/airlock-agent/pii"
+import (
+    "github.com/xinleishen84-afk/airlock-agent/pii/detect"
+    "github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+    "github.com/xinleishen84-afk/airlock-agent/pii/document"
+)
 
-detector := pii.NewCompositeDetector([]pii.Detector{
-    pii.NewRegexDetector(),                    // 手机/身份证/银行卡/密钥，带校验位
-    gazetteer,                                 // 企业主数据名册
-    pii.NewRemoteNERDetector(nerOpts),         // 本地 NER 模型
-}, 0)
+// 检测层：内置识别器 + 你自己的实体类型
+// Detection: built-in recognizers plus your own entity types
+reg, _ := detect.NewDefaultRegistry()
+custom, _ := detect.NewPatternRecognizer(
+    "employee_id", detect.TypeAccount, `EMP-[0-9]{6}`, 0.95,
+    detect.WithContext(0.15, "工号", "employee"))
+reg.Register(custom)
 
-redactor := pii.NewRedactor(detector, true /* failClosed */)
+// 脱敏层：会话映射保证占位符跨轮次稳定
+// Anonymization: the session vault keeps placeholders stable across turns
+redactor := anonymize.NewRedactor(reg, true /* failClosed */)
+vaults := anonymize.NewVaultRegistry(time.Hour, 100_000)
 vault, _ := vaults.Get(sessionID)
 
-// 结构化定向清洗：只碰白名单路径
-err := pii.SanitizeDocument(doc, func(text string) (string, error) {
+// 结构化定向清洗：只碰白名单路径，协议骨架永不被访问
+// Targeted sanitization: only allowlisted paths, skeleton never visited
+err := document.SanitizeDocument(payload, func(text string) (string, error) {
     res, err := redactor.Redact(text, vault)
     return res.Text, err
 })
 ```
+
+三层可以单独使用。只想扫描审计不改数据的，只 import `detect` 即可。
+The three layers are usable independently: import only `detect` if you want to
+scan and audit without modifying anything.
 
 ---
 
@@ -207,8 +221,8 @@ err := pii.SanitizeDocument(doc, func(text string) (string, error) {
 pii/          脱敏引擎（公开 API，零外部依赖）
 gpuload/      GPU 显存感知准入（公开 API）
 sidecar/      HTTP 服务实现
-cmd/shield/   sidecar 二进制
-cmd/gateway/  参考网关实现（完整的 AI 网关，用于演示扩展如何集成）
+cmd/airlock-agent/   sidecar 二进制
+cmd/airlock-gateway/  参考网关实现（完整的 AI 网关，用于演示扩展如何集成）
 internal/     参考网关专用的内部包
 ```
 

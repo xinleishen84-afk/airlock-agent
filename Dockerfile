@@ -15,10 +15,10 @@ COPY . .
 # CGO_ENABLED=0 产出静态二进制，才能跑在 distroless/static 上
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags="-s -w" \
-    -o /shield ./cmd/shield
+    -o /airlock-agent ./cmd/airlock-agent
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /shield /shield
+COPY --from=build /airlock-agent /airlock-agent
 
 # 以非 root 运行。distroless 的 nonroot 标签内置了 uid 65532
 USER nonroot:nonroot
@@ -26,5 +26,5 @@ EXPOSE 8888
 
 # 健康检查交给编排层（K8s probe），镜像里不装 curl——
 # 装了就等于给攻击者留了一个现成的外联工具
-ENTRYPOINT ["/shield"]
+ENTRYPOINT ["/airlock-agent"]
 CMD ["--addr", ":8888"]

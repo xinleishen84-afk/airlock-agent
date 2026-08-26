@@ -1,4 +1,4 @@
-// Command shield 是 PII 脱敏 sidecar。
+// Command airlock-agent 是 PII 脱敏 sidecar。
 //
 // 它把结构化 AST 定向脱敏引擎暴露为 HTTP 服务，任何网关都能接：
 // Envoy（经 ext_proc 适配）、APISIX（serverless 插件）、Kong（plugin）、

@@ -421,7 +421,7 @@ func TestCRDGenerates(t *testing.T) {
 	body := string(out)
 	for _, want := range []string{
 		"apiextensions.k8s.io/v1", "CustomResourceDefinition",
-		"AIGatewayConfig", "openAPIV3Schema", "additionalProperties: false",
+		"AirlockConfig", "openAPIV3Schema", "additionalProperties: false",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("CRD 缺少 %q", want)

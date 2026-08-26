@@ -17,7 +17,7 @@ import (
 //
 // 本用例让漂移在 CI 就被拦下。修法：`gateway --print-crd > configs/....yaml`
 func TestCRDInSyncWithCode(t *testing.T) {
-	path := filepath.Join("..", "..", "configs", "aigatewayconfig-crd.yaml")
+	path := filepath.Join("..", "..", "configs", "airlockconfig-crd.yaml")
 	onDisk, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读取 CRD 失败（是否忘了生成？）：%v", err)
@@ -27,9 +27,9 @@ func TestCRDInSyncWithCode(t *testing.T) {
 		t.Fatalf("生成 CRD 失败: %v", err)
 	}
 	if string(onDisk) != string(generated) {
-		t.Errorf("configs/aigatewayconfig-crd.yaml 与代码不一致。\n" +
+		t.Errorf("configs/airlockconfig-crd.yaml 与代码不一致。\n" +
 			"schema 已漂移，APIServer 侧的拦截会与网关实际接受的字段对不上。\n" +
-			"修法：go run ./cmd/gateway --print-crd > configs/aigatewayconfig-crd.yaml")
+			"修法：go run ./cmd/gateway --print-crd > configs/airlockconfig-crd.yaml")
 	}
 }
 
