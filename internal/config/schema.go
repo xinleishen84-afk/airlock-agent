@@ -97,6 +97,9 @@ func customSchema(t reflect.Type) *Schema {
 	case reflect.TypeOf(EntityTypeName("")):
 		return &Schema{Type: "string", Enum: EntityTypeNames(),
 			Description: "PII 实体类型"}
+	case reflect.TypeOf(JurisdictionCode("")):
+		return &Schema{Type: "string", Enum: JurisdictionCodes(),
+			Description: "国家合规包代码"}
 	case reflect.TypeOf(TaskName("")):
 		return &Schema{Type: "string", Enum: TaskNames(),
 			Description: "任务类型，用于路由定级"}

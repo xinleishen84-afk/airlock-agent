@@ -32,7 +32,7 @@ const (
 	// 涵盖部署特有的标识：工号、合同编号、客户代码。
 	// 没有内置识别器产出它——它的存在是为了让自定义识别器有类型可报。
 	TypeAccount EntityType = "ACCOUNT"
-	TypeIBAN    EntityType = "IBAN" // international bank account / 国际银行账号 // unified social credit code / 统一社会信用代码
+	TypeIBAN    EntityType = "IBAN" // international bank account / 国际银行账号
 )
 
 // NERDependentTypes are the types regexes cannot find, requiring a gazetteer or
@@ -82,7 +82,15 @@ type Detector interface {
 // 是后置校验函数，用于把「看起来像」收紧为「确实是」。
 type validatorFunc func(string) bool
 
-// boundaryClass describes the character class forbidden on either side of an
+// BoundaryClass is exported because jurisdiction packs and tenant YAML rules
+// live outside this package and need the same boundary semantics as the
+// built-ins. A recognizer that cannot express its boundaries is not equivalent
+// to a built-in one, and the whole point of pluggable packs is that they are.
+// 之所以导出，是因为司法管辖区包与租户 YAML 规则都在本包之外，
+// 它们需要与内置识别器相同的边界语义。无法表达边界的识别器与内置识别器
+// 并不等价，而可插拔包的全部意义正在于两者等价。
+//
+// BoundaryClass describes the character class forbidden on either side of an
 // entity.
 // 描述实体两侧不允许出现的字符类。
 //
@@ -104,13 +112,13 @@ type validatorFunc func(string) bool
 // 会因失去前导哨兵而漏检；更严重的是，正则匹配与后置校验之间没有回溯，
 // 一个贪婪但校验失败的匹配会把扫描位置推过真正的目标。
 // 手工边界检查两个问题都不存在。
-type boundaryClass uint8
+type BoundaryClass uint8
 
 const (
-	boundaryNone     boundaryClass = iota // no boundary constraint / 不做边界约束
-	boundaryDigit                         // no digit on either side / 两侧不得为数字
-	boundaryDigitSep                      // no digit or hyphen / 两侧不得为数字或连字符
-	boundaryAlnum                         // no alphanumeric / 两侧不得为字母数字
+	BoundaryNone     BoundaryClass = iota // no boundary constraint / 不做边界约束
+	BoundaryDigit                         // no digit on either side / 两侧不得为数字
+	BoundaryDigitSep                      // no digit or hyphen / 两侧不得为数字或连字符
+	BoundaryAlnum                         // no alphanumeric / 两侧不得为字母数字
 )
 
 // isBoundaryOK checks whether the characters flanking an entity satisfy the
@@ -122,17 +130,17 @@ const (
 // naturally fall outside all of them.
 // 只看紧邻的一个字节：这几类约束的字符集都在 ASCII 内，
 // 多字节 UTF-8 字符的首/尾字节恒 >= 0x80，天然不属于任何禁止集。
-func isBoundaryOK(text string, start, end int, class boundaryClass) bool {
-	if class == boundaryNone {
+func isBoundaryOK(text string, start, end int, class BoundaryClass) bool {
+	if class == BoundaryNone {
 		return true
 	}
 	forbidden := func(b byte) bool {
 		switch class {
-		case boundaryDigit:
+		case BoundaryDigit:
 			return b >= '0' && b <= '9'
-		case boundaryDigitSep:
+		case BoundaryDigitSep:
 			return (b >= '0' && b <= '9') || b == '-'
-		case boundaryAlnum:
+		case BoundaryAlnum:
 			return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 		}
 		return false
@@ -144,168 +152,6 @@ func isBoundaryOK(text string, start, end int, class boundaryClass) bool {
 		return false
 	}
 	return true
-}
-
-// rule is one detection rule. The pattern is bare; the boundary constraint is
-// expressed separately by the boundary field.
-// 是一条检测规则。模式为裸模式，边界由 boundary 字段单独表达。
-type rule struct {
-	typ        EntityType
-	re         *regexp.Regexp
-	confidence float64
-	boundary   boundaryClass
-	validate   validatorFunc // post-check; nil means none / 后置校验，nil 表示无
-	normalize  bool          // strip separators before validating / 校验前剥离分隔符
-}
-
-// buildRules builds the rule table. A function rather than a package-level var,
-// so rules can be trimmed by configuration.
-// 构造规则表。用函数而非包级变量，便于按配置裁剪。
-func buildRules(disabled map[EntityType]bool) []rule {
-	all := []rule{
-		// Email: stable shape, no boundary needed / 邮箱：结构稳定，无需边界约束
-		{typ: TypeEmail, confidence: 0.99, boundary: boundaryNone,
-			re: regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)},
-
-		// Chinese ID: 18 chars, last may be X / 身份证：18 位，末位可为 X
-		{typ: TypeIDCard, confidence: 0.99, boundary: boundaryDigit, validate: CNIDCardValid,
-			re: regexp.MustCompile(`[0-9]{17}[0-9Xx]`)},
-
-		// Mainland China mobile number / 中国大陆手机号
-		{typ: TypePhone, confidence: 0.95, boundary: boundaryDigitSep,
-			re: regexp.MustCompile(`1[3-9][0-9]{9}`)},
-		// Landline: area code - number / 国内固话：区号-号码
-		{typ: TypePhone, confidence: 0.90, boundary: boundaryDigitSep,
-			re: regexp.MustCompile(`0[0-9]{2,3}-[0-9]{7,8}`)},
-		// International: requires a leading +, otherwise far too noisy
-		// 国际号码：必须带 + 前缀，否则误报率过高
-		{typ: TypePhone, confidence: 0.90, boundary: boundaryDigit,
-			re: regexp.MustCompile(`\+[0-9]{1,3}[\s\-]?[0-9]{6,14}`)},
-
-		// Bank card: two shapes — four-digit groups, or a continuous run.
-		// Deliberately not `(?:[0-9][ \-]?){12,19}`: that greedily crosses
-		// separators, joining two adjacent runs into one match that must fail
-		// the checksum, swallowing the real card number.
-		// 银行卡：分「四位分组」与「连续数字」两种形态。刻意不用贪婪模式——
-		// 那会跨越分隔符把相邻数字串连成一个必然校验失败的匹配，吞掉真卡号。
-		{typ: TypeBankCard, confidence: 0.95, boundary: boundaryDigitSep,
-			validate: LuhnValid, normalize: true,
-			re: regexp.MustCompile(`[0-9]{4}(?:[ \-][0-9]{4}){2,4}`)},
-		{typ: TypeBankCard, confidence: 0.95, boundary: boundaryDigitSep,
-			validate: LuhnValid,
-			re:       regexp.MustCompile(`[0-9]{12,19}`)},
-
-		// Unified social credit code: must pass the check digit
-		// 统一社会信用代码：必须过校验位
-		{typ: TypeUSCC, confidence: 0.95, boundary: boundaryAlnum, validate: CNUSCCValid,
-			re: regexp.MustCompile(`[0-9A-HJ-NPQRTUWXY]{2}[0-9]{6}[0-9A-HJ-NPQRTUWXY]{10}`)},
-
-		// US Social Security Number / 美国社会安全号
-		{typ: TypeSSN, confidence: 0.90, boundary: boundaryDigit,
-			re: regexp.MustCompile(`[0-9]{3}-[0-9]{2}-[0-9]{4}`)},
-
-		// Chinese passport / 中国护照
-		{typ: TypePassport, confidence: 0.80, boundary: boundaryAlnum,
-			re: regexp.MustCompile(`[EG][0-9]{8}`)},
-
-		// License plate (incl. 8-char NEV) / 车牌（含新能源 8 位）
-		{typ: TypeLicensePlate, confidence: 0.90, boundary: boundaryNone,
-			re: regexp.MustCompile(`[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}[A-HJ-NP-Z0-9挂学警港澳]`)},
-
-		// IPv4
-		{typ: TypeIP, confidence: 0.75, boundary: boundaryDigit,
-			re: regexp.MustCompile(`(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])`)},
-
-		// Keys and tokens: worst blast radius, prefer false positives
-		// 各类密钥与令牌：泄露后果最严重，宁可误报
-		{typ: TypeCredential, confidence: 0.99, boundary: boundaryNone,
-			re: regexp.MustCompile(`sk-[A-Za-z0-9_\-]{16,}`)},
-		{typ: TypeCredential, confidence: 0.99, boundary: boundaryNone,
-			re: regexp.MustCompile(`AKIA[0-9A-Z]{16}`)},
-		{typ: TypeCredential, confidence: 0.99, boundary: boundaryNone,
-			re: regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`)},
-		{typ: TypeCredential, confidence: 0.99, boundary: boundaryNone,
-			re: regexp.MustCompile(`eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}`)},
-	}
-
-	out := all[:0:0]
-	for _, r := range all {
-		if !disabled[r.typ] {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// RegexDetector detects structured identifiers via regex plus check digits.
-// 基于正则加校验位检测结构化标识。
-type RegexDetector struct {
-	rules []rule
-}
-
-// NewRegexDetector builds the regex detector; rules can be disabled per type
-// (an internal-network deployment may not need IP redaction, for example).
-// 构造正则检测器，可按类型关闭部分规则（例如内网场景不必脱敏 IP）。
-func NewRegexDetector(disabledTypes ...EntityType) *RegexDetector {
-	disabled := make(map[EntityType]bool, len(disabledTypes))
-	for _, t := range disabledTypes {
-		disabled[t] = true
-	}
-	return &RegexDetector{rules: buildRules(disabled)}
-}
-
-// Name 返回检测器标识。
-func (d *RegexDetector) Name() string { return "regex" }
-
-// Detect scans rule by rule. Rules with a check digit only match when the check
-// passes.
-// 逐条规则扫描。带校验位的规则须通过校验才算命中。
-//
-// Uses bare-pattern matching plus manual boundary checks, avoiding both the
-// missed detections caused by sentinel groups consuming adjacent characters and
-// the "greedy match then failed check" case that pushes the scan past the real
-// target.
-// 采用裸模式匹配 + 手工边界检查，避免哨兵组消费相邻字符导致的漏检，
-// 也避免「贪婪匹配 + 校验失败」把扫描位置推过真正目标。
-func (d *RegexDetector) Detect(text string) ([]Entity, error) {
-	var found []Entity
-	for _, r := range d.rules {
-		for _, loc := range r.re.FindAllStringIndex(text, -1) {
-			start, end := loc[0], loc[1]
-			if !isBoundaryOK(text, start, end, r.boundary) {
-				continue
-			}
-			raw := text[start:end]
-			if r.validate != nil {
-				candidate := raw
-				if r.normalize {
-					candidate = stripSeparators(raw)
-				}
-				if !r.validate(candidate) {
-					continue
-				}
-			}
-			found = append(found, Entity{
-				Type: r.typ, Value: raw, Start: start, End: end,
-				Confidence: r.confidence, Detector: d.Name(),
-			})
-		}
-	}
-	return found, nil
-}
-
-// CoveredTypes returns the types this detector covers.
-// 返回本检测器覆盖的类型。
-func (d *RegexDetector) CoveredTypes() []EntityType {
-	seen := map[EntityType]bool{}
-	var out []EntityType
-	for _, r := range d.rules {
-		if !seen[r.typ] {
-			seen[r.typ] = true
-			out = append(out, r.typ)
-		}
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------

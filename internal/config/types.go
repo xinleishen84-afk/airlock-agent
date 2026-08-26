@@ -92,7 +92,26 @@ type PIIConfig struct {
 	OrgRoster  []string `yaml:"org_roster"`
 	// DisabledTypes 可关闭部分检测类型（如内网场景不必脱敏 IP）
 	DisabledTypes []EntityTypeName `yaml:"disabled_types"`
-	NER           NERConfig        `yaml:"ner"`
+
+	// Jurisdictions 是要加载的国家包代码（如 GEN、CN、DE）。
+	// 必填且没有默认值：默认值只能选定某个本土市场，
+	// 而无论选哪个，对写它的人都对、在别处都静默地错——
+	// 扫意大利合同的部署会在从未被询问的情况下继承别人的假设，
+	// 然后报告「零 PII」。
+	//
+	// Jurisdictions names the country packs to load. Required, with no default:
+	// any default would pick a home market and be silently wrong everywhere
+	// else.
+	Jurisdictions []JurisdictionCode `yaml:"jurisdictions"`
+
+	// TenantRulesDir 是租户自定义 YAML 规则目录（工号、资产编号、合同号等
+	// 只有租户自己知道格式的标识）。留空表示不加载。
+	//
+	// TenantRulesDir points at custom YAML rule files for tenant-specific
+	// identifiers. Empty means none are loaded.
+	TenantRulesDir string `yaml:"tenant_rules_dir"`
+
+	NER NERConfig `yaml:"ner"`
 }
 
 // NERConfig 是外部 NER 服务配置。

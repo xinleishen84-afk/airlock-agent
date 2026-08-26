@@ -21,6 +21,7 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/internal/routing"
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 )
 
 // upstreamOpts 控制假上游的行为。
@@ -101,7 +102,7 @@ func newTestHandler(t *testing.T, upstreamURL string, selfHosted bool, redact bo
 			detect.TypeName: {"张伟"},
 		}, false, 2)
 		deps.Redactor = anonymize.NewRedactor(
-			detect.NewCompositeDetector([]detect.Detector{detect.NewRegexDetector(), gaz}, 0), true)
+			detect.NewCompositeDetector([]detect.Detector{packs.MustNewRegistry([]string{"GEN", "CN", "US"}), gaz}, 0), true)
 	}
 	return NewHandler(deps)
 }

@@ -65,6 +65,20 @@ pii:
   # 检测器故障时阻断请求而非放行原文——脱敏网关唯一安全的默认值
   fail_closed: true
   always_redact: false
+  # 要加载的国家包。必填，没有默认值：默认值只能选定某个本土市场，
+  # 对写它的人都对、在别处都静默地错——扫意大利合同的部署会继承
+  # 别人的假设，然后报告「零 PII」。GEN 是与国界无关的那部分
+  # （邮箱、卡号、IBAN、API 密钥）。
+  # Country packs to load. Required, no default: any default would pick a
+  # home market and be silently wrong everywhere else. GEN holds what no
+  # jurisdiction owns (email, card numbers, IBAN, API keys).
+  # 可用 / available: GEN CN US IT DE ES
+  jurisdictions: [GEN, CN]
+  # 租户自定义规则目录：工号、资产编号、合同号这类只有你自己知道格式的标识。
+  # 每条规则必须自带 samples，加载期跑通才会被接受。
+  # Tenant rule directory for identifiers only you define. Every rule ships
+  # with samples that must pass at load time.
+  tenant_rules_dir: ""
   # 企业主数据名册。正则检测不出人名——不配这个也不接 NER，
   # 姓名类 PII 会完全裸奔。生产环境应从员工/客户主数据导出。
   # Enterprise master-data roster. Regexes cannot find names: without this

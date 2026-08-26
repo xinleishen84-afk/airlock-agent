@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
 	"github.com/xinleishen84-afk/airlock-agent/sidecar"
 )
@@ -41,6 +42,11 @@ var (
 	maxSessions  = flag.Int("max-sessions", 100_000, "活跃会话上限")
 	disableTypes = flag.String("disable-types", "",
 		"逗号分隔的检测类型黑名单（如内网场景可关掉 IP）")
+	jurisdictions = flag.String("jurisdictions", "",
+		"逗号分隔的国家包代码（如 GEN,CN）。必填——\n"+
+			"一个都不装意味着任何文本都扫不出 PII，且看起来像「数据很干净」")
+	tenantRules = flag.String("tenant-rules", "",
+		"租户自定义 YAML 规则目录（工号、资产编号等企业内部标识）")
 	logLevel = flag.String("log-level", "info", "日志级别")
 )
 
@@ -111,7 +117,18 @@ func buildDetector(logger *slog.Logger) (detect.Detector, error) {
 	for _, t := range splitCSV(*disableTypes) {
 		disabled = append(disabled, detect.EntityType(strings.ToUpper(t)))
 	}
-	detectors := []detect.Detector{detect.NewRegexDetector(disabled...)}
+	reg, err := packs.NewRegistry(splitCSV(*jurisdictions), disabled...)
+	if err != nil {
+		return nil, err
+	}
+	if *tenantRules != "" {
+		if err := packs.LoadYAMLInto(reg, *tenantRules); err != nil {
+			return nil, fmt.Errorf("装配租户规则: %w", err)
+		}
+	}
+	logger.Info("已装配国家包",
+		"jurisdictions", *jurisdictions, "识别器数", len(reg.Names()))
+	detectors := []detect.Detector{reg}
 
 	roster := map[detect.EntityType][]string{}
 	if names, err := readRoster(*nameRoster); err != nil {

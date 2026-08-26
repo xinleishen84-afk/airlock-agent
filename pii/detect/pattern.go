@@ -42,7 +42,7 @@ type PatternRecognizer struct {
 	name       string
 	entityType EntityType
 	pattern    *regexp.Regexp
-	boundary   boundaryClass
+	boundary   BoundaryClass
 	validate   validatorFunc
 	normalize  bool
 
@@ -85,7 +85,7 @@ func WithPrefilter(f Prefilter) PatternOption {
 
 // WithBoundary sets the character class forbidden on either side of a match.
 // 设置匹配两侧不允许出现的字符类。
-func WithBoundary(class boundaryClass) PatternOption {
+func WithBoundary(class BoundaryClass) PatternOption {
 	return func(p *PatternRecognizer) { p.boundary = class }
 }
 
@@ -268,4 +268,20 @@ func (g *GazetteerRecognizer) Recognize(text string) ([]Entity, error) {
 // 判断 r 是否可作为 ASCII 单词的一部分，供需要自定义边界逻辑的调用方使用。
 func isWordChar(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+// WithoutPrefilter returns a copy with the prefilter removed.
+// 返回一个摘掉前置过滤器的副本。
+//
+// Exists so tests outside this package can prove the prefilter changes only
+// speed and never results. The prefilter is the one optimisation here that can
+// silently cause a miss, so the equivalence has to be testable from wherever
+// the recognizers are actually defined.
+// 它的存在是为了让包外的测试能证明前置过滤只影响速度、绝不影响结果。
+// 前置过滤是这里唯一可能静默导致漏检的优化，
+// 因此这个等价性必须能在识别器真正定义的地方被检验。
+func (p *PatternRecognizer) WithoutPrefilter() *PatternRecognizer {
+	clone := *p
+	clone.prefilter = nil
+	return &clone
 }

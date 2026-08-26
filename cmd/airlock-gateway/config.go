@@ -12,6 +12,7 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/internal/ratelimit"
 	"github.com/xinleishen84-afk/airlock-agent/internal/routing"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 )
 
 // identityTask 是任务类型的别名，避免 buildPolicy 里出现冗长的包路径。
@@ -70,7 +71,19 @@ func buildDetector(c *Config) (detect.Detector, error) {
 	for _, t := range c.PII.DisabledTypes {
 		disabled = append(disabled, t.PII())
 	}
-	detectors := []detect.Detector{detect.NewRegexDetector(disabled...)}
+	// 只装配置显式点名的司法管辖区；校验层已保证列表非空且代码合法。
+	// Only the jurisdictions the config names; validation already guarantees
+	// the list is non-empty and every code is known.
+	reg, err := packs.NewRegistry(jurisdictionCodes(c), disabled...)
+	if err != nil {
+		return nil, fmt.Errorf("装配国家包: %w", err)
+	}
+	if dir := c.PII.TenantRulesDir; dir != "" {
+		if err := packs.LoadYAMLInto(reg, dir); err != nil {
+			return nil, fmt.Errorf("装配租户规则: %w", err)
+		}
+	}
+	detectors := []detect.Detector{reg}
 
 	roster := map[detect.EntityType][]string{}
 	if len(c.PII.NameRoster) > 0 {
@@ -171,3 +184,13 @@ func buildCredentialPolicy(c *Config, t config.TargetConfig) *credential.Backend
 
 // 确保 time 被引用（Duration 转换用到）
 var _ = time.Second
+
+// jurisdictionCodes 取出配置里的国家包代码。
+// jurisdictionCodes extracts the pack codes from the config.
+func jurisdictionCodes(c *Config) []string {
+	out := make([]string, 0, len(c.PII.Jurisdictions))
+	for _, j := range c.PII.Jurisdictions {
+		out = append(out, j.Code())
+	}
+	return out
+}

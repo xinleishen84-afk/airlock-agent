@@ -17,15 +17,23 @@ package detect
 
 import "strings"
 
-// LuhnValid runs the Luhn checksum (bank card numbers).
-// 执行 Luhn 校验（银行卡号）。
+// LuhnValid runs the Luhn checksum on a digit run of any length.
+// 对任意长度的数字串执行 Luhn 校验。
 //
-// Without this step, any 12-19 digit run would be misdetected as a card number,
-// and the false positives would bury the real alerts.
-// 没有这一步，任意 12-19 位数字串都会被误判为银行卡，
-// 真正的告警会被误报淹没。
+// Length is deliberately not checked here. Luhn is used by bank cards, but also
+// by Italy's 11-digit Partita IVA, IMEIs, and plenty of company-internal
+// account numbers — folding a card's length range into the function named
+// "Luhn" makes it quietly wrong for all of them, and the wrongness shows up as
+// a recognizer that never matches rather than as an error.
+// 这里刻意不检查长度。Luhn 用于银行卡，也用于意大利 11 位的增值税号、
+// IMEI，以及大量企业内部账号——把卡号的长度范围折进一个叫 "Luhn" 的函数里，
+// 会让它对上述全部场景悄悄地错，而这种错表现为「识别器永不命中」，
+// 不是一个报错。
+//
+// Callers that need a card-shaped length use BankCardLuhnValid.
+// 需要卡号长度约束的调用方请用 BankCardLuhnValid。
 func LuhnValid(digits string) bool {
-	if len(digits) < 12 || len(digits) > 19 {
+	if len(digits) < 2 {
 		return false
 	}
 	sum := 0
@@ -45,6 +53,21 @@ func LuhnValid(digits string) bool {
 		sum += v
 	}
 	return sum%10 == 0
+}
+
+// BankCardLuhnValid is LuhnValid plus the length range a payment card can have.
+// 是 LuhnValid 加上支付卡可能的长度范围。
+//
+// Without the length bound, any digit run that happens to satisfy Luhn — one in
+// ten of them — is reported as a card number, and those false positives bury
+// the real alerts.
+// 没有长度约束，任何碰巧满足 Luhn 的数字串（十分之一）都会被报成卡号，
+// 而这些误报会淹没真正的告警。
+func BankCardLuhnValid(digits string) bool {
+	if len(digits) < 12 || len(digits) > 19 {
+		return false
+	}
+	return LuhnValid(digits)
 }
 
 // idWeights are the weighting factors for the first 17 digits of a Chinese

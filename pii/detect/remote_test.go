@@ -274,12 +274,12 @@ func TestCompositeWithRemoteNERClosesGap(t *testing.T) {
 	s := newNERServer(t)
 	d := newRemoteDetector(t, s, nil)
 
-	before := NewCompositeDetector([]Detector{NewRegexDetector()}, 0)
+	before := NewCompositeDetector([]Detector{newBaselineRegistry(t)}, 0)
 	if len(before.Missing()) == 0 {
 		t.Fatal("仅正则时应存在覆盖缺口")
 	}
 
-	after := NewCompositeDetector([]Detector{NewRegexDetector(), d}, 0)
+	after := NewCompositeDetector([]Detector{newBaselineRegistry(t), d}, 0)
 	if missing := after.Missing(); len(missing) != 0 {
 		t.Errorf("接入 NER 后缺口应被补上，仍缺: %v", missing)
 	}

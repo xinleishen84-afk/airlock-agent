@@ -76,10 +76,12 @@ spec:
                         type: string
                         description: PII 实体类型
                         enum:
+                          - ACCOUNT
                           - ADDRESS
                           - BANK_CARD
                           - CREDENTIAL
                           - EMAIL
+                          - IBAN
                           - ID_CARD
                           - IP
                           - LICENSE_PLATE
@@ -91,6 +93,18 @@ spec:
                           - USCC
                     fail_closed:
                       type: boolean
+                    jurisdictions:
+                      type: array
+                      items:
+                        type: string
+                        description: 国家合规包代码
+                        enum:
+                          - CN
+                          - DE
+                          - ES
+                          - GEN
+                          - IT
+                          - US
                     name_roster:
                       type: array
                       items:
@@ -124,10 +138,12 @@ spec:
                             type: string
                             description: PII 实体类型
                             enum:
+                              - ACCOUNT
                               - ADDRESS
                               - BANK_CARD
                               - CREDENTIAL
                               - EMAIL
+                              - IBAN
                               - ID_CARD
                               - IP
                               - LICENSE_PLATE
@@ -142,6 +158,8 @@ spec:
                       type: array
                       items:
                         type: string
+                    tenant_rules_dir:
+                      type: string
                   additionalProperties: false
                 rate_limit:
                   type: object

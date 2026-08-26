@@ -27,7 +27,7 @@ var benchLongText = strings.Repeat(
 // 「微秒级」这个断言就落在这个数字上。每个 SSE 请求都要付它，
 // 因此必须实测而非断言。
 func BenchmarkRegexLayer(b *testing.B) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(b)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(benchText)))
 	b.ResetTimer()
@@ -42,10 +42,7 @@ func BenchmarkRegexLayer(b *testing.B) {
 // recognizers with checksums and context boosting, no network.
 // 度量完整的本地管道：预定义识别器 + 校验和 + 上下文加权，无网络。
 func BenchmarkRegistryLocal(b *testing.B) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		b.Fatal(err)
-	}
+	reg := newBaselineRegistry(b)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(benchText)))
 	b.ResetTimer()
@@ -60,10 +57,7 @@ func BenchmarkRegistryLocal(b *testing.B) {
 // a long cached system prefix.
 // 在带长系统前缀的真实提示词上度量同一路径。
 func BenchmarkRegistryLongPrompt(b *testing.B) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		b.Fatal(err)
-	}
+	reg := newBaselineRegistry(b)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(benchLongText)))
 	b.ResetTimer()

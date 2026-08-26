@@ -101,6 +101,7 @@ rate_limit:
   tokens_per_window: 100000000
   window: 1m
 pii:
+  jurisdictions: [GEN, CN]
   fail_closed: true
   # 私有化后端默认不脱敏；验收要覆盖脱敏路径，故强制开启
   always_redact: true

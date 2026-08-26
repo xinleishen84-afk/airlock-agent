@@ -2,6 +2,7 @@ package anonymize
 
 import (
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ func newTestRedactor(t *testing.T) (*Redactor, *SessionVault) {
 	if err != nil {
 		t.Fatalf("构造名册失败: %v", err)
 	}
-	d := detect.NewCompositeDetector([]detect.Detector{detect.NewRegexDetector(), gaz}, 0)
+	d := detect.NewCompositeDetector([]detect.Detector{packs.MustNewRegistry([]string{"GEN", "CN", "US"}), gaz}, 0)
 	return NewRedactor(d, true), newSessionVault("s1", time.Hour)
 }
 

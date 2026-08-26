@@ -32,6 +32,7 @@ rate_limit:
   window: 1m
 pii:
   fail_closed: true
+  jurisdictions: [GEN, CN]
   name_roster: ["张伟"]
 gpu:
   kv_elevated: 0.75
@@ -427,4 +428,35 @@ func TestCRDGenerates(t *testing.T) {
 			t.Errorf("CRD 缺少 %q", want)
 		}
 	}
+}
+
+// 未选司法管辖区必须阻断启动。
+// No jurisdiction selected must block startup.
+//
+// 这条用例存在的理由是：这种配置的失败形态是「一切正常，零 PII」。
+// 它不会崩、不会报错、审计日志干干净净——直到监管机构来问。
+// The failure mode of this configuration is "everything fine, zero PII":
+// nothing crashes, nothing errors, the audit log is spotless — until a
+// regulator asks.
+func TestMissingJurisdictionBlocksStartup(t *testing.T) {
+	y := strings.Replace(baseYAML, "  jurisdictions: [GEN, CN]\n", "", 1)
+	if _, err := load(t, y); err == nil {
+		t.Fatal("未指定国家包应阻断启动")
+	} else if !strings.Contains(err.Error(), "pii.jurisdictions") {
+		t.Fatalf("报错应指向 pii.jurisdictions，实际：%v", err)
+	}
+}
+
+// 拼错的国家包代码同样必须阻断，而不是静默跳过。
+// A misspelled pack code must block too, not be silently skipped.
+func TestUnknownJurisdictionBlocksStartup(t *testing.T) {
+	y := strings.Replace(baseYAML, "[GEN, CN]", "[GEN, GB]", 1)
+	_, err := load(t, y)
+	if err == nil {
+		t.Fatal("未知国家包应阻断启动")
+	}
+	if !strings.Contains(err.Error(), `"GB"`) {
+		t.Fatalf("报错应点名 GB，实际：%v", err)
+	}
+	t.Logf("按预期拒绝：%v", err)
 }

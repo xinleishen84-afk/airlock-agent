@@ -101,6 +101,7 @@ vLLM 开始抢占换出，在途请求被反复重算，整个后端进入活锁
 docker run -p 8888:8888 \
   -v ./names.txt:/rosters/names.txt \
   ghcr.io/xinleishen84-afk/airlock-agent \
+  --jurisdictions GEN,CN \
   --name-roster /rosters/names.txt \
   --ner http://ner-service:8000/v1/detect
 ```
@@ -171,6 +172,65 @@ scan and audit without modifying anything.
 
 ---
 
+## 司法管辖区国家包 / Country packs
+
+一张扁平的「敏感数据」字典，悄悄编码了编写者的假设。以美国为中心的引擎能找到
+SSN 却漏掉意大利税号；以中国为中心的能找到身份证却漏掉德国税号。两者在各自本土
+市场都没错，出了本土都没用 —— 而且**故障是静默的**：用美国包扫意大利文档会报告
+零 PII，这读起来像「数据很干净」，而不是「装错了包」。
+
+所以 `jurisdictions` 是必填项，没有默认值：
+
+```yaml
+pii:
+  jurisdictions: [GEN, CN]   # 必填。装错、拼错、不装，都在启动期报错
+  tenant_rules_dir: /etc/airlock/rules
+```
+
+| 包 | 覆盖 |
+|---|---|
+| `GEN` | 与国界无关的部分：邮箱、银行卡（Luhn）、IBAN（ISO 7064 mod-97）、国际电话、IPv4、API 密钥/JWT |
+| `CN` | 身份证（GB 11643）、统一社会信用代码（GB 32100）、手机、固话、护照、车牌 |
+| `US` | SSN |
+| `IT` | Codice Fiscale（CIN 控制字符）、Partita IVA |
+| `DE` | Steuer-ID（ISO 7064 MOD 11,10 + 数字重复结构规则）、USt-IdNr |
+| `ES` | DNI / NIE（mod-23 校验字母，同一识别器覆盖两者） |
+
+装包的代价是可量化的：装全部六个包相对只装 `GEN`，hot path 从 31.8µs 涨到
+37.9µs（+19%），因为前置过滤器在正则之前就把绝大多数识别器挡掉了。构建全部包
+一次 36µs，不构成启动负担。
+
+### 租户 YAML 规则 / Tenant rule packs
+
+国家包覆盖司法管辖区定义的标识；它们覆盖不了只有你自己知道格式的东西 ——
+工号、资产编号、合同号。这些放在 YAML 里，不需要写代码：
+
+```yaml
+version: 1
+tenant: example-corp
+rules:
+  - name: employee_id
+    type: CUSTOM_EMPLOYEE_ID
+    pattern: 'EMP-[0-9]{6}'
+    score: 0.90
+    boundary: alnum
+    samples:
+      match: ["EMP-004217"]
+      no_match: ["EMP-4217", "emp-004217"]
+```
+
+**`samples` 是强制的**，这是这套规则引擎唯一能安全交给非工程师的前提。
+YAML 规则的每一种故障模式都是静默的 —— 模式并不蕴含的前置过滤、拒绝一切
+真实出现的边界类、拒绝租户自身格式的校验器 —— 三者都能干净地注册、报告成功，
+同时从它们本该捕获的数据上扫过。加载器会在接受规则之前把样本喂进组装好的
+识别器：`match` 必须恰好命中一次且覆盖整串，`no_match` 必须零命中。
+**一条匹配不到任何东西的规则会加载失败，而不是保护失败。**
+
+完整示例见 [`configs/tenant-rules/example.yaml`](configs/tenant-rules/example.yaml)，
+该文件本身在 CI 中被加载验证。
+
+---
+
 ## 设计决策
 
 几个不那么显然、但踩过坑才定下来的选择。
@@ -191,9 +251,19 @@ scan and audit without modifying anything.
 直接抛错）。它存的是「占位符 → 真实姓名/手机/身份证」，落盘就等于把脱敏组件
 变成 PII 数据库 —— 一次备份泄露，整条防线全废。
 
-**正则检测不出人名。** 人名没有稳定的字面特征。只装 `RegexDetector` 就上线，
+**正则检测不出人名。** 人名没有稳定的字面特征。只装正则识别器就上线，
 姓名/地址/机构名会**完全裸奔**。`CompositeDetector` 在缺少这三类覆盖时会主动告警，
 `/stats` 端点也会暴露 `coverage_gaps` —— 必须在监控里可见。
+
+**识别器表只有一份。** 国家包是唯一的来源，网关、sidecar、配置校验层全部从它读。
+这条规则是踩出来的：曾经同一张表存在三份副本（`RegexDetector`、`predefinedSpecs`、
+packs），新增意大利/德国/西班牙识别器后，跑起来的二进制用的仍是老副本 ——
+包装好了，业务上一个也没生效，且没有任何报错。
+
+**校验位函数不许夹带长度。** `LuhnValid` 一度写死了 12–19 位（卡号长度），
+于是意大利 11 位增值税号的识别器注册成功、运行正常、**永不命中**。
+长度属于「卡号」这个概念，不属于 Luhn 这个算法 —— 现在是
+`LuhnValid` 与 `BankCardLuhnValid` 两个函数。
 
 ---
 
@@ -219,6 +289,7 @@ scan and audit without modifying anything.
 
 ```
 pii/          脱敏引擎（公开 API，零外部依赖）
+pii/detect/packs/    国家合规包 + 租户 YAML 规则加载器
 gpuload/      GPU 显存感知准入（公开 API）
 sidecar/      HTTP 服务实现
 cmd/airlock-agent/   sidecar 二进制

@@ -41,6 +41,7 @@ rate_limit:
   tokens_per_window: 1000000
   window: 1m
 pii:
+  jurisdictions: [GEN, CN]
   fail_closed: true
   name_roster: ["张伟"]
   org_roster: ["星辰科技"]

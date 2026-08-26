@@ -40,13 +40,13 @@ import "strings"
 // 因此下面每个门控都是从模式推导出的严格必要条件，而非启发式规则。
 type Prefilter func(text string) bool
 
-// requireByte returns a prefilter demanding at least one of the given bytes.
+// RequireByte returns a prefilter demanding at least one of the given bytes.
 // 返回一个要求文本至少含给定字节之一的门控。
-func requireByte(bytes string) Prefilter {
+func RequireByte(bytes string) Prefilter {
 	return func(text string) bool { return strings.ContainsAny(text, bytes) }
 }
 
-// requireDigit demands at least one ASCII digit.
+// RequireDigit demands at least one ASCII digit.
 // 要求至少一个 ASCII 数字。
 //
 // Hand-rolled rather than strings.ContainsAny("0123456789"): this runs on every
@@ -54,7 +54,7 @@ func requireByte(bytes string) Prefilter {
 // machinery ContainsAny uses for multi-byte input.
 // 手写而非 strings.ContainsAny("0123456789")：多数识别器每个请求都要跑一次，
 // 紧凑的字节循环省掉了 ContainsAny 为多字节输入准备的集合判定机制。
-func requireDigit(text string) bool {
+func RequireDigit(text string) bool {
 	for i := 0; i < len(text); i++ {
 		if text[i] >= '0' && text[i] <= '9' {
 			return true
@@ -63,10 +63,10 @@ func requireDigit(text string) bool {
 	return false
 }
 
-// requirePrefix returns a prefilter demanding a literal substring, used by
+// RequirePrefix returns a prefilter demanding a literal substring, used by
 // recognizers whose pattern starts with a fixed marker.
 // 返回一个要求含指定字面子串的门控，供模式以固定标记开头的识别器使用。
-func requirePrefix(literals ...string) Prefilter {
+func RequirePrefix(literals ...string) Prefilter {
 	return func(text string) bool {
 		for _, lit := range literals {
 			if strings.Contains(text, lit) {
@@ -77,10 +77,10 @@ func requirePrefix(literals ...string) Prefilter {
 	}
 }
 
-// requireUpperAlpha demands at least one uppercase ASCII letter, which every
+// RequireUpperAlpha demands at least one uppercase ASCII letter, which every
 // IBAN, licence plate and credential prefix requires.
 // 要求至少一个大写 ASCII 字母——IBAN、车牌、凭证前缀都必然含有。
-func requireUpperAlpha(text string) bool {
+func RequireUpperAlpha(text string) bool {
 	for i := 0; i < len(text); i++ {
 		if text[i] >= 'A' && text[i] <= 'Z' {
 			return true
@@ -89,7 +89,7 @@ func requireUpperAlpha(text string) bool {
 	return false
 }
 
-// requireCJK demands at least one CJK character, used by the licence-plate
+// RequireCJK demands at least one CJK character, used by the licence-plate
 // recognizer whose pattern begins with a province character.
 // 要求至少一个 CJK 字符，供以省份汉字开头的车牌识别器使用。
 //
@@ -97,7 +97,7 @@ func requireUpperAlpha(text string) bool {
 // condition for the pattern to match and costs one comparison per byte.
 // 只检查 U+4E00–U+9FFF 的 UTF-8 首字节范围，这是模式能匹配的必要条件，
 // 每字节只花一次比较。
-func requireCJK(text string) bool {
+func RequireCJK(text string) bool {
 	for i := 0; i < len(text); i++ {
 		if text[i] >= 0xE4 && text[i] <= 0xE9 {
 			return true

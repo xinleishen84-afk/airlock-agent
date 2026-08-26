@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 )
 
 // newTestServer 构造一个带名册检测器的 sidecar。
@@ -25,7 +26,7 @@ func newTestServer(t *testing.T, failClosed bool, detector detect.Detector) *htt
 			t.Fatal(err)
 		}
 		detector = detect.NewCompositeDetector(
-			[]detect.Detector{detect.NewRegexDetector(), gaz}, 0)
+			[]detect.Detector{packs.MustNewRegistry([]string{"GEN", "CN", "US"}), gaz}, 0)
 	}
 	srv, err := New(Options{
 		Detector: detector, FailClosed: failClosed,
@@ -303,7 +304,7 @@ func TestStatsExposeNoValues(t *testing.T) {
 // 这个事实必须能被监控系统看见，而不是只在启动日志里出现一次。
 func TestCoverageGapExposed(t *testing.T) {
 	ts := newTestServer(t, true, detect.NewCompositeDetector(
-		[]detect.Detector{detect.NewRegexDetector()}, 0))
+		[]detect.Detector{packs.MustNewRegistry([]string{"GEN", "CN", "US"})}, 0))
 
 	resp, err := http.Get(ts.URL + "/stats")
 	if err != nil {

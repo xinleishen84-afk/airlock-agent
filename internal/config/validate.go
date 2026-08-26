@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 )
 
 // ValidationError 是一条配置校验错误。
@@ -273,6 +275,25 @@ func (c *Config) validatePII(add func(string, string, ...any)) {
 	}
 	if c.PII.NER.Endpoint == "" && len(c.PII.NER.Types) > 0 {
 		add("pii.ner.types", "配置了识别类型但未设置 endpoint，NER 不会启用")
+	}
+
+	// 未选司法管辖区 = 一条识别器都不装 = 扫描全过、报告干净。
+	// 这必须是启动期硬错误，不能是警告。
+	// No jurisdiction selected means no recognizers at all: everything scans
+	// clean. That has to fail startup, not warn.
+	if len(c.PII.Jurisdictions) == 0 {
+		add("pii.jurisdictions", "必须显式指定至少一个国家包（可用：%v）——"+
+			"一个都不装意味着任何文本都扫不出 PII，且看起来像「数据很干净」",
+			strings.Join(packs.Available(), ", "))
+	}
+	// 代码本身的合法性已在解析期由 JurisdictionCode 拦下，这里只查重复。
+	// Code validity is already enforced at parse time by JurisdictionCode.
+	seen := map[JurisdictionCode]bool{}
+	for i, code := range c.PII.Jurisdictions {
+		if seen[code] {
+			add(fmt.Sprintf("pii.jurisdictions[%d]", i), "国家包 %q 重复", code)
+		}
+		seen[code] = true
 	}
 }
 

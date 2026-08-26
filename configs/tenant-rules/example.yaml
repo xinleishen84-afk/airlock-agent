@@ -1,0 +1,61 @@
+# 租户自定义规则示例 / Example tenant rule file
+#
+# 国家包覆盖司法管辖区定义的标识。这里放的是只有你自己知道格式的东西：
+# 工号、资产编号、合同号、内部客户号。
+# Country packs cover what jurisdictions define. This file is for identifiers
+# only you define: employee numbers, asset tags, contract IDs.
+#
+# 每条规则必须带 samples。加载器会在接受这条规则前把样本喂进组装好的识别器：
+# match 里的每个值必须被恰好命中一次且覆盖整串，no_match 里的必须零命中。
+# 一条匹配不到任何东西的规则会加载失败，而不是保护失败。
+# Every rule ships with samples. The loader runs them through the assembled
+# recognizer before accepting it, so a rule that matches nothing fails to load
+# rather than failing to protect.
+version: 1
+tenant: example-corp
+
+rules:
+  # 工号：企业自有格式，任何国家包都不会覆盖。
+  # Employee number: a company-owned format no country pack covers.
+  - name: employee_id
+    type: CUSTOM_EMPLOYEE_ID
+    pattern: 'EMP-[0-9]{6}'
+    score: 0.90
+    boundary: alnum
+    prefilter:
+      prefix: ["EMP-"]
+    context:
+      boost: 0.15
+      words: ["工号", "员工号", "employee", "staff id"]
+    samples:
+      match: ["EMP-004217"]
+      no_match:
+        - "EMP-4217"        # 位数不足 / too few digits
+        - "emp-004217"      # 大小写不符 / wrong case
+        - "XEMP-004217"     # 边界被前面的字母破坏 / boundary broken by a letter
+
+  # 内部客户号：末位是 Luhn 校验位，因此可以进快速层。
+  #
+  # 注意 validator 拿到的是整个匹配串。若模式里带了 "C" 这类前缀字母，
+  # Luhn 会因为遇到非数字而判否——所以这里让模式只覆盖数字本身，
+  # 由 context 词负责把它和普通的十位数字区分开。
+  # 这个坑不需要你记住：写错了，samples 会在加载期直接把规则拦下。
+  #
+  # Note the validator receives the entire match. A prefix letter inside the
+  # pattern would make Luhn reject every value, so the pattern covers the
+  # digits alone and context words do the disambiguating. You do not need to
+  # remember this: get it wrong and the samples block the rule at load time.
+  - name: customer_no
+    type: ACCOUNT
+    pattern: '[0-9]{10}'
+    score: 0.80
+    boundary: digit_sep
+    validator: luhn
+    context:
+      boost: 0.15
+      words: ["客户号", "customer"]
+    samples:
+      match: ["4008217350"]
+      no_match:
+        - "客户号 4008217351"    # 校验位不对 / bad check digit
+        - "40082173501"          # 边界被右侧数字破坏 / boundary broken on the right

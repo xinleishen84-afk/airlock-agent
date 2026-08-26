@@ -8,6 +8,7 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/internal/credential"
 	"github.com/xinleishen84-afk/airlock-agent/internal/identity"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -25,14 +26,24 @@ import (
 // EntityTypeName 是经校验的 PII 实体类型名。
 type EntityTypeName string
 
-// knownEntityTypes 是全部合法的实体类型。
-var knownEntityTypes = map[detect.EntityType]bool{
-	detect.TypeName: true, detect.TypePhone: true, detect.TypeEmail: true,
-	detect.TypeIDCard: true, detect.TypeBankCard: true, detect.TypeAddress: true,
-	detect.TypeOrg: true, detect.TypeIP: true, detect.TypeCredential: true,
-	detect.TypePassport: true, detect.TypeLicensePlate: true, detect.TypeSSN: true,
-	detect.TypeUSCC: true,
-}
+// knownEntityTypes 直接派生自 detect.BuiltinTypes()，不另抄一份。
+//
+// 抄一份的代价是静默的：detect 新增一个类型后，这里不更新，
+// 于是配置里写上这个类型会被判为「未知类型」而拒绝启动——
+// 一个明明支持的类型，配置层却说不认识。反向漂移更糟：
+// 这里留着一个 detect 已删除的类型，配置校验放行，检测器却没有它。
+//
+// Derived from detect.BuiltinTypes() rather than copied. A copy drifts
+// silently in both directions: a type detect gained but this list lacks is
+// rejected as unknown, and a type detect dropped but this list keeps passes
+// validation with no recognizer behind it.
+var knownEntityTypes = func() map[detect.EntityType]bool {
+	m := make(map[detect.EntityType]bool, len(detect.BuiltinTypes()))
+	for _, t := range detect.BuiltinTypes() {
+		m[t] = true
+	}
+	return m
+}()
 
 // EntityTypeNames 返回全部合法类型名（已排序），供报错信息与 schema 生成使用。
 func EntityTypeNames() []string {
@@ -43,6 +54,37 @@ func EntityTypeNames() []string {
 	sort.Strings(out)
 	return out
 }
+
+// JurisdictionCode 是经校验的国家包代码。
+//
+// 与实体类型同理：拼错的代码若被静默跳过，部署会在缺一整套识别器的情况下
+// 报告启动成功。这里在解析期就拒绝，报错带行号。
+//
+// A misspelled pack code that is silently skipped leaves a deployment missing
+// an entire recognizer set while reporting a clean start. Rejected at parse
+// time instead, with the line number.
+type JurisdictionCode string
+
+// JurisdictionCodes 返回全部可用的国家包代码，供报错信息与 schema 生成使用。
+func JurisdictionCodes() []string { return packs.Available() }
+
+// UnmarshalYAML 解析并校验国家包代码。
+func (j *JurisdictionCode) UnmarshalYAML(node *yaml.Node) error {
+	var raw string
+	if err := node.Decode(&raw); err != nil {
+		return fmt.Errorf("第 %d 行：国家包代码必须是字符串", node.Line)
+	}
+	normalized := strings.ToUpper(strings.TrimSpace(raw))
+	if _, ok := packs.Get(normalized); !ok {
+		return fmt.Errorf("第 %d 行：未知的国家包 %q。合法取值：%s",
+			node.Line, raw, strings.Join(JurisdictionCodes(), " / "))
+	}
+	*j = JurisdictionCode(normalized)
+	return nil
+}
+
+// Code 返回底层代码。
+func (j JurisdictionCode) Code() string { return string(j) }
 
 // UnmarshalYAML 解析并校验实体类型名。
 func (e *EntityTypeName) UnmarshalYAML(node *yaml.Node) error {

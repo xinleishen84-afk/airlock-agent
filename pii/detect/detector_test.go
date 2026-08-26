@@ -19,7 +19,7 @@ func newTestDetector(t *testing.T) *CompositeDetector {
 	if err != nil {
 		t.Fatalf("构造名册检测器失败: %v", err)
 	}
-	return NewCompositeDetector([]Detector{NewRegexDetector(), gaz}, 0)
+	return NewCompositeDetector([]Detector{newBaselineRegistry(t), gaz}, 0)
 }
 
 // TestDetectStructuredIdentifiers 校验结构化标识全部检出，与 Python 版断言一致。
@@ -58,7 +58,7 @@ func TestNoFalsePositiveOnRandomDigits(t *testing.T) {
 // 这是移植中最容易出错的一处：lookbehind 改成哨兵组后，
 // 若边界失效，长数字串中间的子串会被误当成手机号。
 func TestBoundaryRewriteKeepsPrecision(t *testing.T) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(t)
 	cases := []struct {
 		text     string
 		wantHits int
@@ -87,7 +87,7 @@ func TestBoundaryRewriteKeepsPrecision(t *testing.T) {
 // TestOffsetsAreAccurate 校验偏移量精确——哨兵组吃掉了前后字符，
 // 若取整体匹配而非 group 1，偏移会整体偏移一位，替换后文本会被破坏。
 func TestOffsetsAreAccurate(t *testing.T) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(t)
 	text := "电话 13812345678 结束"
 	entities, _ := d.Detect(text)
 	for _, e := range entities {
@@ -125,7 +125,7 @@ func TestGazetteerLongestMatchFirst(t *testing.T) {
 
 // TestCompositeReportsMissingNERTypes 校验缺少姓名类检测能力时能被发现。
 func TestCompositeReportsMissingNERTypes(t *testing.T) {
-	d := NewCompositeDetector([]Detector{NewRegexDetector()}, 0)
+	d := NewCompositeDetector([]Detector{newBaselineRegistry(t)}, 0)
 	missing := d.Missing()
 	if len(missing) == 0 {
 		t.Fatal("仅有正则检测器时应报告缺少 NAME/ADDRESS/ORG 覆盖")
@@ -172,7 +172,7 @@ func (e *detectorError) Error() string { return e.msg }
 // 连成一片，Luhn 校验失败后扫描位置已推进，真正的卡号被吞掉。
 // 若有人改回贪婪写法，本用例会立刻失败。
 func TestGreedyBankCardRegression(t *testing.T) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(t)
 	text := validID + " " + validCard
 	entities, _ := d.Detect(text)
 
@@ -195,7 +195,7 @@ func TestGreedyBankCardRegression(t *testing.T) {
 
 // TestGroupedBankCardFormats 校验四位分组书写的卡号能被识别。
 func TestGroupedBankCardFormats(t *testing.T) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(t)
 	for _, text := range []string{
 		"4111 1111 1111 1111",
 		"4111-1111-1111-1111",
@@ -216,7 +216,7 @@ func TestGroupedBankCardFormats(t *testing.T) {
 
 // TestAdjacentEntitiesBothDetected 校验相邻实体不会因边界消费而互相遮蔽。
 func TestAdjacentEntitiesBothDetected(t *testing.T) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(t)
 	entities, _ := d.Detect("13812345678 13900001111 13700002222")
 	count := 0
 	for _, e := range entities {
@@ -231,7 +231,7 @@ func TestAdjacentEntitiesBothDetected(t *testing.T) {
 
 // TestUTF8OffsetsSafe 校验中文环境下偏移量与边界检查不越界。
 func TestUTF8OffsetsSafe(t *testing.T) {
-	d := NewRegexDetector()
+	d := newBaselineRegistry(t)
 	text := "客户张伟的手机是13812345678，身份证" + validID + "。"
 	entities, _ := d.Detect(text)
 	if len(entities) == 0 {

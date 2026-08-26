@@ -15,7 +15,7 @@ import (
 //	加字段忘了同步 → APIServer 拒绝一个完全合法的配置
 //	删字段忘了同步 → APIServer 放行一个网关不认识的字段
 //
-// 本用例让漂移在 CI 就被拦下。修法：`gateway --print-crd > configs/....yaml`
+// 本用例让漂移在 CI 就被拦下。修法：`go run ./cmd/airlock-gateway --print-crd > configs/airlockconfig-crd.yaml`
 func TestCRDInSyncWithCode(t *testing.T) {
 	path := filepath.Join("..", "..", "configs", "airlockconfig-crd.yaml")
 	onDisk, err := os.ReadFile(path)
@@ -29,7 +29,7 @@ func TestCRDInSyncWithCode(t *testing.T) {
 	if string(onDisk) != string(generated) {
 		t.Errorf("configs/airlockconfig-crd.yaml 与代码不一致。\n" +
 			"schema 已漂移，APIServer 侧的拦截会与网关实际接受的字段对不上。\n" +
-			"修法：go run ./cmd/gateway --print-crd > configs/airlockconfig-crd.yaml")
+			"修法：go run ./cmd/airlock-gateway --print-crd > configs/airlockconfig-crd.yaml")
 	}
 }
 

@@ -40,7 +40,7 @@ func (s *slowDetector) Calls() int {
 func TestFastOnlyNeverTouchesSlowTier(t *testing.T) {
 	slow := &slowDetector{delay: time.Second}
 	td := &TieredDetector{
-		Fast: []Detector{NewRegexDetector()},
+		Fast: []Detector{newBaselineRegistry(t)},
 		Slow: []Detector{slow},
 		Mode: TierFastOnly,
 	}
@@ -74,7 +74,7 @@ func TestFastOnlyNeverTouchesSlowTier(t *testing.T) {
 func TestCoverageReportsWhatIsActuallyProtected(t *testing.T) {
 	build := func(mode TierMode) *TieredDetector {
 		return &TieredDetector{
-			Fast: []Detector{NewRegexDetector()},
+			Fast: []Detector{newBaselineRegistry(t)},
 			Slow: []Detector{&slowDetector{}},
 			Mode: mode,
 		}
@@ -104,7 +104,7 @@ func TestCoverageReportsWhatIsActuallyProtected(t *testing.T) {
 // 验证超时是慢速层能给 TTFT 增加延迟的硬上限。
 func TestInlineBoundsLatency(t *testing.T) {
 	td := &TieredDetector{
-		Fast:        []Detector{NewRegexDetector()},
+		Fast:        []Detector{newBaselineRegistry(t)},
 		Slow:        []Detector{&slowDetector{delay: 5 * time.Second}},
 		Mode:        TierInline,
 		SlowTimeout: 100 * time.Millisecond,
@@ -134,7 +134,7 @@ func TestInlineBoundsLatency(t *testing.T) {
 // 实际却意味着姓名从此不受保护。
 func TestSlowTierFailureIsReported(t *testing.T) {
 	td := &TieredDetector{
-		Fast:        []Detector{NewRegexDetector()},
+		Fast:        []Detector{newBaselineRegistry(t)},
 		Slow:        []Detector{&slowDetector{err: errors.New("模型服务不可用")}},
 		Mode:        TierInline,
 		SlowTimeout: time.Second,
@@ -174,7 +174,7 @@ func TestAsyncReturnsImmediatelyAndStillReports(t *testing.T) {
 	}
 	reported := make(chan []Entity, 1)
 	td := &TieredDetector{
-		Fast:         []Detector{NewRegexDetector()},
+		Fast:         []Detector{newBaselineRegistry(t)},
 		Slow:         []Detector{slow},
 		Mode:         TierAsync,
 		OnSlowResult: func(_ string, found []Entity) { reported <- found },
@@ -205,10 +205,7 @@ func TestAsyncReturnsImmediatelyAndStillReports(t *testing.T) {
 // TestBatchProcessesOffHotPath covers the offline pipeline.
 // 覆盖离线管道。
 func TestBatchProcessesOffHotPath(t *testing.T) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := newBaselineRegistry(t)
 	b := &BatchDetector{Detector: reg, Concurrency: 4}
 
 	texts := []string{
@@ -236,7 +233,7 @@ func TestBatchProcessesOffHotPath(t *testing.T) {
 // 把已取消的条目留成 nil 结果，会让调用方误读为「已扫描、未发现 PII」，
 // 进而发出未脱敏的文本。
 func TestBatchCancellationMarksRemaining(t *testing.T) {
-	reg, _ := NewDefaultRegistry()
+	reg := newBaselineRegistry(t)
 	b := &BatchDetector{Detector: reg, Concurrency: 1}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -268,26 +265,11 @@ func TestPrefilterNeverCausesMissedDetection(t *testing.T) {
 		"护照 E12345678", "统一代码 91110108MA01ABCD7X",
 	}
 	for _, text := range texts {
-		withGate, err := NewDefaultRegistry()
-		if err != nil {
-			t.Fatal(err)
-		}
+		withGate := newBaselineRegistry(t)
 		gated, _ := withGate.Detect(text)
 
 		// 同样的识别器，但强制关闭门控
-		bare := NewRegistry()
-		for _, spec := range predefinedSpecs() {
-			opts := make([]PatternOption, 0, len(spec.opts))
-			for _, o := range spec.opts {
-				opts = append(opts, o)
-			}
-			opts = append(opts, WithPrefilter(nil))
-			r, err := NewPatternRecognizer(spec.name, spec.entityType, spec.expr, spec.score, opts...)
-			if err != nil {
-				t.Fatal(err)
-			}
-			bare.Register(r)
-		}
+		bare := newBaselineRegistryNoPrefilter(t)
 		ungated, _ := bare.Detect(text)
 
 		if len(gated) != len(ungated) {

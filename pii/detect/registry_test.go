@@ -14,10 +14,7 @@ import (
 // 这正是上下文的意义：同样 16 位数字，旁边是「卡号」和是「订单号」
 // 含义完全不同。没有加权，识别器分不出来，每个订单号都是误报。
 func TestContextBoostsConfidence(t *testing.T) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := newBaselineRegistry(t)
 
 	withCtx, err := reg.Detect("客户的银行卡号是 4111111111111111")
 	if err != nil {
@@ -82,10 +79,7 @@ func TestContextWindowRespectsRuneBoundaries(t *testing.T) {
 // 如果加识别器的唯一途径是 fork，采纳方最终会维护一个 fork——
 // 而被 fork 的安全组件从此收不到上游修复。
 func TestCustomRecognizerRegistration(t *testing.T) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := newBaselineRegistry(t)
 
 	// An internal employee ID format nobody upstream could anticipate.
 	// 一种上游无从预料的内部工号格式。
@@ -139,10 +133,7 @@ func TestDuplicateRegistrationRejected(t *testing.T) {
 // TestRemoveDisablesRecognizer verifies a built-in can be turned off.
 // 校验内置识别器可以被关闭。
 func TestRemoveDisablesRecognizer(t *testing.T) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := newBaselineRegistry(t)
 	before, _ := reg.Detect("服务器地址 192.168.1.100")
 	hasIP := func(list []Entity) bool {
 		for _, e := range list {
@@ -167,10 +158,7 @@ func TestRemoveDisablesRecognizer(t *testing.T) {
 // TestDisabledTypesAtConstruction verifies types can be disabled up front.
 // 校验可在构造时关闭指定类型。
 func TestDisabledTypesAtConstruction(t *testing.T) {
-	reg, err := NewDefaultRegistry(TypeIP)
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := newBaselineRegistry(t, TypeIP)
 	for _, name := range reg.Names() {
 		if strings.Contains(name, "ipv4") {
 			t.Errorf("IP 已被禁用，不应注册 %s", name)
@@ -215,10 +203,7 @@ func (*recognizerErr) Error() string { return "识别器不可用 / recognizer u
 // TestOffsetsAreAccurateFromRegistry verifies offsets survive the registry path.
 // 校验经过注册中心后偏移量仍然精确。
 func TestOffsetsAreAccurateFromRegistry(t *testing.T) {
-	reg, err := NewDefaultRegistry()
-	if err != nil {
-		t.Fatal(err)
-	}
+	reg := newBaselineRegistry(t)
 	text := "客户张三的手机是 13812345678，邮箱 a@b.com"
 	got, err := reg.Detect(text)
 	if err != nil {

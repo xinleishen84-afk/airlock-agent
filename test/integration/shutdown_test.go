@@ -215,6 +215,7 @@ rate_limit:
   tokens_per_window: 100000000
   window: 1m
 pii:
+  jurisdictions: [GEN, CN]
   fail_closed: true
   name_roster: ["张伟"]
 gpu:
