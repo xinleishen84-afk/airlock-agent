@@ -50,6 +50,58 @@ type Redactor struct {
 	detector   detect.Detector
 	failClosed bool
 	allowed    map[detect.EntityType]bool // nil 表示不限类型
+	tokens     TokenStore                 // nil 表示不解析 [tok:...] 形态
+}
+
+// RedactorOption configures a Redactor at construction time.
+// 在构造期配置 Redactor。
+//
+// Options rather than setters: a gateway shares one Redactor across every
+// in-flight request, so a field mutated after start is a data race and, worse,
+// a policy change that takes effect halfway through a stream.
+// 用选项而非 setter：网关的所有在途请求共用同一个 Redactor，
+// 启动后再改字段既是数据竞争，更是一次「在流式响应中途生效」的策略变更。
+type RedactorOption func(*Redactor)
+
+// WithRedactTypes limits redaction to the given entity types.
+// 把脱敏限定在给定的实体类型上。
+func WithRedactTypes(types ...detect.EntityType) RedactorOption {
+	return func(r *Redactor) {
+		if len(types) == 0 {
+			return
+		}
+		r.allowed = make(map[detect.EntityType]bool, len(types))
+		for _, t := range types {
+			r.allowed[t] = true
+		}
+	}
+}
+
+// WithTokenStore lets Unredact resolve [tok:ns:token] values.
+// 让 Unredact 能解析 [tok:ns:token] 形态。
+//
+// Required whenever a flow uses the tokenize operator: without it the tokens
+// come back as phantoms and the end user is handed "[tok:email:9df3a0c1]"
+// where an address belongs.
+// 只要有链路使用令牌化算子就必须配置：否则令牌会被当成幻影，
+// 终端用户会在本该是邮箱的位置拿到 "[tok:email:9df3a0c1]"。
+func WithTokenStore(s TokenStore) RedactorOption {
+	return func(r *Redactor) {
+		if s == nil {
+			return
+		}
+		r.tokens = s
+	}
+}
+
+// NewRedactorWith builds a redactor from options.
+// 用选项构造脱敏器。
+func NewRedactorWith(detector detect.Detector, failClosed bool, opts ...RedactorOption) *Redactor {
+	r := &Redactor{detector: detector, failClosed: failClosed}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // NewRedactor builds a redactor.
@@ -73,9 +125,17 @@ func NewRedactor(detector detect.Detector, failClosed bool, redactTypes ...detec
 // RedactResult is the outcome of one redaction pass.
 // 是一次脱敏的结果。
 type RedactResult struct {
-	Text       string
-	Entities   []detect.Entity
+	Text     string
+	Entities []detect.Entity
+	// TypeCounts 记录每种实体类型被处理了几次。
 	TypeCounts map[string]int
+	// StrategyCounts 记录每个算子被用了几次。
+	//
+	// 审计需要的是「本次请求里 3 个值走了 hash、1 个走了 drop」，
+	// 而不只是「处理了 4 个 PII」——两次配置改动之间，后者完全一样。
+	// Audit needs "3 values were hashed and 1 was dropped", not just "4 PII
+	// handled": across a configuration change the latter reads identically.
+	StrategyCounts map[string]int
 }
 
 // Redact replaces PII in the text with placeholders.
@@ -84,6 +144,33 @@ type RedactResult struct {
 // Entities are applied in offset order so that earlier offsets stay valid.
 // 按偏移顺序处理，保证前面实体的偏移量不会失效。
 func (r *Redactor) Redact(text string, vault *SessionVault) (RedactResult, error) {
+	return r.RedactTo(text, vault, maskOnlyFlow)
+}
+
+// maskOnlyFlow is the policy Redact uses: placeholders for everything.
+// 是 Redact 使用的策略：一律占位符。
+var maskOnlyFlow = Flow{Name: "default", Default: NewMask(), Restores: true}
+
+// DefaultMaskFlow returns the placeholder-only policy.
+// 返回「一律占位符」的策略。
+//
+// This is what a deployment gets before it configures a matrix, and it is the
+// safe default precisely because it is reversible: the restore path works, so
+// nothing downstream breaks while the operator is still deciding.
+// 这是部署方在配置矩阵之前得到的策略，而它之所以是安全的默认值，
+// 恰恰因为它可逆：复原路径能工作，于是运维还在斟酌配置期间，下游不会坏。
+func DefaultMaskFlow() Flow { return maskOnlyFlow }
+
+// RedactTo redacts according to one flow's strategy matrix.
+// 按某条链路的策略矩阵脱敏。
+//
+// Entities are applied in offset order so that earlier offsets stay valid.
+// 按偏移顺序处理，保证前面实体的偏移量不会失效。
+func (r *Redactor) RedactTo(text string, vault *SessionVault, flow Flow) (RedactResult, error) {
+	if flow.Default == nil {
+		return RedactResult{}, fmt.Errorf("%w: 链路 %q 没有默认算子 / flow %q has no default strategy",
+			ErrRedactionFailed, flow.Name, flow.Name)
+	}
 	if text == "" {
 		return RedactResult{Text: text}, nil
 	}
@@ -121,18 +208,37 @@ func (r *Redactor) Redact(text string, vault *SessionVault) (RedactResult, error
 	b.Grow(len(text))
 	cursor := 0
 	counts := make(map[string]int)
+	stratCounts := make(map[string]int)
 	for _, e := range ordered {
 		if e.Start < cursor {
 			continue // should not happen after overlap resolution; defensive / 防御性跳过
 		}
+		strategy := flow.Strategy(e.Type)
+		replacement, err := strategy.Apply(e, vault)
+		if err != nil {
+			// 算子失败一律阻断，不受 fail_closed 影响：fail_closed 说的是
+			// 「检测器不可用时怎么办」，而算子失败意味着这个已经检出的 PII
+			// 没能被处理。放行它等同于明知有 PII 仍原样送出。
+			// A strategy failure always blocks, regardless of fail_closed:
+			// that setting is about an unavailable detector, whereas this is a
+			// PII value already found and not handled. Letting it through is
+			// shipping known PII verbatim.
+			return RedactResult{}, fmt.Errorf(
+				"%w: 链路 %q 的 %s 算子处理 %s 失败: %v",
+				ErrRedactionFailed, flow.Name, strategy.Name(), e.Type, err)
+		}
 		b.WriteString(text[cursor:e.Start])
-		b.WriteString(vault.PlaceholderFor(e))
+		b.WriteString(replacement)
 		cursor = e.End
 		counts[string(e.Type)]++
+		stratCounts[strategy.Name()]++
 	}
 	b.WriteString(text[cursor:])
 
-	return RedactResult{Text: b.String(), Entities: entities, TypeCounts: counts}, nil
+	return RedactResult{
+		Text: b.String(), Entities: entities,
+		TypeCounts: counts, StrategyCounts: stratCounts,
+	}, nil
 }
 
 // UnredactResult is the outcome of one restoration pass.
@@ -184,7 +290,53 @@ func (r *Redactor) Unredact(text string, vault *SessionVault) UnredactResult {
 	}
 	b.WriteString(text[cursor:])
 	res.Text = b.String()
+
+	if r.tokens != nil {
+		r.unredactTokens(&res)
+	}
 	return res
+}
+
+// tokenRe matches a tokenize-operator output.
+// 匹配令牌化算子的输出。
+var tokenRe = regexp.MustCompile(`\[tok:([a-z0-9_]+):([0-9a-fA-F]{8,64})\]`)
+
+// completeTokenRe tells whether a token has fully appeared.
+// 判断一个令牌是否已完整出现。
+var completeTokenRe = regexp.MustCompile(`\[tok:[a-z0-9_]+:[0-9a-fA-F]{8,64}\]`)
+
+// unredactTokens resolves [tok:ns:token] values in place.
+// 就地解析 [tok:ns:token]。
+//
+// Unresolvable tokens are recorded as phantoms and left verbatim, exactly like
+// placeholders. A model that invents a plausible-looking token must not cause
+// the gateway to invent a plausible-looking person.
+// 解析不了的令牌与占位符一样，记为幻影并原样保留。
+// 模型凭空造出一个像模像样的令牌，不能让网关跟着造出一个像模像样的人。
+func (r *Redactor) unredactTokens(res *UnredactResult) {
+	text := res.Text
+	if !strings.Contains(text, "[tok:") {
+		return
+	}
+
+	var b strings.Builder
+	b.Grow(len(text))
+	cursor := 0
+	for _, m := range tokenRe.FindAllStringSubmatchIndex(text, -1) {
+		ns := text[m[2]:m[3]]
+		tok := strings.ToLower(text[m[4]:m[5]])
+		value, ok := r.tokens.Resolve(ns, tok)
+		if !ok {
+			res.Phantom = append(res.Phantom, text[m[0]:m[1]])
+			continue
+		}
+		b.WriteString(text[cursor:m[0]])
+		b.WriteString(value)
+		cursor = m[1]
+		res.Restored++
+	}
+	b.WriteString(text[cursor:])
+	res.Text = b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -267,33 +419,55 @@ func (s *StreamUnredactor) Phantom() []string { return s.phantom }
 // 尾部只要可能是半个占位符（含 ANONYMIZED 前缀的任意真前缀），
 // 就必须留到下一个分片再判定，否则占位符会被拆开输出给用户。
 func splitSafePrefix(buf string) (safe, held string) {
-	const marker = PlaceholderPrefix // "ANONYMIZED_"
+	// 两种可复原构造都要滞留，取更靠前的切点。
+	//
+	// 只认 "ANONYMIZED_" 会让一个被帧边界切开的 [tok:email:9df3a0c1]
+	// 前半截直接发给终端用户——既泄露了令牌，也让剩下的半截永远还原不了。
+	// Holding back only "ANONYMIZED_" lets the first half of a frame-split
+	// [tok:email:9df3a0c1] reach the end user: the token leaks and the
+	// remainder can never be restored.
+	cut := len(buf)
+	if c := holdPoint(buf, PlaceholderPrefix, completePlaceholderRe); c < cut {
+		cut = c
+	}
+	if c := holdPoint(buf, tokenPrefix, completeTokenRe); c < cut {
+		cut = c
+	}
+	return buf[:cut], buf[cut:]
+}
 
+// tokenPrefix is the literal that opens a tokenize-operator output.
+// 是令牌化算子输出的起始字面量。
+const tokenPrefix = "[tok:"
+
+// holdPoint returns the offset from which the buffer must be held back for one
+// marker, or len(buf) if nothing is pending.
+// 返回针对某个标记必须开始滞留的偏移；没有待完成构造时返回 len(buf)。
+func holdPoint(buf, marker string, complete *regexp.Regexp) int {
 	searchFrom := 0
 	if len(buf) > maxPlaceholderLen {
 		searchFrom = len(buf) - maxPlaceholderLen
 	}
-	idx := strings.LastIndex(strings.ToUpper(buf[searchFrom:]), marker)
+	idx := strings.LastIndex(strings.ToUpper(buf[searchFrom:]), strings.ToUpper(marker))
 
 	if idx < 0 {
-		// 也可能尾部正在拼 "ANONYM" 这样的半个前缀
+		// 也可能尾部正在拼 "ANONYM" 或 "[to" 这样的半个前缀
 		upper := strings.ToUpper(buf)
 		for n := min(len(marker)-1, len(buf)); n > 0; n-- {
-			if strings.HasSuffix(upper, marker[:n]) {
-				return buf[:len(buf)-n], buf[len(buf)-n:]
+			if strings.HasSuffix(upper, strings.ToUpper(marker[:n])) {
+				return len(buf) - n
 			}
 		}
-		return buf, ""
+		return len(buf)
 	}
 
 	abs := searchFrom + idx
-	tail := buf[abs:]
-	// A trailing non-identifier char means the placeholder is complete.
-	// 已出现结束特征说明占位符是完整的
-	if completePlaceholderRe.MatchString(tail) {
-		return buf, ""
+	// A trailing non-identifier char means the construct is complete.
+	// 已出现结束特征说明构造是完整的
+	if complete.MatchString(buf[abs:]) {
+		return len(buf)
 	}
-	return buf[:abs], tail
+	return abs
 }
 
 // completePlaceholderRe tells whether a placeholder has fully appeared

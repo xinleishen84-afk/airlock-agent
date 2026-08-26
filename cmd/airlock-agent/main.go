@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
@@ -47,6 +48,13 @@ var (
 			"一个都不装意味着任何文本都扫不出 PII，且看起来像「数据很干净」")
 	tenantRules = flag.String("tenant-rules", "",
 		"租户自定义 YAML 规则目录（工号、资产编号等企业内部标识）")
+	matrixFile = flag.String("redaction-matrix", "",
+		"脱敏策略矩阵配置。配置后请求必须带 destination 字段")
+	hashKeyFile = flag.String("hash-key-file", "",
+		"HMAC 密钥文件（密钥卷挂载点）。矩阵里用到 hash 算子时必填。\n"+
+			"密钥绝不能写进配置文件——与策略文件同行的密钥会随它的每一份副本流传")
+	ontologyFile = flag.String("ontology", "",
+		"本体词表 YAML。矩阵里用到 generalize 算子时必填")
 	logLevel = flag.String("log-level", "info", "日志级别")
 )
 
@@ -62,8 +70,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	matrix, tokenStore, err := buildMatrix()
+	if err != nil {
+		logger.Error("构造脱敏策略矩阵失败", "err", err)
+		os.Exit(1)
+	}
+	if matrix != nil {
+		logger.Info("脱敏策略矩阵已生效", "流向", matrix.Destinations())
+		fmt.Fprint(os.Stderr, matrix.Describe())
+	}
+
 	srv, err := sidecar.New(sidecar.Options{
 		Detector:    detector,
+		Matrix:      matrix,
+		TokenStore:  tokenStore,
 		FailClosed:  *failClosed,
 		SessionTTL:  *sessionTTL,
 		MaxSessions: *maxSessions,
@@ -217,4 +237,55 @@ func newLogger(level string) *slog.Logger {
 		l = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
+}
+
+// buildMatrix 装配脱敏策略矩阵。
+//
+// 密钥与词表由本函数从磁盘读取后交给矩阵，而不是由矩阵配置自己去读：
+// 配置描述策略，进程提供材料。一份能自行拉取密钥的策略文件，
+// 等于把密钥路径也变成了策略的一部分，任何能改配置的人都能改它指向哪。
+//
+// buildMatrix assembles the redaction matrix. The key and ontology are read
+// here and handed in, rather than fetched by the matrix config itself: config
+// describes policy, the process supplies material. A policy file that can
+// fetch its own key makes the key path part of the policy, and anyone who can
+// edit the policy can point it elsewhere.
+func buildMatrix() (*anonymize.Matrix, anonymize.TokenStore, error) {
+	if *matrixFile == "" {
+		if *hashKeyFile != "" || *ontologyFile != "" {
+			return nil, nil, fmt.Errorf(
+				"配置了 --hash-key-file / --ontology 但没有 --redaction-matrix，" +
+					"这些材料不会被任何算子使用")
+		}
+		return nil, nil, nil
+	}
+
+	deps := anonymize.MatrixDeps{TokenStore: anonymize.NewMemoryTokenStore()}
+
+	if *hashKeyFile != "" {
+		key, err := os.ReadFile(*hashKeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("读取 HMAC 密钥失败: %w", err)
+		}
+		// 密钥文件常带尾部换行，原样使用会让同一把密钥因写入方式不同
+		// 产生两组互不相容的摘要——跨系统关联就此断掉，且不会报错。
+		// Key files usually carry a trailing newline; using it verbatim makes
+		// one key produce two incompatible digest sets depending on how it was
+		// written, silently breaking cross-system correlation.
+		deps.HashKey = []byte(strings.TrimSpace(string(key)))
+	}
+
+	if *ontologyFile != "" {
+		o, err := anonymize.LoadOntologyFile(*ontologyFile)
+		if err != nil {
+			return nil, nil, err
+		}
+		deps.Ontology = o
+	}
+
+	m, err := anonymize.LoadMatrixFile(*matrixFile, deps)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, deps.TokenStore, nil
 }

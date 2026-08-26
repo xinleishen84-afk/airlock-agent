@@ -1,0 +1,67 @@
+# 脱敏策略矩阵 / Redaction strategy matrix
+#
+# [REDACTED] 是对某一个问题的答案，而对大多数问题都是错的答案：
+# 需要统计去重用户数的分析仓库用不了它；需要让「他」始终指向同一个人的
+# 模型用不了它；而必须一个字节都不出去的 DLP 红线，也不会满足于一个
+# 仍然为这些字节留着位置的占位符。因此算子由数据的去向决定。
+#
+# [REDACTED] answers one question and is the wrong answer to most others.
+# The operator is therefore chosen by where the data is going.
+#
+# 密钥不在这里。HMAC 密钥由进程从密钥卷读取（--hash-key-file），
+# 因为与策略文件同行的密钥，会随策略文件的每一份副本一起流传。
+# The HMAC key is not in this file: a key that travels with the policy travels
+# with every copy of it.
+version: 1
+
+options:
+  char_mask:
+    char: "*"
+    keep: 4          # 保留末四位是展示层的选择，不是隐私控制手段
+  hash:
+    digits: 8        # 越短越可读，也越容易碰撞：约 7.7 万个不同值时碰撞率 50%
+  generalize:
+    granularity: decade    # year | decade
+    fallback: char_mask    # 词表未覆盖的值走这个算子，绝不原样通过
+
+flows:
+  # 公有云大模型：占位符保持语法与指代一致，同一个人在第 1 轮和第 9 轮
+  # 都是 ANONYMIZED_NAME_0，于是「他」仍然解析得了。响应要复原，
+  # 因此本链路只允许可逆算子（mask / tokenize）。
+  # Public-cloud LLM: placeholders keep grammar and coreference intact.
+  - name: public_llm
+    restores: true
+    default: mask
+
+  # 跨系统伪名化：令牌在另一个系统里含义相同，可用于关联；
+  # 代价是令牌库本身成了 PII 数据库，需要与原始数据同级的管控。
+  # Cross-system pseudonymization: the token store is itself a PII database.
+  - name: pseudonymous
+    restores: true
+    default: tokenize
+
+  # 分析数仓：需要可关联的假名，不需要还原。
+  # 手机号在数仓里没有分析价值，直接切除。
+  # Analytics warehouse: joinable pseudonyms, no restoration.
+  - name: analytics
+    default: hash
+    by_type:
+      PHONE: drop
+      BANK_CARD: drop
+
+  # DLP 红线归档：要求是字节不出去，而不是打上标签再出去。
+  # DLP hard line: the bytes must not leave, not leave labelled.
+  - name: archive
+    default: drop
+
+  # 研究导出：日期粗化到十年、职业泛化到上位词，保住统计效用。
+  # 注意：泛化不是隐私保证。「1990 年代」加上一个罕见专科加上一座小城，
+  # 仍然可能恰好是一个人。k-匿名是整个发布数据集的属性，网关算不了。
+  # Research export: generalization preserves utility. It is not a privacy
+  # guarantee — k-anonymity is a property of the released corpus.
+  - name: research_export
+    default: drop
+    by_type:
+      ID_CARD: generalize
+      ORG: generalize
+      ADDRESS: generalize

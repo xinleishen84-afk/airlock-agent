@@ -3,6 +3,7 @@ package sidecar
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -319,4 +320,103 @@ func TestCoverageGapExposed(t *testing.T) {
 	if len(stats.CoverageGaps) == 0 {
 		t.Error("仅有正则检测器时应报告覆盖缺口——否则运维不知道姓名在裸奔")
 	}
+}
+
+// 配了矩阵之后，缺 destination 必须拒绝，不能静默回退。
+// With a matrix configured, a missing destination must be rejected.
+func TestDestinationRequiredWhenMatrixConfigured(t *testing.T) {
+	m := anonymize.NewMatrix()
+	m.MustAdd(anonymize.Flow{
+		Name: "public_llm", Default: anonymize.NewMask(), Restores: true,
+	})
+	m.MustAdd(anonymize.Flow{Name: "archive", Default: anonymize.NewDrop()})
+
+	ts := newMatrixTestServer(t, m)
+
+	t.Run("缺 destination", func(t *testing.T) {
+		code, body := ts.post(t, "/v1/redact", `{"session_id":"s1","text":"手机 13812345678"}`)
+		if code != http.StatusBadRequest {
+			t.Fatalf("应返回 400，实际 %d：%s", code, body)
+		}
+		if !strings.Contains(body, "destination") {
+			t.Fatalf("报错应提示 destination：%s", body)
+		}
+	})
+
+	t.Run("未知 destination", func(t *testing.T) {
+		code, body := ts.post(t, "/v1/redact",
+			`{"session_id":"s1","destination":"nowhere","text":"手机 13812345678"}`)
+		if code != http.StatusBadRequest {
+			t.Fatalf("应返回 400，实际 %d：%s", code, body)
+		}
+	})
+
+	t.Run("按流向选算子", func(t *testing.T) {
+		_, masked := ts.post(t, "/v1/redact",
+			`{"session_id":"s1","destination":"public_llm","text":"手机 13812345678"}`)
+		if !strings.Contains(masked, "ANONYMIZED_PHONE_0") {
+			t.Fatalf("public_llm 应走占位符：%s", masked)
+		}
+		_, dropped := ts.post(t, "/v1/redact",
+			`{"session_id":"s1","destination":"archive","text":"手机 13812345678"}`)
+		if strings.Contains(dropped, "ANONYMIZED") || strings.Contains(dropped, "13812345678") {
+			t.Fatalf("archive 应切除：%s", dropped)
+		}
+		if !strings.Contains(dropped, `"drop":1`) {
+			t.Fatalf("响应应带算子计数：%s", dropped)
+		}
+	})
+}
+
+// 没配矩阵时指定 destination 必须拒绝，不能静默忽略。
+// Without a matrix, naming a destination must be rejected, not ignored.
+//
+// 静默忽略会让调用方以为归档链路的切除策略生效了，
+// 实际上数据带着占位符原样发了出去 —— 占位符在归档场景里就是泄露。
+// Silently ignoring it lets the caller believe the archive drop policy took
+// effect while placeholders shipped instead — which in an archive is a leak.
+func TestDestinationRejectedWithoutMatrix(t *testing.T) {
+	ts := newMatrixTestServer(t, nil)
+	code, body := ts.post(t, "/v1/redact",
+		`{"session_id":"s1","destination":"archive","text":"手机 13812345678"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("应返回 400，实际 %d：%s", code, body)
+	}
+	t.Logf("按预期拒绝：%s", body)
+}
+
+// matrixTestServer 是带策略矩阵的测试服务器。
+type matrixTestServer struct{ url string }
+
+func newMatrixTestServer(t *testing.T, m *anonymize.Matrix) matrixTestServer {
+	t.Helper()
+	srv, err := New(Options{
+		Detector:    packs.MustNewRegistry([]string{"GEN", "CN"}),
+		FailClosed:  true,
+		SessionTTL:  time.Hour,
+		MaxSessions: 100,
+		Matrix:      m,
+		TokenStore:  anonymize.NewMemoryTokenStore(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return matrixTestServer{url: ts.URL}
+}
+
+func (m matrixTestServer) post(t *testing.T, path, body string) (int, string) {
+	t.Helper()
+	resp, err := http.Post(m.url+path, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(b)
 }

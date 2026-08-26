@@ -41,6 +41,18 @@ type RedactRequest struct {
 	// Text 是单段文本模式。与 Payload 二选一——
 	// 网关若只想脱敏某个字段，用这个更直接。
 	Text string `json:"text,omitempty"`
+
+	// Destination 指定数据流向，决定使用哪一组脱敏算子。
+	//
+	// 同一份请求体发往公有云模型、分析数仓和冷归档，需要的算子并不相同：
+	// 模型要指代一致的占位符，数仓要可关联的假名，归档要字节消失。
+	// 未配置矩阵时留空即可，此时一律使用占位符遮罩。
+	//
+	// Destination selects which operators apply. The same body bound for a
+	// public-cloud model, an analytics warehouse and a cold archive needs
+	// different ones. Leave empty when no matrix is configured; placeholder
+	// masking is then used throughout.
+	Destination string `json:"destination,omitempty"`
 }
 
 // RedactResponse is a redaction result.
@@ -53,6 +65,14 @@ type RedactResponse struct {
 	// EntityCounts 是本次脱敏的实体类型计数。
 	// 只给计数不给值——审计日志会长期归档，一旦写进真实值就是永久泄露。
 	EntityCounts map[string]int `json:"entity_counts"`
+
+	// StrategyCounts 是各脱敏算子的使用次数。
+	//
+	// 审计要回答的是「这条链路上有几个值被哈希、几个被切除」，
+	// 而这在两次配置改动之间恰恰是唯一会变的数字——只看实体计数看不出来。
+	// Audit needs "how many values were hashed and how many dropped": across a
+	// configuration change that is the only number that moves.
+	StrategyCounts map[string]int `json:"strategy_counts,omitempty"`
 
 	// Blocked 为 true 表示按 fail-closed 阻断了请求。
 	// 网关收到后应向调用方返回错误，绝不能放行原始载荷。
@@ -115,4 +135,12 @@ type StatsResponse struct {
 	// NERCacheHitRate 反映 NER 缓存效果。偏低说明文本变化频繁，
 	// NER 的延迟成本会直接压在 TTFT 上。
 	NERCacheHitRate float64 `json:"ner_cache_hit_rate,omitempty"`
+
+	// RedactionMatrix 是当前生效的脱敏策略矩阵。
+	//
+	// 从运行中的进程产出，而不是从某个人以为已经部署了的配置文件产出——
+	// 这两者不一致，正是审计要查的那种事。
+	// Produced from the live process, not from the config file someone
+	// believes is deployed: the gap between those two is what audit looks for.
+	RedactionMatrix string `json:"redaction_matrix,omitempty"`
 }

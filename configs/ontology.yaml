@@ -1,0 +1,19 @@
+# 本体词表示例 / Example ontology
+#
+# 刻意不内置：内置一套医学或职业层级，对多数部署都是错的，
+# 更糟的是错得看不见——表里没有的词会走兜底算子，
+# 于是一张「看起来像那么回事」但与语料对不上的表，
+# 会泛化掉一部分值、把其余的交给兜底。
+# 真正的层级体系（SNOMED CT、ICD、ISCO）有授权、有版本、分领域。
+#
+# Shipped as an example, never built in: the real hierarchies (SNOMED CT, ICD,
+# ISCO) are licensed, versioned and domain-specific.
+terms:
+  外科医生: 医生
+  心内科医生: 医生
+  神经外科医生: 医生
+  麻醉师: 医生
+  上海市浦东新区: 上海市
+  北京市海淀区: 北京市
+  surgeon: physician
+  cardiologist: physician

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,7 +31,24 @@ type Options struct {
 	MaxSessions int
 	// MaxBodyBytes 限制单次请求体大小
 	MaxBodyBytes int64
-	Logger       *slog.Logger
+
+	// Matrix 是脱敏策略矩阵。为 nil 时一律使用占位符遮罩。
+	//
+	// 配置了矩阵之后，请求必须带 destination：一个既配了矩阵、
+	// 又允许不指定流向的服务，会在调用方漏传字段时静默回退到
+	// 某条默认策略，把数据按为别处写的规则发出去。
+	//
+	// When a matrix is configured, requests must name a destination. A service
+	// that allows both would silently fall back to some default policy when a
+	// caller forgets the field, shipping data under rules written for
+	// somewhere else.
+	Matrix *anonymize.Matrix
+
+	// TokenStore 支撑 tokenize 算子的复原。矩阵里用到 tokenize 时必填。
+	// Backs restoration for the tokenize operator; required when it is used.
+	TokenStore anonymize.TokenStore
+
+	Logger *slog.Logger
 }
 
 // Server is the PII redaction sidecar.
@@ -80,8 +98,9 @@ func New(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:         opts,
-		redactor:     anonymize.NewRedactor(opts.Detector, opts.FailClosed),
+		opts: opts,
+		redactor: anonymize.NewRedactorWith(opts.Detector, opts.FailClosed,
+			anonymize.WithTokenStore(opts.TokenStore)),
 		vaults:       anonymize.NewVaultRegistry(opts.SessionTTL, opts.MaxSessions),
 		logger:       opts.Logger,
 		streamers:    map[string]*streamEntry{},
@@ -114,6 +133,43 @@ func (s *Server) Handler() http.Handler {
 	return m
 }
 
+// resolveFlow 把请求里的 destination 解析为脱敏策略。
+//
+// 三种情形各有其唯一安全的处理：
+//   - 未配矩阵、也未指定流向：一律占位符遮罩，即本服务原有的行为
+//   - 配了矩阵却没指定流向：拒绝。回退到某条默认策略等于把数据按
+//     为别处写的规则发出去，而调用方不会知道
+//   - 指定了未知流向：拒绝，并列出已配置的流向
+//
+// resolveFlow turns the request's destination into a policy. Falling back to
+// some default when a matrix is configured would ship data under rules written
+// for somewhere else, with the caller none the wiser.
+func (s *Server) resolveFlow(w http.ResponseWriter, dest string) (anonymize.Flow, bool) {
+	if s.opts.Matrix == nil {
+		if dest != "" {
+			s.fail(w, http.StatusBadRequest,
+				"请求指定了 destination="+dest+"，但本服务未配置脱敏策略矩阵——"+
+					"按指定流向处理是做不到的，静默忽略又会让调用方以为生效了", false)
+			return anonymize.Flow{}, false
+		}
+		return anonymize.DefaultMaskFlow(), true
+	}
+
+	if dest == "" {
+		s.fail(w, http.StatusBadRequest,
+			"已配置脱敏策略矩阵，请求必须指定 destination。已配置："+
+				strings.Join(s.opts.Matrix.Destinations(), ", "), false)
+		return anonymize.Flow{}, false
+	}
+
+	flow, err := s.opts.Matrix.Flow(anonymize.Destination(dest))
+	if err != nil {
+		s.fail(w, http.StatusBadRequest, err.Error(), false)
+		return anonymize.Flow{}, false
+	}
+	return flow, true
+}
+
 // handleRedact applies structured, AST-directed sanitization to an outbound
 // payload.
 // 对出站载荷执行结构化 AST 定向清洗。
@@ -136,19 +192,28 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	flow, ok := s.resolveFlow(w, req.Destination)
+	if !ok {
+		return
+	}
+
 	counts := map[string]int{}
+	stratCounts := map[string]int{}
 	transform := func(text string) (string, error) {
-		res, err := s.redactor.Redact(text, vault)
+		res, err := s.redactor.RedactTo(text, vault, flow)
 		if err != nil {
 			return "", err
 		}
 		for typ, n := range res.TypeCounts {
 			counts[typ] += n
 		}
+		for name, n := range res.StrategyCounts {
+			stratCounts[name] += n
+		}
 		return res.Text, nil
 	}
 
-	resp := RedactResponse{EntityCounts: counts}
+	resp := RedactResponse{EntityCounts: counts, StrategyCounts: stratCounts}
 	switch {
 	case req.Payload != nil:
 		// 深拷贝后再改，避免把调用方传来的结构改坏
@@ -328,6 +393,9 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 		RestoreCalls:   s.restoreCalls.Load(),
 		BlockedCalls:   s.blockedCalls.Load(),
 		EntityCounts:   counts,
+	}
+	if s.opts.Matrix != nil {
+		resp.RedactionMatrix = s.opts.Matrix.Describe()
 	}
 	if comp, ok := s.opts.Detector.(*detect.CompositeDetector); ok {
 		for _, t := range comp.Missing() {
