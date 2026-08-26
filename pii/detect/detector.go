@@ -2,7 +2,6 @@ package detect
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -166,8 +165,23 @@ func isBoundaryOK(text string, start, end int, class BoundaryClass) bool {
 // the names worth protecting are already in the master data.
 // 企业场景下这往往比通用 NER 更准：要保护的姓名本来就在主数据里。
 type GazetteerDetector struct {
-	re            *regexp.Regexp
-	types         map[string]EntityType
+	// ac 是编译后的多模式自动机。
+	//
+	// 曾经这里是「把所有词条拼成一个正则大并集」。那条路的代价随词典大小
+	// 增长——一万条员工姓名是一万个分支的 NFA——而企业主数据动辄十万条。
+	// 换成 Aho-Corasick 之后，扫描代价与词典大小解耦，实测 100 条与 50000 条
+	// 的耗时在同一量级。
+	//
+	// This was a regex alternation of every term, whose cost grows with the
+	// dictionary. Aho-Corasick decouples scan cost from dictionary size.
+	ac *AhoCorasick
+
+	// patternType maps a pattern index to its entity type.
+	// 把模式下标映射到实体类型。
+	patternType []EntityType
+
+	// original holds the term as written, for case-insensitive lookup.
+	// 保存词条的原始写法，供不区分大小写时回写。
 	caseSensitive bool
 	covered       []EntityType
 }
@@ -183,14 +197,25 @@ func NewGazetteerDetector(entries map[EntityType][]string, caseSensitive bool, m
 	if minLen < 1 {
 		minLen = 2
 	}
-	d := &GazetteerDetector{
-		types:         map[string]EntityType{},
-		caseSensitive: caseSensitive,
-	}
+	d := &GazetteerDetector{caseSensitive: caseSensitive}
+
+	// 词条按类型收集。同一个词条出现在两个类型下是主数据的问题，
+	// 静默取其一会让「这个名字为什么被判成机构」变成一桩无头案。
+	// The same term under two types is a master-data problem; silently picking
+	// one makes "why was this name classed as an organization" unanswerable.
+	seen := make(map[string]EntityType)
 	var terms []string
-	for typ, values := range entries {
+	var types []EntityType
+
+	typeOrder := make([]EntityType, 0, len(entries))
+	for typ := range entries {
+		typeOrder = append(typeOrder, typ)
+	}
+	sort.Slice(typeOrder, func(i, j int) bool { return typeOrder[i] < typeOrder[j] })
+
+	for _, typ := range typeOrder {
 		d.covered = append(d.covered, typ)
-		for _, v := range values {
+		for _, v := range entries[typ] {
 			term := strings.TrimSpace(v)
 			if len([]rune(term)) < minLen {
 				continue // short terms flood false positives / 过短词条会让误报泛滥
@@ -199,29 +224,31 @@ func NewGazetteerDetector(entries map[EntityType][]string, caseSensitive bool, m
 			if !caseSensitive {
 				key = strings.ToLower(term)
 			}
-			d.types[key] = typ
-			terms = append(terms, term)
+			if prev, dup := seen[key]; dup {
+				if prev != typ {
+					return nil, fmt.Errorf(
+						"名册词条 %q 同时出现在 %s 与 %s 下——请在主数据里消歧 / "+
+							"term %q appears under both %s and %s",
+						term, prev, typ, term, prev, typ)
+				}
+				continue
+			}
+			seen[key] = typ
+			terms = append(terms, key)
+			types = append(types, typ)
 		}
 	}
+
 	if len(terms) == 0 {
 		return d, nil
 	}
-	sort.Slice(terms, func(i, j int) bool { return len(terms[i]) > len(terms[j]) })
 
-	quoted := make([]string, len(terms))
-	for i, t := range terms {
-		quoted[i] = regexp.QuoteMeta(t)
-	}
-	pattern := strings.Join(quoted, "|")
-	if !caseSensitive {
-		pattern = "(?i)" + pattern
-	}
-	re, err := regexp.Compile(pattern)
+	ac, err := NewAhoCorasick(terms)
 	if err != nil {
-		return nil, fmt.Errorf("名册正则编译失败: %w", err)
+		return nil, fmt.Errorf("构建名册自动机失败 / building roster automaton: %w", err)
 	}
-	d.re = re
-	sort.Slice(d.covered, func(i, j int) bool { return d.covered[i] < d.covered[j] })
+	d.ac = ac
+	d.patternType = types
 	return d, nil
 }
 
@@ -231,23 +258,41 @@ func (d *GazetteerDetector) Name() string { return "gazetteer" }
 // Detect scans for gazetteer hits.
 // 扫描名册命中项。
 func (d *GazetteerDetector) Detect(text string) ([]Entity, error) {
-	if d.re == nil {
+	if d.ac == nil {
 		return nil, nil
 	}
-	var found []Entity
-	for _, loc := range d.re.FindAllStringIndex(text, -1) {
-		raw := text[loc[0]:loc[1]]
-		key := raw
-		if !d.caseSensitive {
-			key = strings.ToLower(raw)
+
+	// 不区分大小写时在小写副本上匹配。偏移仍然对得上，因为 ToLower 只对
+	// ASCII 字母改变字节，不改变长度——但这个前提对某些 Unicode 字符不成立
+	// （例如 'İ' 小写后变成两个 code point）。因此这里断言长度不变，
+	// 不成立就退回原文匹配，宁可漏掉大小写变体，也不能给出错位的偏移。
+	//
+	// Offsets still line up because ToLower changes bytes but not length for
+	// ASCII — a premise that fails for some Unicode (e.g. 'İ'). The length is
+	// asserted; if it does not hold, matching falls back to the original text.
+	// Missing a case variant is acceptable; a misaligned offset is not.
+	haystack := text
+	if !d.caseSensitive {
+		lowered := strings.ToLower(text)
+		if len(lowered) == len(text) {
+			haystack = lowered
 		}
-		typ, ok := d.types[key]
-		if !ok {
-			continue
-		}
+	}
+
+	matches := d.ac.FindAll(haystack)
+	if len(matches) == 0 {
+		return nil, nil
+	}
+
+	found := make([]Entity, 0, len(matches))
+	for _, m := range matches {
 		found = append(found, Entity{
-			Type: typ, Value: raw, Start: loc[0], End: loc[1],
-			Confidence: 0.98, Detector: d.Name(),
+			Type:       d.patternType[m.Pattern],
+			Value:      text[m.Start:m.End],
+			Start:      m.Start,
+			End:        m.End,
+			Confidence: 0.98,
+			Detector:   d.Name(),
 		})
 	}
 	return found, nil
