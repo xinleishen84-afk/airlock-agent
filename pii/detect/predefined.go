@@ -68,11 +68,13 @@ func predefinedSpecs() []predefinedSpec {
 			expr: `[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`,
 			// Email needs no boundary or context: the shape is unambiguous.
 			// 邮箱不需要边界或上下文：形态本身就无歧义。
+			opts: []PatternOption{WithPrefilter(requireByte("@"))},
 		},
 		{
 			name: "cn_id_card", entityType: TypeIDCard, score: 0.90,
 			expr: `[0-9]{17}[0-9Xx]`,
 			opts: []PatternOption{
+				WithPrefilter(requireDigit),
 				WithBoundary(boundaryDigit),
 				WithValidator(CNIDCardValid, false),
 				WithContext(contextBoost, "身份证", "证件号", "identity", "id card", "id no"),
@@ -82,6 +84,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "cn_mobile", entityType: TypePhone, score: 0.85,
 			expr: `1[3-9][0-9]{9}`,
 			opts: []PatternOption{
+				WithPrefilter(requireDigit),
 				WithBoundary(boundaryDigitSep),
 				WithContext(contextBoost, "手机", "电话", "联系", "phone", "mobile", "tel"),
 			},
@@ -89,12 +92,14 @@ func predefinedSpecs() []predefinedSpec {
 		{
 			name: "cn_landline", entityType: TypePhone, score: 0.85,
 			expr: `0[0-9]{2,3}-[0-9]{7,8}`,
-			opts: []PatternOption{WithBoundary(boundaryDigitSep)},
+			opts: []PatternOption{
+				WithPrefilter(requireByte("-")), WithBoundary(boundaryDigitSep)},
 		},
 		{
 			name: "intl_phone", entityType: TypePhone, score: 0.85,
 			expr: `\+[0-9]{1,3}[\s\-]?[0-9]{6,14}`,
-			opts: []PatternOption{WithBoundary(boundaryDigit)},
+			opts: []PatternOption{
+				WithPrefilter(requireByte("+")), WithBoundary(boundaryDigit)},
 		},
 		{
 			// Grouped form: four-digit blocks. Deliberately separate from the
@@ -107,6 +112,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "bank_card_grouped", entityType: TypeBankCard, score: 0.80,
 			expr: `[0-9]{4}(?:[ \-][0-9]{4}){2,4}`,
 			opts: []PatternOption{
+				WithPrefilter(requireDigit),
 				WithBoundary(boundaryDigitSep),
 				WithValidator(LuhnValid, true),
 				WithContext(contextBoost, "卡号", "银行卡", "信用卡", "card", "credit"),
@@ -116,6 +122,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "bank_card_plain", entityType: TypeBankCard, score: 0.80,
 			expr: `[0-9]{12,19}`,
 			opts: []PatternOption{
+				WithPrefilter(requireDigit),
 				WithBoundary(boundaryDigitSep),
 				WithValidator(LuhnValid, false),
 				WithContext(contextBoost, "卡号", "银行卡", "信用卡", "card", "credit"),
@@ -128,6 +135,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "iban", entityType: TypeIBAN, score: 0.95,
 			expr: `[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]{4}){2,7}[A-Z0-9]{0,4}`,
 			opts: []PatternOption{
+				WithPrefilter(requireUpperAlpha),
 				WithBoundary(boundaryAlnum),
 				WithValidator(IBANValid, true),
 				WithContext(contextBoost, "iban", "账号", "account", "银行"),
@@ -137,6 +145,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "cn_uscc", entityType: TypeUSCC, score: 0.90,
 			expr: `[0-9A-HJ-NPQRTUWXY]{2}[0-9]{6}[0-9A-HJ-NPQRTUWXY]{10}`,
 			opts: []PatternOption{
+				WithPrefilter(requireUpperAlpha),
 				WithBoundary(boundaryAlnum),
 				WithValidator(CNUSCCValid, false),
 			},
@@ -145,6 +154,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "us_ssn", entityType: TypeSSN, score: 0.85,
 			expr: `[0-9]{3}-[0-9]{2}-[0-9]{4}`,
 			opts: []PatternOption{
+				WithPrefilter(requireByte("-")),
 				WithBoundary(boundaryDigit),
 				WithContext(contextBoost, "ssn", "social security"),
 			},
@@ -157,6 +167,7 @@ func predefinedSpecs() []predefinedSpec {
 			name: "cn_passport", entityType: TypePassport, score: 0.60,
 			expr: `[EG][0-9]{8}`,
 			opts: []PatternOption{
+				WithPrefilter(requirePrefix("E", "G")),
 				WithBoundary(boundaryAlnum),
 				WithContext(0.30, "护照", "passport"),
 			},
@@ -165,12 +176,14 @@ func predefinedSpecs() []predefinedSpec {
 			name: "cn_license_plate", entityType: TypeLicensePlate, score: 0.90,
 			expr: `[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领]` +
 				`[A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}[A-HJ-NP-Z0-9挂学警港澳]`,
+			opts: []PatternOption{WithPrefilter(requireCJK)},
 		},
 		{
 			name: "ipv4", entityType: TypeIP, score: 0.70,
 			expr: `(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}` +
 				`(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])`,
-			opts: []PatternOption{WithBoundary(boundaryDigit)},
+			opts: []PatternOption{
+				WithPrefilter(requireByte(".")), WithBoundary(boundaryDigit)},
 		},
 		// Credentials: worst blast radius, so no context requirement and the
 		// score is maxed. A leaked API key is unrecoverable in a way a leaked
@@ -178,12 +191,16 @@ func predefinedSpecs() []predefinedSpec {
 		// 凭证：泄露后果最严重，因此不要求上下文且分数拉满。
 		// 泄露的 API 密钥是不可挽回的，泄露的手机号不是。
 		{name: "openai_key", entityType: TypeCredential, score: 0.99,
+			opts: []PatternOption{WithPrefilter(requirePrefix("sk-"))},
 			expr: `sk-[A-Za-z0-9_\-]{16,}`},
 		{name: "aws_access_key", entityType: TypeCredential, score: 0.99,
+			opts: []PatternOption{WithPrefilter(requirePrefix("AKIA"))},
 			expr: `AKIA[0-9A-Z]{16}`},
 		{name: "github_token", entityType: TypeCredential, score: 0.99,
+			opts: []PatternOption{WithPrefilter(requirePrefix("gh"))},
 			expr: `gh[pousr]_[A-Za-z0-9]{20,}`},
 		{name: "jwt", entityType: TypeCredential, score: 0.99,
+			opts: []PatternOption{WithPrefilter(requirePrefix("eyJ"))},
 			expr: `eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}`},
 	}
 }

@@ -32,6 +32,13 @@ import (
 // 命中上下文词时提升置信度；未命中则不低于配置的基线。
 // 向上加权是安全的；向下惩罚会静默漏掉「恰好附近没有关键词」的真实 PII。
 type PatternRecognizer struct {
+	// prefilter is a necessary condition checked before the regex. It may only
+	// produce false positives; a false negative would silently disable this
+	// recognizer.
+	// 是在正则之前检查的必要条件。它只允许产生假阳性；
+	// 假阴性会静默禁用本识别器。
+	prefilter Prefilter
+
 	name       string
 	entityType EntityType
 	pattern    *regexp.Regexp
@@ -62,6 +69,18 @@ func WithValidator(fn func(string) bool, stripSeparators bool) PatternOption {
 		p.validate = fn
 		p.normalize = stripSeparators
 	}
+}
+
+// WithPrefilter attaches a cheap necessary condition evaluated before the regex.
+// 附加一个在正则之前求值的廉价必要条件。
+//
+// The condition must be strictly implied by the pattern. Attaching one the
+// pattern does not require silently disables the recognizer for any text that
+// fails it — the exact failure this system exists to prevent.
+// 该条件必须由模式严格蕴含。附加一个模式并不要求的条件，
+// 会让任何不满足它的文本静默跳过本识别器——正是本系统要防的那种故障。
+func WithPrefilter(f Prefilter) PatternOption {
+	return func(p *PatternRecognizer) { p.prefilter = f }
 }
 
 // WithBoundary sets the character class forbidden on either side of a match.
@@ -126,6 +145,15 @@ func (p *PatternRecognizer) EntityType() EntityType { return p.entityType }
 // surrounding context.
 // 查找匹配、执行校验位，再按周围上下文调整置信度。
 func (p *PatternRecognizer) Recognize(text string) ([]Entity, error) {
+	// Rule the text out before paying for the regex. On a realistic prompt most
+	// recognizers exit here, and the saving is the difference between scanning
+	// the text once and scanning it once per recognizer.
+	// 在付出正则代价之前先排除。真实提示词下多数识别器在此退出，
+	// 省下的正是「扫一遍」与「每个识别器各扫一遍」之间的差距。
+	if p.prefilter != nil && !p.prefilter(text) {
+		return nil, nil
+	}
+
 	var found []Entity
 	for _, loc := range p.pattern.FindAllStringIndex(text, -1) {
 		start, end := loc[0], loc[1]
