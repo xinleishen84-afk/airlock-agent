@@ -1,0 +1,99 @@
+# AI 网关配置
+#
+# 严格解析：任何与本文档字段名对不上的键都会让进程启动失败。
+# 用 `gateway --dry-run -config <本文件>` 在部署前验证。
+
+# K8s 会把 Secret 以 tmpfs 挂载到此目录，每个键一个文件。
+# 切勿指向 /tmp——那是全局可写的，任何进程都能读。
+# K8s mounts Secrets here as tmpfs, one file per key.
+# Never point this at /tmp: it is world-writable.
+secrets_mount_path: /var/run/secrets/llm
+secrets_cache_ttl: 5m
+session_ttl: 1h
+max_sessions: 100000
+
+targets:
+  - name: tier1-cloud-premium
+    tier: 1
+    base_url: http://127.0.0.1:9001/v1
+    model: gemini-2.5-flash
+    weight: 100
+    credential_key: vendor-api-key
+
+  - name: tier2-local-gpu
+    tier: 2
+    base_url: http://127.0.0.1:9002/v1
+    model: gpt-oss-120b
+    weight: 100
+    self_hosted: true
+
+rules:
+  - name: batch-workloads-offload
+    target_tier: 2
+    priority: 10
+    match_apps:
+      - "toolbench-agent"
+      - "*-batch"
+      - "*-indexer"
+
+  - name: planning-apps-premium
+    target_tier: 1
+    priority: 20
+    match_apps:
+      - "planner-agent"
+      - "*-orchestrator"
+
+budgets:
+  "1": 500.0
+
+breaker:
+  failure_threshold: 5
+  recovery_timeout: 30s
+
+rate_limit:
+  tokens_per_window: 5000000
+  window: 1m
+  max_concurrent: 512
+  reservation_ttl: 10m
+  per_subject:
+    "acme/toolbench-agent":
+      tokens_per_window: 20000000
+      window: 1m
+      max_concurrent: 2048
+
+pii:
+  # 检测器故障时阻断请求而非放行原文——脱敏网关唯一安全的默认值
+  fail_closed: true
+  always_redact: false
+  # 企业主数据名册。正则检测不出人名——不配这个也不接 NER，
+  # 姓名类 PII 会完全裸奔。生产环境应从员工/客户主数据导出。
+  # Enterprise master-data roster. Regexes cannot find names: without this
+  # and without NER, name-class PII is fully exposed. In production this
+  # should be exported from your employee/customer master data.
+  name_roster: []
+  org_roster: []
+  disabled_types: ["IP"]
+  ner:
+    endpoint: http://127.0.0.1:9100/v1/detect
+    timeout: 300ms
+    cache_ttl: 10m
+    cache_size: 4096
+    types: ["NAME", "ADDRESS", "ORG"]
+    fail_open: false
+    failure_threshold: 5
+    cooldown: 15s
+
+upstream:
+  max_idle_conns_per_host: 512
+  response_header_timeout: 1m
+  dial_timeout: 5s
+  idle_conn_timeout: 1m
+
+gpu:
+  probe_interval: 300ms
+  kv_elevated: 0.75
+  kv_critical: 0.9
+  waiting_elevated: 8
+  waiting_critical: 32
+  prefix_affinity: true
+  affinity_load_factor: 1.25

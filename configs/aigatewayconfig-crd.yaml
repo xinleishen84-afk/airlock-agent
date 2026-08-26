@@ -1,0 +1,294 @@
+# 本文件由 `gateway --print-crd` 生成，请勿手工编辑。
+# 单一事实来源是 internal/config 的结构体定义；
+# CI 会断言本文件与生成结果一致，防止 schema 与代码漂移。
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aigatewayconfigs.gateway.ai.enterprise.io
+spec:
+  group: gateway.ai.enterprise.io
+  names:
+    kind: AIGatewayConfig
+    listKind: AIGatewayConfigList
+    plural: aigatewayconfigs
+    singular: aigatewayconfig
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          additionalProperties: false
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              description: 'AI 网关配置。所有对象均设 additionalProperties: false，未声明的字段会在 kubectl apply 阶段被拒绝'
+              properties:
+                breaker:
+                  type: object
+                  properties:
+                    failure_threshold:
+                      type: integer
+                    recovery_timeout:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                  additionalProperties: false
+                budgets:
+                  type: object
+                  additionalProperties:
+                    type: number
+                gpu:
+                  type: object
+                  properties:
+                    affinity_load_factor:
+                      type: number
+                    kv_critical:
+                      type: number
+                    kv_elevated:
+                      type: number
+                    prefix_affinity:
+                      type: boolean
+                    probe_interval:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    waiting_critical:
+                      type: integer
+                    waiting_elevated:
+                      type: integer
+                  additionalProperties: false
+                max_sessions:
+                  type: integer
+                pii:
+                  type: object
+                  properties:
+                    always_redact:
+                      type: boolean
+                    disabled_types:
+                      type: array
+                      items:
+                        type: string
+                        description: PII 实体类型
+                        enum:
+                          - ADDRESS
+                          - BANK_CARD
+                          - CREDENTIAL
+                          - EMAIL
+                          - ID_CARD
+                          - IP
+                          - LICENSE_PLATE
+                          - NAME
+                          - ORG
+                          - PASSPORT
+                          - PHONE
+                          - SSN
+                          - USCC
+                    fail_closed:
+                      type: boolean
+                    name_roster:
+                      type: array
+                      items:
+                        type: string
+                    ner:
+                      type: object
+                      properties:
+                        cache_size:
+                          type: integer
+                        cache_ttl:
+                          type: string
+                          description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                          pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                        cooldown:
+                          type: string
+                          description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                          pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                        endpoint:
+                          type: string
+                        fail_open:
+                          type: boolean
+                        failure_threshold:
+                          type: integer
+                        timeout:
+                          type: string
+                          description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                          pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                        types:
+                          type: array
+                          items:
+                            type: string
+                            description: PII 实体类型
+                            enum:
+                              - ADDRESS
+                              - BANK_CARD
+                              - CREDENTIAL
+                              - EMAIL
+                              - ID_CARD
+                              - IP
+                              - LICENSE_PLATE
+                              - NAME
+                              - ORG
+                              - PASSPORT
+                              - PHONE
+                              - SSN
+                              - USCC
+                      additionalProperties: false
+                    org_roster:
+                      type: array
+                      items:
+                        type: string
+                  additionalProperties: false
+                rate_limit:
+                  type: object
+                  properties:
+                    max_concurrent:
+                      type: integer
+                    per_subject:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        properties:
+                          max_concurrent:
+                            type: integer
+                          reservation_ttl:
+                            type: string
+                            description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                            pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                          tokens_per_window:
+                            type: integer
+                          window:
+                            type: string
+                            description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                            pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                        additionalProperties: false
+                    reservation_ttl:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    tokens_per_window:
+                      type: integer
+                    window:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                  additionalProperties: false
+                rules:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      match_apps:
+                        type: array
+                        items:
+                          type: string
+                      match_tasks:
+                        type: array
+                        items:
+                          type: string
+                          description: 任务类型，用于路由定级
+                          enum:
+                            - classification
+                            - code_generation
+                            - embedding_prep
+                            - extraction
+                            - planning
+                            - reasoning
+                            - rerank
+                            - summarization
+                            - tool_orchestration
+                            - translation
+                            - unknown
+                      match_tenants:
+                        type: array
+                        items:
+                          type: string
+                      min_priority:
+                        type: integer
+                      name:
+                        type: string
+                      prefer_targets:
+                        type: array
+                        items:
+                          type: string
+                      priority:
+                        type: integer
+                      target_tier:
+                        type: integer
+                        description: 性能梯队，数值越小档次越高
+                        minimum: 1
+                        maximum: 9
+                    additionalProperties: false
+                secrets_cache_ttl:
+                  type: string
+                  description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                  pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                secrets_mount_path:
+                  type: string
+                session_ttl:
+                  type: string
+                  description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                  pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                targets:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      base_url:
+                        type: string
+                      credential_key:
+                        type: string
+                      inject_header:
+                        type: string
+                      inject_mode:
+                        type: string
+                        description: 凭证注入方式
+                        enum:
+                          - bearer
+                          - header
+                      input_price_per_mtok:
+                        type: number
+                      model:
+                        type: string
+                      name:
+                        type: string
+                      output_price_per_mtok:
+                        type: number
+                      self_hosted:
+                        type: boolean
+                      tier:
+                        type: integer
+                        description: 性能梯队，数值越小档次越高
+                        minimum: 1
+                        maximum: 9
+                      weight:
+                        type: integer
+                    additionalProperties: false
+                upstream:
+                  type: object
+                  properties:
+                    dial_timeout:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    idle_conn_timeout:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                    max_idle_conns_per_host:
+                      type: integer
+                    response_header_timeout:
+                      type: string
+                      description: 时长，必须带单位（如 300ms / 5s / 1h30m）。不接受裸数字
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                  additionalProperties: false
+              additionalProperties: false
+          required:
+            - spec
+          type: object
+      served: true
+      storage: true
