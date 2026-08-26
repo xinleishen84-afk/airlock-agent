@@ -1,25 +1,33 @@
 # airlock-agent
 
-**Bidirectional PII redaction for LLM gateways.**
-**面向 LLM 网关的双向 PII 脱敏。**
+**LLM 网关的 PII 层：出站脱敏，入站复原，会话映射不落盘。**
+**The PII layer for an LLM gateway: redact on the way out, restore on the way back.**
 
-> An *airlock* is the sealed chamber between two incompatible environments —
-> everything passes through it on the way out, and through it again on the way
-> back in. That is exactly what this does: sensitive data is redacted before it
-> crosses your enterprise boundary, and restored when the model's answer returns.
->
+<sub>会话保险库从类型层面禁止序列化。跨会话可逆需要令牌库，而令牌库**是**持久化的
+—— 那是一个 PII 数据库，代价见「脱敏策略矩阵」一节。<br>
+The session vault refuses to serialize. Cross-session reversibility needs a token
+store, and that store **is** persistent — it is a PII database.</sub>
+
 > 气闸舱是两个不相容环境之间的密封通道——出去要过它，回来也要过它。
 > 这正是本项目做的事：数据出企业边界前脱敏，模型回答返回时复原。
-
-> **Not an agent framework.** The `-agent` suffix follows the `datadog-agent` /
-> `consul-agent` convention: a resident process that works alongside your
-> gateway. It does not build AI agents; it protects the traffic they generate.
 >
+> An *airlock* is the sealed chamber between two incompatible environments.
+> Everything passes through it on the way out, and through it again on the way back.
+
 > **不是 Agent 框架。** `-agent` 后缀取 `datadog-agent` / `consul-agent` 的惯例，
 > 指常驻边车进程。它不用于构建 AI Agent，而是保护 Agent 产生的流量。
+>
+> **Not an agent framework.** The suffix follows the `datadog-agent` convention:
+> a resident process alongside your gateway.
 
-Plugs into the gateway you already run — Envoy, APISIX, Higress, Kong, or your
-own. Not a replacement for it.
+> **不是通用 PII 库。** 如果你要扫数据库、扫文件、做批量去标识化，
+> 用 [Presidio](https://github.com/microsoft/presidio)——它的生态、模型和社区都比这里成熟。
+> 本项目只解决一件事：**LLM 请求/响应这条链路上**的 PII，
+> 以及这条链路特有的问题（协议结构、流式帧、会话一致性、多租户可逆映射）。
+>
+> **Not a general-purpose PII library.** For scanning databases or files, use
+> Presidio. This solves PII on the LLM request/response path specifically.
+
 接入你现有的网关——Envoy、APISIX、Higress、Kong，或自研的。不是要替换它。
 
 ```
@@ -34,12 +42,83 @@ own. Not a replacement for it.
 
 ---
 
-## 解决什么问题
+## 成熟度：先看这个
 
-### 1. PII 脱敏：把整个请求体喂给 NER，协议会被打烂
+这是一份**没有生产使用者**的代码。在你评估它之前，请先读完这一节。
 
-LLM 请求体是多层嵌套的 JSON。NER 是**概率性**的，把整个 payload 当文本扫，
-或者递归净化所有字符串值，迟早会出这种事：
+**做得到**
+
+- 结构化标识（身份证、银行卡、统一社会信用代码、IBAN、税号、护照、车牌、API 密钥……）
+- 协议安全的定向脱敏：不会打烂 OpenAI 请求体的工具调用约束
+- 双向复原：含 SSE 流式帧被切开的情形
+- 多租户隔离、GDPR 第 17 条精准擦除、不带原文的安全审计
+
+**做不到**
+
+- **人名、地址、机构名的召回率是 0%**（不接 NER 模型时）。
+  这不是调参问题——人名没有字面特征，正则找不到「周慧敏」，也找不到
+  「Margaret Okonkwo」。本项目留好了 NER 接口和企业名册接口，
+  但**没有内置模型，我也没有在真实模型上验证过**。
+- 出站侧**没有流式脱敏**（复原是流式的，脱敏要拿到完整载荷）
+- 多副本部署的会话映射共享（当前在单实例内存中，需要会话亲和路由）
+- Envoy `ext_proc` gRPC 适配层（HTTP 接口可用，Envoy 侧需一层薄翻译）
+
+**验证到什么程度**
+
+| | |
+|---|---|
+| 测试 | 429 个测试函数 / 13,672 行测试代码 / 覆盖率 73.7% / `-race` 全绿 |
+| 依赖 | 主模块 1 个外部依赖（yaml） |
+| 已实测 | 检测准确率、延迟分位、吞吐、还原准确率（见下节） |
+| **未实测** | Testcontainers 用例（开发机无 Docker）、OTel 处理器未用 `ocb` 构建进真实 Collector、生产规模压测 |
+| **零外部验证** | 没有任何人在生产里跑过它 |
+
+---
+
+## 实测数字
+
+全部由 `eval/` 下的评测框架跑出，可复现：`go test ./eval/ -v`
+
+| 指标 | 目标 | 实测 | |
+|---|---|---|---|
+| 精确率（对抗性语料） | ≥ 98% | 24 篇对抗文本 **0 误报** | ✅ |
+| 精确率（生成式，12000 条） | ≥ 98% | 误报 7 次，**0.058%** | ✅ |
+| 召回率（结构化标识） | ≥ 99.5% | 37/37 = **100%** | ⚠️ 见下 |
+| 召回率（名册外姓名/地址/机构） | ≥ 99.5% | **0%** | ❌ |
+| P99 延迟（2KB 提示词） | ≤ 20ms | **277µs** | ✅ |
+| P99 延迟（32KB） | ≤ 20ms | **3.8ms** | ✅ |
+| P99 延迟（384KB ≈ 131k token） | ≤ 20ms | **14.9ms**（空闲机单请求） | ✅ |
+| 吞吐（真实提示词形态，单请求） | ≥ 50MB/s | **69.0 MB/s** | ✅ |
+| 吞吐（并发饱和，整机） | ≥ 50MB/s | **~40 MB/s** | ❌ |
+| 还原准确率 | 100% | 500 组随机排列 **0 错位** | ✅ |
+| 幂等性 | 是 | 脱敏、复原双向幂等 | ✅ |
+
+**关于那个 100% 召回率：你不该采信它。** 正例语料是本项目作者写的，
+识别器也是——量的是「模式能匹配它们本来就是为之而写的例子」。
+**精确率那个数才是真的**，因为反例是对抗性写的：源代码、git 哈希、UUID、
+订单号、毫秒时间戳、坐标、医学与法律术语，没有一条是为了通过而写的。
+
+**关于并发下的吞吐：**并行分块降低的是**空闲机器上的单请求延迟**，
+不是负载下的吞吐。核被并发请求占满之后就摊不出去了：
+
+```
+并发  1：P99   2.7ms   整机吞吐 12.1 MB/s
+并发 16：P99  56.4ms   整机吞吐 39.8 MB/s
+并发 64：P99 437.0ms   整机吞吐 38.7 MB/s
+```
+
+把空闲时的 69 MB/s 当作生产吞吐报，是性能页上最常见的那种误导。
+
+---
+
+## 为什么不是又一个 PII 库
+
+四件事，是这条链路特有的，也是本项目存在的理由。
+
+### 1. 把整个请求体喂给 NER，协议会被打烂
+
+LLM 请求体是多层嵌套 JSON。NER 是**概率性**的，把整个 payload 当文本扫、
+或递归净化所有字符串值，迟早会出这种事：
 
 ```jsonc
 {
@@ -56,8 +135,8 @@ LLM 请求体是多层嵌套的 JSON。NER 是**概率性**的，把整个 paylo
 更糟的是复原：占位符→真实值的映射依赖会话字典，协议一旦被污染，
 不仅返回数据无法还原，请求本身已经破损，下游解析器直接罢工。
 
-**本项目的做法是白名单，不是黑名单。** 只有 7 条显式声明的 JSON 路径
-会被送进检测器，其余字段在遍历层面就不会被访问到：
+**本项目用白名单，不是黑名单。** 只有 7 条显式声明的 JSON 路径会被送进检测器，
+其余字段在遍历层面就不会被访问到：
 
 ```
 system
@@ -69,48 +148,81 @@ tools[*].description
 tools[*].function.parameters.**.description    ← 只取 description，enum/type/属性名不碰
 ```
 
-黑名单的问题在于默认方向错了：默认净化一切、例外才跳过，
+黑名单的默认方向是错的：默认净化一切、例外才跳过，
 意味着上游 API 新增任何字符串参数都会被 NER 触碰。安全组件必须默认拒绝。
 
-### 2. GPU 感知：只看 QPS 的网关会在 KV 快满时继续放行
+### 2. 复原必须扛得住 SSE 帧边界
 
-LLM 推理的真实约束是 **KV 缓存显存**，不是请求数。一个 10 万 token 的 prompt
-配 1 个输出，和 1 千 token 配 10 万输出，QPS 完全相同，显存压力天差地别。
+模型的回答是逐帧流式吐出来的，一个占位符会被切成两半：
 
-多个 Agent 同时爆发（coding agent 一次规划并发几十个请求）会瞬间打满 KV，
-vLLM 开始抢占换出，在途请求被反复重算，整个后端进入活锁。
+```
+帧 1: {"delta":{"content":"已通知 ANONYMIZED_NA"}}
+帧 2: {"delta":{"content":"ME_0 处理"}}
+```
 
-本项目按 vLLM 的实际指标做**分级降级**：
+滞留缓冲会压住不完整的尾部直到下一帧到来。**逐字节切分下，
+流式复原与整体复原逐字相同**——有用例钉住这一点。
 
-| KV 占用 | priority≤3 | priority 4~7 | priority≥8 |
-|---|---|---|---|
-| < 75% | 放行 | 放行 | 放行 |
-| ≥ 75% | **429** | 放行 | 放行 |
-| ≥ 90% 或检测到抢占 | 429 | **429** | 放行 |
+令牌化算子引入后这里出过一次真实故障：滞留只认 `ANONYMIZED_`，
+于是被切开的 `[tok:email:9df3a0c1]` 前半截直接发给了终端用户。
+注入回归验证过现在拦得住。
 
-在 GPU 死锁**之前**先牺牲低价值流量。等完全打满再一刀切，
-队列里已经全是低优先级请求，高价值请求照样排在后面。
+### 3. 租户在键里，不在 WHERE 子句里
+
+每一个可逆构造都是一次查表：进去占位符或令牌，出来真实值。
+**键里没有租户的查表，在构造上就是一个越权漏洞。**
+
+这个洞在本项目里曾经是活的：会话保险库只以调用方提供的 `session_id` 作键，
+而 `session_id` 是自由文本——租户 B 拿到租户 A 的 `session_id` 调
+`/v1/restore`，原样拿回对方的**明文姓名和手机号**。不是令牌、不是摘要，是值本身。
+
+修法不是加一层检查，是把租户放进键里：
+
+```go
+SessionRef{Tenant, Session}            // 会话保险库
+TokenKey{Tenant, Namespace} + token    // 令牌库
+PRIMARY KEY (tenant_id, namespace, token)   // SQL 驱动：复合主键，不是代理主键+租户列
+```
+
+过滤会在某一个调用点被忘掉，键不会。
+
+### 4. 网关脱敏了模型看到的东西，管不到飞往 Datadog 的那份副本
+
+同一段提示词还躺在 span 属性里。而遥测里的那份**更糟**：模型厂商有合同、
+有留存策略，而可观测性后端对每一个有看板账号的人可读、留存一年。
+
+```yaml
+processors: [piiredaction, batch]     # 正确
+processors: [batch, piiredaction]     # 已经晚了
+```
+
+放在 `batch` 之后照样能脱敏，但未脱敏的 span 已经在队列里待过，
+而堆转储、debug exporter、崩溃日志都读得到它。
 
 ---
 
 ## 快速开始
 
-### 作为 sidecar（任何语言的网关都能用）
+### 作为 sidecar（任何语言的网关都能接）
+
+> 还没有发布二进制或容器镜像。下面是从源码跑。
+> No released binary or container image yet; this builds from source.
 
 ```bash
-docker run -p 8888:8888 \
-  -v ./names.txt:/rosters/names.txt \
-  ghcr.io/xinleishen84-afk/airlock-agent \
+go build -o airlock ./cmd/airlock-agent
+
+./airlock \
+  --addr :8888 \
   --jurisdictions GEN,CN \
   --tenant-header X-Tenant-Id \
-  --name-roster /rosters/names.txt \
-  --ner http://ner-service:8000/v1/detect
+  --name-roster ./names.txt \
+  --ner http://ner-service:8000/v1/detect   # 不配 --ner 时，姓名类召回率为 0
 ```
 
 出站脱敏：
 
 ```bash
-curl -X POST localhost:8888/v1/redact -d '{
+curl -X POST localhost:8888/v1/redact -H 'X-Tenant-Id: acme' -d '{
   "session_id": "conv-42",
   "payload": {"model":"gpt-4o","messages":[
     {"role":"user","content":"联系张伟，手机 13812345678"}]}
@@ -122,6 +234,7 @@ curl -X POST localhost:8888/v1/redact -d '{
   "payload": {"model":"gpt-4o","messages":[
     {"role":"user","content":"联系ANONYMIZED_NAME_0，手机 ANONYMIZED_PHONE_0"}]},
   "entity_counts": {"NAME":1,"PHONE":1},
+  "strategy_counts": {"mask":2},
   "blocked": false
 }
 ```
@@ -129,139 +242,94 @@ curl -X POST localhost:8888/v1/redact -d '{
 入站复原（把模型回吐的占位符换回真实值）：
 
 ```bash
-curl -X POST localhost:8888/v1/restore -d '{
+curl -X POST localhost:8888/v1/restore -H 'X-Tenant-Id: acme' -d '{
   "session_id": "conv-42",
   "payload": {"choices":[{"delta":{"content":"已通知 ANONYMIZED_NAME_0"}}]}
 }'
 # -> {"payload":{"choices":[{"delta":{"content":"已通知 张伟"}}]},"restored":1}
 ```
 
-### 作为 Go 库 / As a Go library
+### 作为 Go 库
 
 ```go
 import (
-    "github.com/xinleishen84-afk/airlock-agent/pii/detect"
     "github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
-    "github.com/xinleishen84-afk/airlock-agent/pii/document"
+    "github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 )
 
-// 检测层：内置识别器 + 你自己的实体类型
-// Detection: built-in recognizers plus your own entity types
-reg, _ := detect.NewDefaultRegistry()
-custom, _ := detect.NewPatternRecognizer(
-    "employee_id", detect.TypeAccount, `EMP-[0-9]{6}`, 0.95,
-    detect.WithContext(0.15, "工号", "employee"))
-reg.Register(custom)
+// 必须显式选择司法管辖区——没有默认值
+reg, err := packs.NewRegistry([]string{"GEN", "CN"})
+if err != nil {
+    return err
+}
+redactor := anonymize.NewRedactorWith(reg, true /* fail-closed */)
 
-// 脱敏层：会话映射保证占位符跨轮次稳定
-// Anonymization: the session vault keeps placeholders stable across turns
-redactor := anonymize.NewRedactor(reg, true /* failClosed */)
+// 会话保险库持有「占位符 → 真实值」，按租户+会话取
 vaults := anonymize.NewVaultRegistry(time.Hour, 100_000)
-vault, _ := vaults.Get(sessionID)
+vault, err := vaults.Get(anonymize.SessionRef{Tenant: "acme", Session: "conv-42"})
+if err != nil {
+    return err
+}
+scope := anonymize.StrategyScope{Tenant: "acme", Vault: vault}
 
-// 结构化定向清洗：只碰白名单路径，协议骨架永不被访问
-// Targeted sanitization: only allowlisted paths, skeleton never visited
-err := document.SanitizeDocument(payload, func(text string) (string, error) {
-    res, err := redactor.Redact(text, vault)
-    return res.Text, err
-})
+// 出站
+flow := anonymize.Flow{Name: "public_llm", Default: anonymize.NewMask(), Restores: true}
+out, err := redactor.RedactTo(ctx, "联系张伟，手机 13812345678", scope, flow)
+// out.Text == "联系张伟，手机 ANONYMIZED_PHONE_0"
+//   （张伟需要名册或 NER 才能检出——见「成熟度」一节）
+
+// 入站
+back, err := redactor.Unredact(ctx, modelReply, scope)
 ```
-
-三层可以单独使用。只想扫描审计不改数据的，只 import `detect` 即可。
-The three layers are usable independently: import only `detect` if you want to
-scan and audit without modifying anything.
 
 ---
 
-## 司法管辖区国家包 / Country packs
+## 能力细节
+
+### 司法管辖区国家包
 
 一张扁平的「敏感数据」字典，悄悄编码了编写者的假设。以美国为中心的引擎能找到
 SSN 却漏掉意大利税号；以中国为中心的能找到身份证却漏掉德国税号。两者在各自本土
-市场都没错，出了本土都没用 —— 而且**故障是静默的**：用美国包扫意大利文档会报告
+市场都没错，出了本土都没用——而且**故障是静默的**：用美国包扫意大利文档会报告
 零 PII，这读起来像「数据很干净」，而不是「装错了包」。
 
-所以 `jurisdictions` 是必填项，没有默认值：
-
-```yaml
-pii:
-  jurisdictions: [GEN, CN]   # 必填。装错、拼错、不装，都在启动期报错
-  tenant_rules_dir: /etc/airlock/rules
-```
+所以 `jurisdictions` 是必填项，没有默认值。装错、拼错、不装，都在启动期报错。
 
 | 包 | 覆盖 |
 |---|---|
-| `GEN` | 与国界无关的部分：邮箱、银行卡（Luhn）、IBAN（ISO 7064 mod-97）、国际电话、IPv4、API 密钥/JWT |
+| `GEN` | 与国界无关：邮箱、银行卡（Luhn + ISO/IEC 7812 IIN）、IBAN、国际电话、IPv4、API 密钥/JWT |
 | `CN` | 身份证（GB 11643）、统一社会信用代码（GB 32100）、手机、固话、护照、车牌 |
 | `US` | SSN |
 | `IT` | Codice Fiscale（CIN 控制字符）、Partita IVA |
-| `DE` | Steuer-ID（ISO 7064 MOD 11,10 + 数字重复结构规则）、USt-IdNr |
-| `ES` | DNI / NIE（mod-23 校验字母，同一识别器覆盖两者） |
+| `DE` | Steuer-ID（ISO 7064 MOD 11,10 **+ 数字重复结构规则**） |
+| `ES` | DNI / NIE（mod-23，同一识别器覆盖两者） |
 
-装包的代价是可量化的：装全部六个包相对只装 `GEN`，hot path 从 31.8µs 涨到
-37.9µs（+19%），因为前置过滤器在正则之前就把绝大多数识别器挡掉了。构建全部包
-一次 36µs，不构成启动负担。
+德国那条值得单说：**只做校验位会放行十分之一的随机 11 位数字**——订单号、
+时间戳都是 11 位数字。结构规则把这批全挡掉了（实测 2000/2000 校验位正确的
+随机串全被拒绝）。
 
-### 租户 YAML 规则 / Tenant rule packs
+**租户 YAML 规则**（工号、资产编号、合同号）：`samples` 是强制的。
+加载器在接受规则前把样本喂进组装好的识别器跑一遍——
+**匹配不到任何东西的规则会加载失败，而不是保护失败。**
 
-国家包覆盖司法管辖区定义的标识；它们覆盖不了只有你自己知道格式的东西 ——
-工号、资产编号、合同号。这些放在 YAML 里，不需要写代码：
+详见 [`configs/tenant-rules/example.yaml`](configs/tenant-rules/example.yaml)。
 
-```yaml
-version: 1
-tenant: example-corp
-rules:
-  - name: employee_id
-    type: CUSTOM_EMPLOYEE_ID
-    pattern: 'EMP-[0-9]{6}'
-    score: 0.90
-    boundary: alnum
-    samples:
-      match: ["EMP-004217"]
-      no_match: ["EMP-4217", "emp-004217"]
-```
-
-**`samples` 是强制的**，这是这套规则引擎唯一能安全交给非工程师的前提。
-YAML 规则的每一种故障模式都是静默的 —— 模式并不蕴含的前置过滤、拒绝一切
-真实出现的边界类、拒绝租户自身格式的校验器 —— 三者都能干净地注册、报告成功，
-同时从它们本该捕获的数据上扫过。加载器会在接受规则之前把样本喂进组装好的
-识别器：`match` 必须恰好命中一次且覆盖整串，`no_match` 必须零命中。
-**一条匹配不到任何东西的规则会加载失败，而不是保护失败。**
-
-完整示例见 [`configs/tenant-rules/example.yaml`](configs/tenant-rules/example.yaml)，
-该文件本身在 CI 中被加载验证。
-
----
-
-## 脱敏策略矩阵 / Redaction strategy matrix
+### 脱敏策略矩阵
 
 `[REDACTED]` 是对某一个问题的答案，而对大多数问题都是错的答案：需要统计去重
-用户数的分析仓库用不了它；需要让「他」始终指向同一个人的模型用不了它；而必须
-一个字节都不出去的 DLP 红线，也不会满足于一个仍然为这些字节留着位置的占位符。
+用户数的分析仓库用不了它；需要让「他」始终指向同一个人的模型用不了它；
+必须一个字节都不出去的 DLP 红线，也不会满足于一个仍为这些字节留着位置的占位符。
 
 **算子由数据的去向决定，不由数据本身决定。**
 
 | 算子 | 输出 | 可逆 | 用在哪 |
 |---|---|---|---|
-| `mask` | `ANONYMIZED_NAME_0` | ✅ | 公有云大模型 —— 保语法完整与指代一致 |
-| `tokenize` | `[tok:email:9df3a0c1]` | ✅ | 跨系统伪名化 —— 令牌在另一个系统里含义相同 |
-| `hash` | `[hash:email:a4b2efc8]` | ❌ | 分析数仓 —— 可关联的假名，不需还原 |
-| `char_mask` | `************1111` | ❌ | 展示层 —— 保留末四位是**刻意的泄露** |
-| `drop` | `` | ❌ | DLP 红线归档 —— 字节必须消失 |
-| `generalize` | `1995-10-24` → `1990s` | ❌ | 医疗/研究导出 —— 保住统计效用 |
-
-```yaml
-# configs/redaction-matrix.yaml
-version: 1
-flows:
-  - name: public_llm
-    restores: true          # 声明要复原响应
-    default: mask
-  - name: analytics
-    default: hash
-    by_type: {PHONE: drop}
-  - name: archive
-    default: drop
-```
+| `mask` | `ANONYMIZED_NAME_0` | ✅ | 公有云模型——保语法与指代一致 |
+| `tokenize` | `[tok:email:9df3a0c1]` | ✅ | 跨系统伪名化 |
+| `hash` | `[hash:email:a4b2efc8]` | ❌ | 分析数仓——可关联假名 |
+| `char_mask` | `************1111` | ❌ | 展示层——保留末四位是**刻意的泄露** |
+| `drop` | `` | ❌ | DLP 红线归档 |
+| `generalize` | `1995-10-24` → `1990s` | ❌ | 医疗/研究导出 |
 
 同一份请求体、四个去向，实测输出：
 
@@ -272,298 +340,187 @@ analytics     客户手机 ，邮箱 [hash:email:2cbdec25]                      
 archive       客户手机 ，邮箱                                            {drop:2}
 ```
 
-### 唯一要紧的不变量：可逆性
+**唯一要紧的不变量是可逆性。** 给一条要复原响应的链路配上哈希，运行时不会有
+任何报错：请求带哈希出站，模型用哈希作答，网关把 `[hash:name:a4b2efc8]`
+当成人名交给终端用户。故障从头到尾静默——所以 `restores: true`
+的链路在**加载期**就拒绝不可逆算子。
 
-给一条要做响应复原的链路配上哈希，**运行时不会有任何报错**：请求带着哈希正常
-出站，模型用哈希作答，网关把 `[hash:name:a4b2efc8]` 当成人名交给终端用户。
-故障从头到尾都是静默的 —— 所以 `restores: true` 的链路在**加载期**就拒绝
-不可逆算子：
+这个检查**只看算子名，不构建算子**：它必须在密钥没挂上时也能跑，
+否则「缺 HMAC 密钥」会盖住「策略本身不成立」。
 
-```
-flows[0]：声明 restores 却对 默认 / default 使用不可逆算子 "hash"——
-这类配置不会报错，只会把脱敏后的符号当作原值交给终端用户
-```
+几个不打折扣的说法：
 
-这个检查只看算子名字，不构建算子。理由是它必须在密钥没挂上时也能跑：否则
-「缺 HMAC 密钥」的报错会盖住「策略本身不成立」，运维补上密钥，然后带着一条
-静默损坏的链路上线。
+- **哈希用 HMAC，不是「SHA-256 加盐」。** 中国大陆手机号总量 10¹¹，
+  已知盐一台笔记本几分钟穷举完。密钥从密钥卷读，绝不进配置文件。
+- **假名仍然是个人数据。** 稳定到可以做关联，就稳定到可以做画像。GDPR 下它
+  降低暴露面，但没有走出监管范围。
+- **令牌库是一个 PII 数据库。** 这是跨系统可逆的代价，消不掉。
+- **泛化不是隐私保证。** k-匿名是整个**发布数据集**的属性，网关算不了。
 
-### 几个不打折扣的说法
+### 租户隔离与可逆令牌库
 
-**哈希用 HMAC，不是「SHA-256 加盐」。** 中国大陆手机号总量 10^11，已知盐的
-情况下一台笔记本几分钟就能穷举完 —— 与数据放在一起的盐，在数据泄露之后
-一文不值，而数据泄露正是这套机制要应对的场景。密钥只存在于网关进程内，
-从密钥卷读取（`--hash-key-file`），**绝不写进配置文件**。
-
-**假名仍然是个人数据。** 一个稳定到可以做关联的假名，也就稳定到可以做画像。
-在 GDPR 下它降低暴露面，但没有走出监管范围。
-
-**令牌库是一个 PII 数据库。** `SessionVault` 拒绝序列化，正因为一张活得比会话
-久的映射表就是 PII 数据库。令牌库是同一张表、刻意做成持久的 —— 这就是跨系统
-可逆的代价。令牌化把秘密从载荷搬进了库，库因此继承原始数据的全部管控要求。
-
-**泛化不是隐私保证。** 「1990 年代」加上一个罕见专科加上一座小城，仍然可能
-恰好是一个人。k-匿名是整个**发布数据集**的属性，需要跨准标识符计算，
-一个只看得见单条请求的网关无从计算。本算子诚实的说法是：它以保住分析效用的
-方式降低精度。
-
-**词表未覆盖的值走兜底算子，绝不原样通过。** 词表里没有的词，恰恰是没人预料到
-的那个值 —— 「查不到就放过」的泛化器，泄露的正是最不该泄露的那些。
-
----
-
-## 租户隔离与可逆令牌库 / Tenant isolation
-
-每一个可逆构造都是一次查表：进去一个占位符或令牌，出来一个真实值。
-**键里没有租户的查表，在构造上就是一个越权漏洞** —— 谁拿到那串不透明字符谁就
-拿到值，而不透明字符是会流传的：流经日志、流经模型的回复、流经某人粘进工单的
-那段文本。
-
-所以租户是键的一部分，不是事后施加的过滤。过滤可能在某一个调用点被忘掉，键不会。
-
-```
-SessionRef{Tenant, Session}            会话保险库：占位符 → 真实值
-TokenKey{Tenant, Namespace} + token    令牌库：令牌 → 真实值
-```
-
-隔离模型必须显式声明，二选一，没有默认值：
+隔离模型必须显式声明，二选一，没有默认值——不配就不启动：
 
 ```bash
---tenant-header X-Tenant-Id   # 多租户：从上游盖的头部解析
+--tenant-header X-Tenant-Id   # 多租户
 --single-tenant acme          # 单租户：让「不做隔离」成为敲出来的参数
 ```
 
-不配就不启动：
-
-```
-必须指定 --tenant-header 或 --single-tenant：缺少租户隔离时，
-会话保险库只以调用方提供的 session_id 作键，
-任何拿到他人 session_id 的调用方都能取回对方的明文 PII
-```
-
-### 三个驱动，同一套契约
-
-| 驱动 | 用在哪 | TTL | 跨重启 |
+| 令牌库驱动 | 用在哪 | TTL | 跨重启 |
 |---|---|---|---|
 | `MemoryTokenStore` | 开发、单进程 | ✅ | ❌ |
 | `CacheTokenStore` | 多副本（Redis / DynamoDB / 任意 KV） | ✅ | ✅ |
 | `SQLTokenStore` | 加密关系库 | ✅ | ✅ |
 
-`Cache` 与 `SQLExecutor` 都是刻意收窄的接口，不含任何厂商类型 —— 签名里出现
-`redis.Client`，会让本库的每个使用者都依赖那个客户端的版本。三个驱动跑**同一套
-契约用例**，否则「开发用内存、生产换 Redis」这句话不成立。
+三个驱动跑**同一套契约用例**，否则「开发用内存、生产换 Redis」这句话不成立。
+`Cache` 与 `SQLExecutor` 都不含厂商类型——签名里出现 `redis.Client`，
+会让本库每个使用者都依赖那个客户端的版本。
 
-`SQLTokenStore` 的表结构由代码给出，两件事必须做对：
+`SQLTokenStore` 的值用租户派生密钥 AES-GCM 加密、以 HMAC 摘要作查找键，
+租户参与 AAD——一行密文被挪到另一个租户名下会**解不开**。
 
-```sql
-PRIMARY KEY (tenant_id, namespace, token)          -- 不是「代理主键 + 租户列」
-UNIQUE (tenant_id, namespace, value_digest)
-value_cipher BLOB NOT NULL                          -- 不存明文
-```
-
-复合主键而非代理主键，是因为**这一类越权漏洞每一个都是一句忘掉的 WHERE**。
-值用租户派生密钥 AES-GCM 加密、以自身 HMAC 摘要作查找键：存明文会把每个被令牌化
-的值送进数据库的索引、备份、副本和查询日志 —— 而那正是买下令牌化本来要消除的
-暴露面。租户参与 AAD，所以一行密文被挪到另一个租户名下时会**解不开**，而不是
-干干净净地解密出来。
-
-### 每租户密钥派生，而不是每租户一把密钥
-
-`Keyring` 用 HKDF-SHA256 从单一根密钥派生子密钥。独立密钥意味着 N 份秘密要挂载、
-轮转和审计，新增租户会变成一次密钥管理操作；派生只保留一份根密钥，轮转根密钥即
-一次性轮转全部。
-
-这对 `hash` 算子是**必需**的：哈希按设计确定性，没有租户级密钥时同一个手机号在
-每个租户下摘要相同，两个租户比对数仓导出即可确认共有客户 —— 一次谁都没同意的
-跨租户披露，用双方都以为已经假名化的数据做到。
+**每租户密钥派生**（HKDF-SHA256）对 `hash` 算子是必需的：没有它，
+同一个手机号在每个租户下摘要相同，两个租户比对数仓导出即可确认共有客户。
 
 ```
 tenant-a  [hash:email:561bdc89]
 tenant-b  [hash:email:ed13e46e]      同一个邮箱
 ```
 
-**令牌不需要盐。** 令牌是随机的，本就跨租户不可关联 —— 根本没有东西可加盐。
-保护它们的是复合键。
+**令牌不需要盐**——令牌是随机的，本就跨租户不可关联。保护它们的是复合键。
 
-### GDPR 第 17 条：精准擦除
+**GDPR 第 17 条：** `POST /v1/tenant/erase` 同时清会话映射与令牌库，
+回执带条数——一次因租户串写错而匹配到零条的擦除，与一次真正成功的擦除，
+在没有计数时看起来完全一样。
 
-```
-POST /v1/tenant/erase       →  {"tenant":"tenant-a","sessions_erased":2,"tokens_erased":1}
-```
-
-擦除同时覆盖两处状态，漏掉任何一处都只做了一半：内存里活着的会话映射，和持久化的
-令牌库。**回执里的条数不是便利功能** —— 第 17 条的擦除要拿得出证据，而「我们调了
-这个接口」不算证据：一次因租户串写错而匹配到零条的擦除，与一次真正成功的擦除，
-在没有计数时看起来完全一样。令牌库擦除失败时接口返回错误而非成功，因为一次
-「部分擦除」被签字为完成，数据还在库里。
-
----
-
-## 遥测防火墙 / Telemetry firewall
-
-网关脱敏的是**模型看到的东西**。它管不到同一段提示词在 span 属性里、正飞往
-Datadog 的那份副本。
-
-而遥测里的那份更糟：模型厂商有合同、有留存策略，而可观测性后端**对每一个有看板
-账号的人可读**、留存一年、并被复制进财务当初选的那一档日志分析服务里。
-
-```
-processors: [piiredaction, batch]     # 正确
-processors: [batch, piiredaction]     # 已经晚了
-```
-
-放在 `batch` 之后照样能脱敏，但未脱敏的 span 已经在一个队列里待过，而堆转储、
-debug exporter 或崩溃日志都读得到它 —— **「我们最终会脱敏」不是任何人能作证的
-属性。**
-
-### 白名单在这里不适用
-
-文档清洗器基于**七条 JSON 路径的白名单**，因为 OpenAI 请求 schema 是有限且已知的。
-遥测恰恰相反：属性键由依赖树里每一个库自行发明，而下个季度携带 PII 的那个键现在
-还不存在。在这里用白名单，等于列出一份「已经被人发现过的泄露」清单。
-
-所以这里**扫描一切**，只跳过那些取值由 OTel 语义约定枚举出来的键
-（`http.status_code`、`rpc.system`……）—— 而跳过的理由只能是吞吐，绝不能是安全。
-`http.url`、`db.statement`、`enduser.id`、`exception.message` 一个都不在跳过清单里，
-有专门的用例钉住这件事。
-
-覆盖范围：span 名（常是带客户 ID 的 URL 路径）、属性、`status.message`、
-**span 事件**（异常消息是用运行时变量拼出来的，是一条链路里最富含 PII 的地方）、
-链接属性、日志正文、日志属性、资源属性、指标标签、exemplar 属性、以及全部**嵌套
-值**（`kvlistValue` / `arrayValue`）。
-
-`traceId` / `spanId` / `parentSpanId` **从不改写** —— 它们是不透明标识，改写脱不掉
-任何东西，却会打断它们所属的每一条链路：泄露还在，可观测性没了。
-
-### 遥测不许用 mask
-
-这是配置层的硬约束，构造期就拒绝：
-
-```
-遥测链路不得使用 mask 算子：占位符按不同值在会话保险库中铸造，
-而遥测没有会话——每个不同的值都会留下一条永不被解析的记录，
-保险库随流量增长；用在指标标签上还会让基数炸弹原样存活。
-请改用 hash（保住聚合）或 drop
-```
-
-`hash` 在**有界基数**下保住了聚合能力 —— 同一个用户是同一个摘要，`group by` 仍能
-统计去重用户数：
-
-```
-13812345678  →  [hash:phone:3ab040e5]
-13812345678  →  [hash:phone:3ab040e5]      同一条时间序列
-13900001111  →  [hash:phone:1131773c]
-```
-
-### 两个模块
+### 遥测防火墙
 
 | 模块 | 依赖 | 用途 |
 |---|---|---|
 | `pii/telemetry` | 零外部依赖 | 防火墙 + OTLP/JSON 遍历器 |
 | `otelprocessor/` | collector pdata | 真正的 Collector 处理器 |
 
-分开是因为 collector 的 pdata 会带进一棵庞大的依赖树，而一个做 PII 脱敏的库不该把
-它强加给只想扫自己那份 JSON 的调用方。CI 里两个模块**分别跑** —— 「单独成模块」在
-CI 里最容易变成「没人跑」。
+覆盖 span 名（常是带客户 ID 的 URL 路径）、属性、`status.message`、
+**span 事件**（异常消息是用运行时变量拼出来的，一条链路里最富含 PII 的地方）、
+链接、日志正文与属性、资源属性、指标标签、exemplar、以及全部嵌套值。
+`traceId`/`spanId` **从不改写**——改写脱不掉任何东西，却会打断整条链路。
 
-`pii/telemetry` 的 OTLP/JSON 遍历器同时认 `traceId` 与 `trace_id`、`stringValue` 与
-`string_value`：两种拼写都是合法 OTLP/JSON，真实 SDK 依编码器不同各自输出，
-**只认一种会在一半流量上静默地什么都不访问，然后报告成功。**
+**遥测不许用 mask**（构造期硬拒绝）：占位符按不同值在会话保险库中铸造，
+而遥测没有会话——保险库会随流量增长；用在指标标签上还会让基数炸弹原样存活。
 
-### 失败的方向是反的
+### 安全审计与管理面
 
-请求路径上阻断一个请求代价高昂且可见。这里的取舍反过来：丢一个 span 的代价是看板
-上少一段，而漏一个 span 会被复制进一个留存一年、人人可读的后端。所以
-`failure_mode: drop` 是默认值，检测器故障时批次不到达 exporter。
+审计事件只携带**计数、枚举与带密钥的指纹**：
 
-`forward` 存在，是因为少数部署宁可失去这个保证也不愿失去遥测 —— 而这个选择应当
-写在配置里，而不是由某个回退行为暗示。
+```json
+{"schema":"airlock.audit.v1","tenant":"acme","session_fingerprint":"1cbcf2a5ad1c089d",
+ "action":"redact","outcome":"ok","destination":"public_llm",
+ "entities":{"PHONE":1,"EMAIL":1,"ID_CARD":1},"strategies":{"mask":6},
+ "recognizers":{"cn_mobile":1,"email":1,"gazetteer":2},"duration_micros":96}
+```
 
-实测：**10 个 span / 每个 3 个文本字段 ≈ 101µs**（约 3.4µs/字段）。
+**`session_id` 被指纹化，不被记录**——它是调用方自由文本，而调用方会拿
+用户邮箱当会话 ID。原样记录会在一个没人把它归类为 PII 的字段上泄露 PII，
+而这些请求的载荷本身脱敏得干干净净。
+
+**错误只记类别，绝不记 `err.Error()`**——错误信息是写给排查的人看的，
+所以它们会引用出问题的那个值。
+
+这个保证是**结构性**的，不是靠人守规矩：有一条用例用反射遍历事件结构体，
+遇到任何未经论证的字符串字段就失败。注入一个 `SampleText string` 会当场红：
+
+```
+Event.SampleText 是一个未经论证的字符串字段。
+审计事件绝不能携带调用方可控的文本——它会被送进 SIEM、建索引、留存数年。
+```
+
+`GET /v1/admin/inspect` 给出策略矩阵、国家包装配、识别器健康度
+（含**从未命中**的规则——一条写错的租户规则不报错，它只是安静地什么都不拦），
+但不含密钥、盐、映射记录、名册条目或租户名单。**名册条目就是 PII**，
+回显它等于导出 PII。
+
+### GPU 显存感知准入
+
+LLM 推理的真实约束是 **KV 缓存显存**，不是请求数。一个 10 万 token 的 prompt
+配 1 个输出，和 1 千 token 配 10 万输出，QPS 完全相同，显存压力天差地别。
+
+| KV 占用 | priority≤3 | priority 4~7 | priority≥8 |
+|---|---|---|---|
+| < 75% | 放行 | 放行 | 放行 |
+| ≥ 75% | **429** | 放行 | 放行 |
+| ≥ 90% 或检测到抢占 | 429 | **429** | 放行 |
+
+在 GPU 死锁**之前**先牺牲低价值流量。等完全打满再一刀切，队列里已经全是低优先
+级请求。
 
 ---
 
-## 设计决策
+## 设计决策：踩过的坑
 
-几个不那么显然、但踩过坑才定下来的选择。
+这一节记的都是**能编译、能运行、能报告成功，但业务上什么也没做**的故障。
+它们是这个项目里最难抓的一类。
 
-**校验位不是可选项。** 身份证（GB 11643）、银行卡（Luhn）、统一社会信用代码
-（GB 32100）全部做校验位验证。没有它，任意 18 位串都会被误报为信用代码 ——
-误报会淹没真正的告警。
-
-**服务契约里不含偏移量。** Python 的 `str` 索引按字符，Go 的字符串索引按字节，
-中文一字 3 字节。直接采信对端偏移会把文本切碎，且**只在含中文时出错** ——
-用英文测试完全正常，能一路带到生产。NER 服务只返回实体文本，由本端回原文定位。
-
-**fail-closed 返回 200 + `blocked: true`，不返回 5xx。** 这不是服务故障而是
-安全策略生效。返回 5xx 会让网关按「上游故障」重试或降级 ——
-而降级的方向往往是放行，恰好与安全意图相反。
-
-**脱敏映射永不落盘。** `SessionVault` 从类型层面禁止序列化（`__reduce__` 等价物
-直接抛错）。它存的是「占位符 → 真实姓名/手机/身份证」，落盘就等于把脱敏组件
-变成 PII 数据库 —— 一次备份泄露，整条防线全废。
-
-**正则检测不出人名。** 人名没有稳定的字面特征。只装正则识别器就上线，
-姓名/地址/机构名会**完全裸奔**。`CompositeDetector` 在缺少这三类覆盖时会主动告警，
-`/stats` 端点也会暴露 `coverage_gaps` —— 必须在监控里可见。
-
-**识别器表只有一份。** 国家包是唯一的来源，网关、sidecar、配置校验层全部从它读。
-这条规则是踩出来的：曾经同一张表存在三份副本（`RegexDetector`、`predefinedSpecs`、
-packs），新增意大利/德国/西班牙识别器后，跑起来的二进制用的仍是老副本 ——
-包装好了，业务上一个也没生效，且没有任何报错。
-
-**pdata 的 MoveTo/CopyTo 会产出独立副本。** OTel 处理器的第一版用它来隔离每个
-资源，结果：能编译、能运行、还会报告自己脱敏了多少字段 —— 然后原样转发了原批次。
-探针用例当场坐实了这一点（`改写副本后，原批次里的 span 名 = "原始名"`），
-现在遍历器一律就地改写。
-
-**这个越权漏洞曾经是活的。** 在引入租户之前，会话保险库只以调用方提供的
-`session_id` 作键。租户 B 拿同一个 `session_id` 调 `/v1/restore`，会原样拿回
-租户 A 的姓名和手机号**明文** —— 不是令牌、不是摘要，是值本身。这比令牌层的
-越权更严重：令牌至少还要先有一个令牌。修复方式不是加一层检查，而是把租户放进键里。
+**识别器表只有一份。** 曾经同一张表存在三份副本（`RegexDetector`、
+`predefinedSpecs`、packs），新增意大利/德国/西班牙识别器后，跑起来的二进制
+用的仍是老副本——包装好了，业务上一个也没生效，且没有任何报错。
 
 **校验位函数不许夹带长度。** `LuhnValid` 一度写死了 12–19 位（卡号长度），
 于是意大利 11 位增值税号的识别器注册成功、运行正常、**永不命中**。
-长度属于「卡号」这个概念，不属于 Luhn 这个算法 —— 现在是
-`LuhnValid` 与 `BankCardLuhnValid` 两个函数。
+长度属于「卡号」这个概念，不属于 Luhn 这个算法。
+
+**只做 Luhn 会放行十分之一的随机数字串**（单位校验位的理论值，实测 9.80%）。
+加入 ISO/IEC 7812 的 IIN 前缀与各卡组织实际签发长度后降到 0.86%，
+八个卡组织的公开测试卡号零漏检。
+
+**IPv4 与四段式版本号字面完全相同。** `5.15.0.91` 既是合法地址也是内核版本号
+——没有任何模式能分开，因为根本没有可分的东西。上下文对这一类被提升为
+**必要条件**。代价写下来了：裸日志行里的地址会被漏掉。
+
+**pdata 的 MoveTo/CopyTo 会产出独立副本。** OTel 处理器第一版用它隔离每个资源：
+能编译、能运行、还会报告自己脱敏了多少字段——然后原样转发了原批次。
+
+**`ResolveOverlaps` 曾是 O(n²)。** 3052 个实体上单次 8.8ms。改为「按起点切连通块
++ 块内原贪心」，3000 组随机输入上新旧输出逐字相同，6000 个实体上提速 285×。
+
+**试过但不成立：把 22 个模式合并成一个并集正则做门控。** 逻辑上完全成立，
+实测比不加还慢——RE2 把它模拟成一个大自动机，每字节代价高过依次跑那些小的。
+记在这里，因为「合并成一个正则」听上去永远像个优化。
+
+**服务契约里不含偏移量。** Python 的 `str` 索引按字符，Go 按字节，中文一字 3 字节。
+直接采信对端偏移会把文本切碎，且**只在含中文时出错**——用英文测试完全正常。
+
+**fail-closed 返回 200 + `blocked: true`，不返回 5xx。** 这不是服务故障而是安全
+策略生效。返回 5xx 会让网关按「上游故障」重试或降级——而降级的方向往往是放行。
+
+**脱敏映射永不落盘。** `SessionVault` 从类型层面禁止序列化。它存的是
+「占位符 → 真实姓名/手机/身份证」，落盘就等于把脱敏组件变成 PII 数据库。
 
 ---
-
-## 现状与边界
-
-**已验证**
-
-- 12 个 Go 包，`-race -count=2` 全绿
-- 端到端验收：真实进程 + 真实故障转移 + 真实 PII，观测点在组件外部
-- 协议完整性：用「把任何文本都判成人名」的最坏情况检测器验证骨架不被污染
-
-**未验证**
-
-- OTel 处理器只在进程内用 `consumertest` sink 验证，未在真实 Collector 二进制里
-  用 `ocb` 构建并接入过真实后端
-- Testcontainers 集成用例（开发机无 Docker，代码写好但容器行为未实测）
-- 生产规模压测
-
-**尚未实现**
-
-- Envoy `ext_proc` gRPC 适配层（HTTP 接口已可用，Envoy 侧需要一层薄翻译）
-- 多副本部署的会话映射共享（当前映射在单实例内存中，需要会话亲和路由）
 
 ## 仓库结构
 
 ```
-pii/          脱敏引擎（公开 API，零外部依赖）
+pii/detect/          检测：正则 + 校验位 + 名册 + 远程 NER + 分层 + 并行分块扫描
 pii/detect/packs/    国家合规包 + 租户 YAML 规则加载器
-pii/telemetry/       遥测防火墙（零外部依赖，含 OTLP/JSON 遍历器）
-otelprocessor/       OTel Collector 处理器（独立模块，依赖 pdata）
-gpuload/      GPU 显存感知准入（公开 API）
-sidecar/      HTTP 服务实现
-cmd/airlock-agent/   sidecar 二进制
-cmd/airlock-gateway/  参考网关实现（完整的 AI 网关，用于演示扩展如何集成）
-internal/     参考网关专用的内部包
+pii/anonymize/       脱敏算子、策略矩阵、租户令牌库、会话保险库
+pii/document/        AST 定向清洗白名单（协议完整性）
+pii/verify/          双层验证：证据链验证器 + CAPID 上下文相关性
+pii/audit/           GDPR 安全审计事件与 SIEM sink
+pii/telemetry/       遥测防火墙（零外部依赖）
+gpuload/             GPU 显存感知准入
+sidecar/             HTTP 服务实现 + 租户解析 + 管理面快照
+eval/                量化评测框架（语料、打分、延迟、吞吐、还原准确率）
+cmd/airlock-agent/   sidecar 二进制 ← 主要交付物
+otelprocessor/       OTel Collector 处理器（独立模块）
+test/integration/    集成测试（独立模块，testcontainers）
+
+cmd/airlock-gateway/ 演示用参考网关。不与 Envoy/APISIX 竞争，
+internal/            只是为了让集成方式有一份可运行的示例。
 ```
 
-`pii` 与 `gpuload` 是公开包，可以单独 import；其余是参考实现。
+`pii/*`、`gpuload`、`sidecar` 是公开包，可单独 import。
+
+---
 
 ## License
 
