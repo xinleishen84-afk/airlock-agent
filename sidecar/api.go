@@ -111,6 +111,22 @@ type SessionRequest struct {
 	SessionID string `json:"session_id"`
 }
 
+// EraseResponse reports what a tenant erasure actually removed.
+// 报告一次租户擦除实际移除了什么。
+type EraseResponse struct {
+	Tenant string `json:"tenant"`
+	// SessionsErased 是被清除的会话映射数量。
+	SessionsErased int `json:"sessions_erased"`
+	// TokensErased 是被清除的令牌数量。
+	//
+	// 两个计数都给出来，是因为擦除要拿得出证据。
+	// 一次因租户串写错而匹配到零条的擦除，与一次真正成功的擦除，
+	// 在没有计数时看起来完全一样。
+	// Both counts are reported because erasure has to be evidenced: without
+	// them, an erasure that matched nothing looks like one that worked.
+	TokensErased int `json:"tokens_erased"`
+}
+
 // ErrorResponse is an error response.
 // 是错误响应。
 type ErrorResponse struct {

@@ -55,6 +55,14 @@ var (
 			"密钥绝不能写进配置文件——与策略文件同行的密钥会随它的每一份副本流传")
 	ontologyFile = flag.String("ontology", "",
 		"本体词表 YAML。矩阵里用到 generalize 算子时必填")
+	tenantHeader = flag.String("tenant-header", "",
+		"从该请求头解析租户（如 X-Tenant-Id）。\n"+
+			"只有当调用方绕不过去的上游来设置它时才安全——服务网格、做认证的网关、\n"+
+			"带 mTLS 的入口。在调用方能直连的端口上，这等于让他们自己挑租户")
+	singleTenant = flag.String("single-tenant", "",
+		"把所有请求归入该租户。确实是单租户部署时使用。\n"+
+			"与 --tenant-header 二选一，且必须选一个：\n"+
+			"缺少隔离时，任何拿到他人 session_id 的调用方都能取回对方的明文 PII")
 	logLevel = flag.String("log-level", "info", "日志级别")
 )
 
@@ -70,6 +78,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	resolver, err := buildTenantResolver()
+	if err != nil {
+		logger.Error("构造租户解析器失败", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("租户隔离已生效", "resolver", resolver.Name())
+
 	matrix, tokenStore, err := buildMatrix()
 	if err != nil {
 		logger.Error("构造脱敏策略矩阵失败", "err", err)
@@ -81,13 +96,14 @@ func main() {
 	}
 
 	srv, err := sidecar.New(sidecar.Options{
-		Detector:    detector,
-		Matrix:      matrix,
-		TokenStore:  tokenStore,
-		FailClosed:  *failClosed,
-		SessionTTL:  *sessionTTL,
-		MaxSessions: *maxSessions,
-		Logger:      logger,
+		Detector:       detector,
+		Matrix:         matrix,
+		TokenStore:     tokenStore,
+		TenantResolver: resolver,
+		FailClosed:     *failClosed,
+		SessionTTL:     *sessionTTL,
+		MaxSessions:    *maxSessions,
+		Logger:         logger,
 	})
 	if err != nil {
 		logger.Error("启动失败", "err", err)
@@ -260,10 +276,10 @@ func buildMatrix() (*anonymize.Matrix, anonymize.TokenStore, error) {
 		return nil, nil, nil
 	}
 
-	deps := anonymize.MatrixDeps{TokenStore: anonymize.NewMemoryTokenStore()}
+	deps := anonymize.MatrixDeps{TokenStore: anonymize.NewMemoryTokenStore(*sessionTTL)}
 
 	if *hashKeyFile != "" {
-		key, err := os.ReadFile(*hashKeyFile)
+		key, err := os.ReadFile(*hashKeyFile) //nolint:gosec // 路径由运维显式指定
 		if err != nil {
 			return nil, nil, fmt.Errorf("读取 HMAC 密钥失败: %w", err)
 		}
@@ -272,7 +288,11 @@ func buildMatrix() (*anonymize.Matrix, anonymize.TokenStore, error) {
 		// Key files usually carry a trailing newline; using it verbatim makes
 		// one key produce two incompatible digest sets depending on how it was
 		// written, silently breaking cross-system correlation.
-		deps.HashKey = []byte(strings.TrimSpace(string(key)))
+		ring, err := anonymize.NewKeyring([]byte(strings.TrimSpace(string(key))), nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		deps.Keyring = ring
 	}
 
 	if *ontologyFile != "" {
@@ -288,4 +308,33 @@ func buildMatrix() (*anonymize.Matrix, anonymize.TokenStore, error) {
 		return nil, nil, err
 	}
 	return m, deps.TokenStore, nil
+}
+
+// buildTenantResolver 装配租户解析器。
+//
+// 两者必选其一，没有默认值。默认值只能是「所有人一个租户」，
+// 而那意味着任何拿到他人 session_id 的调用方都能从 /v1/restore
+// 取回对方的明文姓名和手机号——不是令牌，是值本身。
+// 让「不做隔离」成为一个必须敲出来的命令行参数。
+//
+// One of the two is required, with no default. The only possible default is
+// "everyone is one tenant", which means anyone holding another caller's
+// session_id gets their name and phone number back in plaintext.
+func buildTenantResolver() (sidecar.TenantResolver, error) {
+	switch {
+	case *tenantHeader != "" && *singleTenant != "":
+		return nil, fmt.Errorf(
+			"--tenant-header 与 --single-tenant 只能选一个——" +
+				"同时配置时无法判断哪一个才是实际生效的隔离模型")
+
+	case *tenantHeader != "":
+		return sidecar.NewHeaderTenantResolver(*tenantHeader)
+
+	case *singleTenant != "":
+		return sidecar.NewStaticTenantResolver(anonymize.Tenant(*singleTenant))
+	}
+	return nil, fmt.Errorf(
+		"必须指定 --tenant-header 或 --single-tenant：" +
+			"缺少租户隔离时，会话保险库只以调用方提供的 session_id 作键，" +
+			"任何拿到他人 session_id 的调用方都能取回对方的明文 PII")
 }

@@ -3,6 +3,7 @@ package anonymize
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const goodMatrix = `
@@ -27,16 +28,17 @@ flows:
       ORG: generalize
 `
 
-func testDeps() MatrixDeps {
+func testDeps(t testing.TB) MatrixDeps {
+	t.Helper()
 	return MatrixDeps{
-		HashKey:    testKey(),
-		TokenStore: NewMemoryTokenStore(),
+		Keyring:    testKeyring(t),
+		TokenStore: NewMemoryTokenStore(time.Hour),
 		Ontology:   testOntology(),
 	}
 }
 
 func TestLoadMatrix(t *testing.T) {
-	m, err := LoadMatrix(strings.NewReader(goodMatrix), testDeps(), "test.yaml")
+	m, err := LoadMatrix(strings.NewReader(goodMatrix), testDeps(t), "test.yaml")
 	if err != nil {
 		t.Fatalf("加载失败：%v", err)
 	}
@@ -108,7 +110,7 @@ func TestMatrixConfigRejections(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := LoadMatrix(strings.NewReader(c.src), testDeps(), "test.yaml")
+			_, err := LoadMatrix(strings.NewReader(c.src), testDeps(t), "test.yaml")
 			if err == nil {
 				t.Fatal("应加载失败")
 			}
@@ -123,7 +125,7 @@ func TestMatrixConfigRejections(t *testing.T) {
 // A missing dependency must fail at startup, not on the first request.
 func TestMissingDependenciesFailAtLoad(t *testing.T) {
 	cases := []struct{ name, src, want string }{
-		{"缺密钥", "version: 1\nflows:\n  - name: a\n    default: hash\n", "HMAC"},
+		{"缺密钥", "version: 1\nflows:\n  - name: a\n    default: hash\n", "密钥环"},
 		{"缺令牌库", "version: 1\nflows:\n  - name: a\n    default: tokenize\n", "令牌库"},
 		{"缺词表", "version: 1\nflows:\n  - name: a\n    default: generalize\n", "词表"},
 	}
@@ -147,7 +149,7 @@ func TestMissingDependenciesFailAtLoad(t *testing.T) {
 // changes and the table does not, validation starts approving a silently
 // broken flow.
 func TestReversibilityTableMatchesOperators(t *testing.T) {
-	deps := testDeps()
+	deps := testDeps(t)
 	var opts MatrixOptions
 	for name, want := range reversibleByName {
 		s, err := opts.build(name, deps)
@@ -168,8 +170,8 @@ func TestShippedExampleMatrixLoads(t *testing.T) {
 		t.Fatalf("发布的示例词表加载失败：%v", err)
 	}
 	m, err := LoadMatrixFile("../../configs/redaction-matrix.yaml", MatrixDeps{
-		HashKey:    testKey(),
-		TokenStore: NewMemoryTokenStore(),
+		Keyring:    testKeyring(t),
+		TokenStore: NewMemoryTokenStore(time.Hour),
 		Ontology:   o,
 	})
 	if err != nil {

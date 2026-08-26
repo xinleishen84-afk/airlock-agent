@@ -1,14 +1,13 @@
 package anonymize
 
 import (
+	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 )
@@ -43,6 +42,26 @@ import (
 // 模型用哈希作答，网关把 "[hash:name:a4b2efc8]" 当成人名交给终端用户。
 // 因此每个算子都必须声明 Reversible()，而带复原的目的地拒绝用不可逆算子构建。
 
+// StrategyScope carries everything an operator needs beyond the entity itself.
+// 携带算子在实体之外所需的一切。
+//
+// The tenant is here rather than baked into each operator at construction: one
+// gateway process serves every tenant, so an operator holding a tenant would
+// have to be rebuilt per request, and the one that was not rebuilt would
+// quietly serve tenant A's data under tenant B's key.
+// 租户放在这里，而不是构造期烧进每个算子：一个网关进程服务所有租户，
+// 因此持有租户的算子必须逐请求重建，
+// 而那个没被重建的算子会悄悄地用租户 B 的密钥处理租户 A 的数据。
+type StrategyScope struct {
+	// Tenant is the isolation boundary this call belongs to.
+	// 是本次调用所属的隔离边界。
+	Tenant Tenant
+
+	// Vault holds the session's placeholder mapping.
+	// 持有本会话的占位符映射。
+	Vault *SessionVault
+}
+
 // Strategy is a redaction operator.
 // 是一个脱敏算子。
 type Strategy interface {
@@ -52,7 +71,7 @@ type Strategy interface {
 
 	// Apply returns the replacement text for one entity.
 	// 返回一个实体的替换文本。
-	Apply(e detect.Entity, vault *SessionVault) (string, error)
+	Apply(ctx context.Context, scope StrategyScope, e detect.Entity) (string, error)
 
 	// Reversible reports whether Apply's output can be turned back into the
 	// original value. It is a hard property of the operator, not a hint.
@@ -94,11 +113,11 @@ func (MaskStrategy) Name() string { return "mask" }
 func (MaskStrategy) Reversible() bool { return true }
 
 // Apply implements Strategy.
-func (MaskStrategy) Apply(e detect.Entity, vault *SessionVault) (string, error) {
-	if vault == nil {
+func (MaskStrategy) Apply(_ context.Context, scope StrategyScope, e detect.Entity) (string, error) {
+	if scope.Vault == nil {
 		return "", fmt.Errorf("%w: mask 需要会话保险库 / mask requires a session vault", ErrStrategy)
 	}
-	return vault.PlaceholderFor(e), nil
+	return scope.Vault.PlaceholderFor(e), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +170,7 @@ func (CharMaskStrategy) Reversible() bool { return false }
 // operator meant to hide.
 // 按字符（rune）而非字节计数：按字节遮罩中文姓名会每个字输出三个星号，
 // 从而泄露一个本想隐藏的值的字数。
-func (s CharMaskStrategy) Apply(e detect.Entity, _ *SessionVault) (string, error) {
+func (s CharMaskStrategy) Apply(_ context.Context, _ StrategyScope, e detect.Entity) (string, error) {
 	runes := []rune(e.Value)
 	if s.Keep >= len(runes) {
 		// Keeping everything would emit the value unchanged. Refuse rather
@@ -212,18 +231,9 @@ func (s CharMaskStrategy) Apply(e detect.Entity, _ *SessionVault) (string, error
 // 在 GDPR 下它仍然是个人数据，不是匿名数据。
 // 它降低暴露面，但并没有走出监管范围。
 type HashStrategy struct {
-	key    []byte
-	digits int
+	keyring *Keyring
+	digits  int
 }
-
-// minHashKeyLen is the shortest key accepted.
-// 是可接受的最短密钥长度。
-//
-// Below this the key is guessable and the construction degrades to a plain
-// hash, which is the failure this operator exists to avoid.
-// 低于此长度密钥可被猜出，构造退化为普通哈希——
-// 正是本算子要避免的那种故障。
-const minHashKeyLen = 16
 
 // NewHash builds the keyed-hash operator.
 // 构造带密钥哈希算子。
@@ -235,21 +245,20 @@ const minHashKeyLen = 16
 // digits 是摘要后缀的十六进制长度。越短越可读，也越容易碰撞：
 // 8 位十六进制下，约 7.7 万个不同值时碰撞概率就到 50%（生日界），
 // 对一个统计去重用户数的数仓字段而言，这是实打实的少算。
-func NewHash(key []byte, digits int) (HashStrategy, error) {
-	if len(key) < minHashKeyLen {
+func NewHash(keyring *Keyring, digits int) (HashStrategy, error) {
+	if keyring == nil {
 		return HashStrategy{}, fmt.Errorf(
-			"%w: 哈希密钥至少 %d 字节，实际 %d——过短的密钥可被穷举，"+
-				"构造退化为无盐哈希 / hash key must be >= %d bytes",
-			ErrStrategy, minHashKeyLen, len(key), minHashKeyLen)
+			"%w: 哈希算子需要密钥环——没有它就只能用固定密钥，"+
+				"于是同一个手机号在每个租户下摘要相同，"+
+				"两个租户比对数仓导出即可确认共有客户 / hash requires a keyring",
+			ErrStrategy)
 	}
 	if digits < 8 || digits > 64 {
 		return HashStrategy{}, fmt.Errorf(
 			"%w: 摘要位数须在 [8,64]，实际 %d / digest length must be in [8,64]",
 			ErrStrategy, digits)
 	}
-	k := make([]byte, len(key))
-	copy(k, key)
-	return HashStrategy{key: k, digits: digits}, nil
+	return HashStrategy{keyring: keyring, digits: digits}, nil
 }
 
 // Name implements Strategy.
@@ -259,11 +268,15 @@ func (HashStrategy) Name() string { return "hash" }
 func (HashStrategy) Reversible() bool { return false }
 
 // Apply implements Strategy.
-func (s HashStrategy) Apply(e detect.Entity, _ *SessionVault) (string, error) {
-	if len(s.key) == 0 {
-		return "", fmt.Errorf("%w: 哈希算子未初始化密钥 / hash strategy has no key", ErrStrategy)
+func (s HashStrategy) Apply(_ context.Context, scope StrategyScope, e detect.Entity) (string, error) {
+	if s.keyring == nil {
+		return "", fmt.Errorf("%w: 哈希算子未初始化密钥环 / hash strategy has no keyring", ErrStrategy)
 	}
-	mac := hmac.New(sha256.New, s.key)
+	key, err := s.keyring.Key(scope.Tenant)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrStrategy, err)
+	}
+	mac := hmac.New(sha256.New, key)
 	// The type is part of the MAC input, not only of the printed label: without
 	// it, the same string as a NAME and as an ORG would produce one digest and
 	// silently join two different populations in the warehouse.
@@ -279,119 +292,6 @@ func (s HashStrategy) Apply(e detect.Entity, _ *SessionVault) (string, error) {
 // ---------------------------------------------------------------------------
 // Tokenize / 可逆伪名化
 // ---------------------------------------------------------------------------
-
-// TokenStore holds token → value mappings with namespace isolation.
-// 持有带命名空间隔离的「令牌 → 原值」映射。
-//
-// # This is a PII database
-// # 这是一个 PII 数据库
-//
-// SessionVault refuses to serialize because a placeholder map that outlives the
-// conversation is a PII database. A token store is that same map, deliberately
-// made durable — that is what buys reversibility across sessions and systems.
-// The trade is real and cannot be engineered away: tokenizing moves the secret
-// from the payload into the store, so the store inherits every control the raw
-// data had. Encryption at rest, access audit, key rotation, retention limits.
-// SessionVault 拒绝序列化，是因为一张活得比会话久的占位符表就是 PII 数据库。
-// 令牌库正是同一张表，只是刻意做成持久的——这就是跨会话、跨系统可逆的代价。
-// 这个取舍是真实的，工程上消不掉：令牌化把秘密从载荷搬进了库，
-// 于是库继承了原始数据的全部管控要求：静态加密、访问审计、密钥轮转、留存期限。
-//
-// The interface exists so that store can be Redis, a KMS-backed table, or an
-// HSM — not because in-memory is good enough for production.
-// 定义成接口，是为了让这个库可以是 Redis、KMS 托管表或 HSM，
-// 而不是因为内存实现足以上生产。
-type TokenStore interface {
-	// Issue returns a stable token for (namespace, value), creating one on
-	// first sight. The same pair must always map to the same token.
-	// 为 (namespace, value) 返回稳定令牌，首次出现时创建。
-	// 同一对必须始终映射到同一令牌。
-	Issue(namespace, value string) (string, error)
-
-	// Resolve returns the value behind a token.
-	// 返回令牌背后的原值。
-	Resolve(namespace, token string) (string, bool)
-}
-
-// MemoryTokenStore is an in-process TokenStore.
-// 是进程内的 TokenStore 实现。
-//
-// Tokens do not survive a restart. That is not merely a durability gap: the
-// point of tokenization is that a token means the same thing tomorrow and in
-// the next system, so a store that forgets breaks correlation without breaking
-// anything visibly. Use it for tests and single-process deployments only.
-// 令牌不跨重启存活。这不只是持久性缺口：令牌化的意义就在于同一个令牌
-// 明天、在另一个系统里含义相同，而一个会遗忘的库会在不显现任何故障的
-// 情况下破坏关联性。仅用于测试与单进程部署。
-type MemoryTokenStore struct {
-	mu     sync.RWMutex
-	byPair map[string]string // namespace\x00value -> token
-	byTok  map[string]string // namespace\x00token -> value
-}
-
-// NewMemoryTokenStore builds an in-process token store.
-// 构造进程内令牌库。
-func NewMemoryTokenStore() *MemoryTokenStore {
-	return &MemoryTokenStore{
-		byPair: map[string]string{},
-		byTok:  map[string]string{},
-	}
-}
-
-// Issue implements TokenStore.
-func (s *MemoryTokenStore) Issue(namespace, value string) (string, error) {
-	key := namespace + "\x00" + value
-
-	s.mu.RLock()
-	tok, ok := s.byPair[key]
-	s.mu.RUnlock()
-	if ok {
-		return tok, nil
-	}
-
-	// Tokens are random, not derived from the value. A derived token is a hash
-	// under another name and inherits the offline-enumeration problem; a random
-	// one carries no information about what it stands for, which is the whole
-	// premise of "无语义".
-	// 令牌是随机的，不由原值推导。推导出来的令牌不过是换了名字的哈希，
-	// 继承了同样的离线穷举问题；随机令牌不携带任何关于原值的信息，
-	// 而这正是「无语义」的全部前提。
-	raw := make([]byte, 8)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("%w: 生成令牌失败 / generating token: %v", ErrStrategy, err)
-	}
-	tok = hex.EncodeToString(raw)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Re-check: another goroutine may have issued one for the same pair while
-	// this one was generating randomness. Overwriting would hand out two
-	// tokens for one value and break the stability guarantee.
-	// 二次确认：本协程生成随机数期间，可能已有其他协程为同一对签发了令牌。
-	// 覆盖会让一个值对应两个令牌，破坏稳定性保证。
-	if existing, ok := s.byPair[key]; ok {
-		return existing, nil
-	}
-	s.byPair[key] = tok
-	s.byTok[namespace+"\x00"+tok] = value
-	return tok, nil
-}
-
-// Resolve implements TokenStore.
-func (s *MemoryTokenStore) Resolve(namespace, token string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	v, ok := s.byTok[namespace+"\x00"+token]
-	return v, ok
-}
-
-// Size returns how many distinct values are tokenized.
-// 返回已令牌化的不同值的数量。
-func (s *MemoryTokenStore) Size() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.byPair)
-}
 
 // TokenizeStrategy replaces a value with a semantics-free token.
 // 用无语义令牌替换值。
@@ -418,9 +318,9 @@ func (TokenizeStrategy) Name() string { return "tokenize" }
 func (TokenizeStrategy) Reversible() bool { return true }
 
 // Apply implements Strategy.
-func (s TokenizeStrategy) Apply(e detect.Entity, _ *SessionVault) (string, error) {
+func (s TokenizeStrategy) Apply(ctx context.Context, scope StrategyScope, e detect.Entity) (string, error) {
 	ns := namespaceOf(e.Type)
-	tok, err := s.store.Issue(ns, e.Value)
+	tok, err := s.store.Issue(ctx, TokenKey{Tenant: scope.Tenant, Namespace: ns}, e.Value)
 	if err != nil {
 		return "", err
 	}
@@ -460,7 +360,9 @@ func (DropStrategy) Name() string { return "drop" }
 func (DropStrategy) Reversible() bool { return false }
 
 // Apply implements Strategy.
-func (DropStrategy) Apply(detect.Entity, *SessionVault) (string, error) { return "", nil }
+func (DropStrategy) Apply(context.Context, StrategyScope, detect.Entity) (string, error) {
+	return "", nil
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers / 公共辅助

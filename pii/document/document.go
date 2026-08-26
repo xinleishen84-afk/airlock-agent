@@ -1,6 +1,7 @@
 package document
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
@@ -497,17 +498,17 @@ func RestoreDocument(doc map[string]any, transform textTransform) error {
 // 文本流，共用一个缓冲会让它们互相污染。
 type StreamRestorer struct {
 	redactor *anonymize.Redactor
-	vault    *anonymize.SessionVault
+	scope    anonymize.StrategyScope
 	buffers  map[string]*anonymize.StreamUnredactor
 	phantom  []string
 }
 
 // NewStreamRestorer creates a restorer for one stream.
 // 为一条流创建复原器。
-func NewStreamRestorer(r *anonymize.Redactor, vault *anonymize.SessionVault) *StreamRestorer {
+func NewStreamRestorer(r *anonymize.Redactor, scope anonymize.StrategyScope) *StreamRestorer {
 	return &StreamRestorer{
 		redactor: r,
-		vault:    vault,
+		scope:    scope,
 		buffers:  make(map[string]*anonymize.StreamUnredactor, 2),
 	}
 }
@@ -519,7 +520,7 @@ func NewStreamRestorer(r *anonymize.Redactor, vault *anonymize.SessionVault) *St
 // non-JSON heartbeats or error text, and doing nothing is safer than guessing.
 // 帧无法解析为 JSON 时原样返回：上游可能吐出非 JSON 的心跳或错误文本，
 // 此时不做任何替换比猜测更安全。
-func (s *StreamRestorer) Frame(data []byte) []byte {
+func (s *StreamRestorer) Frame(ctx context.Context, data []byte) []byte {
 	var doc map[string]any
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return data
@@ -535,10 +536,10 @@ func (s *StreamRestorer) Frame(data []byte) []byte {
 		idx++
 		buf, ok := s.buffers[key]
 		if !ok {
-			buf = anonymize.NewStreamUnredactor(s.redactor, s.vault)
+			buf = anonymize.NewStreamUnredactor(s.redactor, s.scope)
 			s.buffers[key] = buf
 		}
-		return buf.Feed(text), nil
+		return buf.Feed(ctx, text)
 	})
 	if err != nil {
 		return data
@@ -560,13 +561,17 @@ func (s *StreamRestorer) Frame(data []byte) []byte {
 // placeholder, and dropping it drops content.
 // 返回的是拼接后的纯文本。调用方应把它作为一个额外的增量帧发出——
 // 滞留缓冲里可能压着占位符的后半截，丢掉就是丢内容。
-func (s *StreamRestorer) Flush() string {
+func (s *StreamRestorer) Flush(ctx context.Context) (string, error) {
 	var b strings.Builder
 	for _, buf := range s.buffers {
-		b.WriteString(buf.Flush())
+		text, err := buf.Flush(ctx)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(text)
 		s.phantom = append(s.phantom, buf.Phantom()...)
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // Phantom 返回整条流中模型捏造的占位符。
@@ -588,13 +593,18 @@ func (s *StreamRestorer) keyFor(index int) string {
 
 // RestoreBody applies targeted restoration to a non-streaming response body.
 // 对非流式响应体执行定向复原。
-func RestoreBody(body []byte, redactor *anonymize.Redactor, vault *anonymize.SessionVault) []byte {
+func RestoreBody(ctx context.Context, body []byte, redactor *anonymize.Redactor,
+	scope anonymize.StrategyScope) []byte {
 	var doc map[string]any
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return body
 	}
 	err := RestoreDocument(doc, func(text string) (string, error) {
-		return redactor.Unredact(text, vault).Text, nil
+		res, err := redactor.Unredact(ctx, text, scope)
+		if err != nil {
+			return "", err
+		}
+		return res.Text, nil
 	})
 	if err != nil {
 		return body

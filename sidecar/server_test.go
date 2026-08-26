@@ -32,6 +32,7 @@ func newTestServer(t *testing.T, failClosed bool, detector detect.Detector) *htt
 	srv, err := New(Options{
 		Detector: detector, FailClosed: failClosed,
 		SessionTTL: time.Hour, MaxSessions: 100,
+		TenantResolver: mustStaticResolver(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -391,12 +392,13 @@ type matrixTestServer struct{ url string }
 func newMatrixTestServer(t *testing.T, m *anonymize.Matrix) matrixTestServer {
 	t.Helper()
 	srv, err := New(Options{
-		Detector:    packs.MustNewRegistry([]string{"GEN", "CN"}),
-		FailClosed:  true,
-		SessionTTL:  time.Hour,
-		MaxSessions: 100,
-		Matrix:      m,
-		TokenStore:  anonymize.NewMemoryTokenStore(),
+		Detector:       packs.MustNewRegistry([]string{"GEN", "CN"}),
+		FailClosed:     true,
+		SessionTTL:     time.Hour,
+		MaxSessions:    100,
+		Matrix:         m,
+		TokenStore:     anonymize.NewMemoryTokenStore(time.Hour),
+		TenantResolver: mustStaticResolver(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -419,4 +421,15 @@ func (m matrixTestServer) post(t *testing.T, path, body string) (int, string) {
 		t.Fatal(err)
 	}
 	return resp.StatusCode, string(b)
+}
+
+// mustStaticResolver 供既有单租户用例使用。
+// 这些用例测的不是隔离，因此显式声明「单租户」而不是把隔离关掉。
+func mustStaticResolver(t *testing.T) TenantResolver {
+	t.Helper()
+	r, err := NewStaticTenantResolver("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }

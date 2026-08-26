@@ -32,7 +32,7 @@ func newTestRedactor(t *testing.T) (*Redactor, *SessionVault) {
 func TestRoundTrip(t *testing.T) {
 	r, v := newTestRedactor(t)
 	original := "张伟的手机是 13812345678，身份证 " + validID
-	res, err := r.Redact(original, v)
+	res, err := r.Redact(t.Context(), original, sessScope(v))
 	if err != nil {
 		t.Fatalf("脱敏失败: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestRoundTrip(t *testing.T) {
 			t.Errorf("脱敏后仍含真实值 %q: %s", secret, res.Text)
 		}
 	}
-	if got := r.Unredact(res.Text, v).Text; got != original {
+	if got := unredactT(t, r, res.Text, sessScope(v)).Text; got != original {
 		t.Errorf("往返不一致:\n  得到 %q\n  期望 %q", got, original)
 	}
 }
@@ -51,8 +51,8 @@ func TestRoundTrip(t *testing.T) {
 func TestWhitespacePreserved(t *testing.T) {
 	r, v := newTestRedactor(t)
 	original := "李娜 13900001111 张伟 13812345678"
-	res, _ := r.Redact(original, v)
-	if got := r.Unredact(res.Text, v).Text; got != original {
+	res, _ := r.Redact(t.Context(), original, sessScope(v))
+	if got := unredactT(t, r, res.Text, sessScope(v)).Text; got != original {
 		t.Errorf("空白丢失:\n  得到 %q\n  期望 %q", got, original)
 	}
 }
@@ -60,8 +60,8 @@ func TestWhitespacePreserved(t *testing.T) {
 // TestCrossTurnConsistency 校验跨轮次同一实体占位符稳定。
 func TestCrossTurnConsistency(t *testing.T) {
 	r, v := newTestRedactor(t)
-	first, _ := r.Redact("张伟来了", v)
-	second, _ := r.Redact("张伟又来了", v)
+	first, _ := r.Redact(t.Context(), "张伟来了", sessScope(v))
+	second, _ := r.Redact(t.Context(), "张伟又来了", sessScope(v))
 	if !strings.Contains(first.Text, "ANONYMIZED_NAME_0") ||
 		!strings.Contains(second.Text, "ANONYMIZED_NAME_0") {
 		t.Errorf("跨轮次占位符不稳定: %q / %q", first.Text, second.Text)
@@ -81,12 +81,12 @@ func TestDistinctPlaceholderPerType(t *testing.T) {
 // TestUnredactToleratesRewriting 校验模型改写占位符后仍能复原。
 func TestUnredactToleratesRewriting(t *testing.T) {
 	r, v := newTestRedactor(t)
-	r.Redact("张伟", v)
+	r.Redact(t.Context(), "张伟", sessScope(v))
 	for _, variant := range []string{
 		"ANONYMIZED_NAME_0", "anonymized_name_0",
 		"`ANONYMIZED_NAME_0`", "[ANONYMIZED_NAME_0]", "【ANONYMIZED_NAME_0】",
 	} {
-		got := r.Unredact("你好 "+variant, v).Text
+		got := unredactT(t, r, "你好 "+variant, sessScope(v)).Text
 		if !strings.Contains(got, "张伟") {
 			t.Errorf("变体 %q 未能复原，得到 %q", variant, got)
 		}
@@ -96,8 +96,8 @@ func TestUnredactToleratesRewriting(t *testing.T) {
 // TestPhantomPlaceholderNotGuessed 校验模型捏造的占位符原样保留并记录。
 func TestPhantomPlaceholderNotGuessed(t *testing.T) {
 	r, v := newTestRedactor(t)
-	r.Redact("张伟", v)
-	res := r.Unredact("联系 ANONYMIZED_NAME_77", v)
+	r.Redact(t.Context(), "张伟", sessScope(v))
+	res := unredactT(t, r, "联系 ANONYMIZED_NAME_77", sessScope(v))
 	if !strings.Contains(res.Text, "ANONYMIZED_NAME_77") {
 		t.Errorf("捏造的占位符应原样保留: %q", res.Text)
 	}
@@ -110,7 +110,7 @@ func TestPhantomPlaceholderNotGuessed(t *testing.T) {
 func TestFailClosedBlocks(t *testing.T) {
 	r := NewRedactor(detect.NewCompositeDetector([]detect.Detector{brokenDetector{}}, 0), true)
 	v := newSessionVault("s", time.Hour)
-	if _, err := r.Redact("张伟 13812345678", v); err == nil {
+	if _, err := r.Redact(t.Context(), "张伟 13812345678", sessScope(v)); err == nil {
 		t.Fatal("检测器故障时必须阻断")
 	}
 }
@@ -119,7 +119,7 @@ func TestFailClosedBlocks(t *testing.T) {
 func TestFailOpenPassesThroughWithError(t *testing.T) {
 	r := NewRedactor(detect.NewCompositeDetector([]detect.Detector{brokenDetector{}}, 0), false)
 	v := newSessionVault("s", time.Hour)
-	res, err := r.Redact("张伟", v)
+	res, err := r.Redact(t.Context(), "张伟", sessScope(v))
 	if err == nil {
 		t.Error("fail-open 也必须返回错误，否则无法审计追责")
 	}
@@ -131,7 +131,7 @@ func TestFailOpenPassesThroughWithError(t *testing.T) {
 // TestScanLeakDetectsResidual 校验终检能发现脱敏后残留的真实值。
 func TestScanLeakDetectsResidual(t *testing.T) {
 	r, v := newTestRedactor(t)
-	r.Redact("张伟", v)
+	r.Redact(t.Context(), "张伟", sessScope(v))
 	if got := v.ScanLeak("正常文本"); len(got) != 0 {
 		t.Errorf("无泄露时应返回空，得到 %v", got)
 	}
@@ -143,7 +143,7 @@ func TestScanLeakDetectsResidual(t *testing.T) {
 // TestAuditCountsHideValues 校验审计视图只暴露计数。
 func TestAuditCountsHideValues(t *testing.T) {
 	r, v := newTestRedactor(t)
-	r.Redact("张伟 13812345678", v)
+	r.Redact(t.Context(), "张伟 13812345678", sessScope(v))
 	counts := v.AuditCounts()
 	if counts["NAME"] != 1 || counts["PHONE"] != 1 {
 		t.Errorf("计数不符: %v", counts)
@@ -168,7 +168,7 @@ func TestPurgeClearsMapping(t *testing.T) {
 // 这是流式脱敏的核心难点：占位符可能横跨两个 SSE 分片。
 func TestStreamUnredactHandlesSplitPlaceholder(t *testing.T) {
 	r, v := newTestRedactor(t)
-	r.Redact("张伟", v) // 登记 ANONYMIZED_NAME_0
+	r.Redact(t.Context(), "张伟", sessScope(v)) // 登记 ANONYMIZED_NAME_0
 
 	cases := [][]string{
 		{"你好 ANONYMIZED_NAME_0 再见"},             // complete in one chunk / 单片完整
@@ -177,12 +177,12 @@ func TestStreamUnredactHandlesSplitPlaceholder(t *testing.T) {
 		{"你好 ", "A", "N", "O", "N", "Y", "M", "I", "Z", "E", "D", "_", "N", "A", "M", "E", "_", "0", " 再见"},
 	}
 	for i, chunks := range cases {
-		s := NewStreamUnredactor(r, v)
+		s := NewStreamUnredactor(r, sessScope(v))
 		var out strings.Builder
 		for _, c := range chunks {
-			out.WriteString(s.Feed(c))
+			out.WriteString(s.FeedT(t, c))
 		}
-		out.WriteString(s.Flush())
+		out.WriteString(s.FlushT(t))
 		if got := out.String(); got != "你好 张伟 再见" {
 			t.Errorf("用例 %d 复原错误: %q", i, got)
 		}
@@ -192,14 +192,14 @@ func TestStreamUnredactHandlesSplitPlaceholder(t *testing.T) {
 // TestStreamNeverEmitsPartialPlaceholder 校验绝不把半个占位符吐给用户。
 func TestStreamNeverEmitsPartialPlaceholder(t *testing.T) {
 	r, v := newTestRedactor(t)
-	r.Redact("张伟", v)
+	r.Redact(t.Context(), "张伟", sessScope(v))
 
-	s := NewStreamUnredactor(r, v)
-	emitted := s.Feed("前缀 ANONYMIZED_NA")
+	s := NewStreamUnredactor(r, sessScope(v))
+	emitted := s.FeedT(t, "前缀 ANONYMIZED_NA")
 	if strings.Contains(emitted, "ANONYMIZED") {
 		t.Errorf("半个占位符被吐出: %q", emitted)
 	}
-	rest := s.Feed("ME_0 后缀") + s.Flush()
+	rest := s.FeedT(t, "ME_0 后缀") + s.FlushT(t)
 	if !strings.Contains(emitted+rest, "张伟") {
 		t.Errorf("最终未复原: %q", emitted+rest)
 	}
@@ -208,14 +208,14 @@ func TestStreamNeverEmitsPartialPlaceholder(t *testing.T) {
 // TestVaultRegistryExpiry 校验 TTL 到期的会话被回收且映射清空。
 func TestVaultRegistryExpiry(t *testing.T) {
 	reg := NewVaultRegistry(10*time.Millisecond, 100)
-	first, err := reg.Get("s")
+	first, err := reg.Get(anonymize_SessionRef("s"))
 	if err != nil {
 		t.Fatalf("获取会话失败: %v", err)
 	}
 	p := first.PlaceholderFor(detect.Entity{Type: detect.TypeName, Value: "张伟"})
 
 	time.Sleep(20 * time.Millisecond)
-	second, _ := reg.Get("s")
+	second, _ := reg.Get(anonymize_SessionRef("s"))
 	if second == first {
 		t.Error("过期会话应被重建")
 	}
@@ -234,13 +234,13 @@ func TestVaultRegistryConcurrent(t *testing.T) {
 		go func(id int) {
 			defer func() { done <- struct{}{} }()
 			sid := string(rune('a' + id%8))
-			v, err := reg.Get(sid)
+			v, err := reg.Get(anonymize_SessionRef(sid))
 			if err != nil {
 				t.Errorf("并发获取失败: %v", err)
 				return
 			}
 			for j := 0; j < 50; j++ {
-				res, _ := r.Redact("张伟 13812345678", v)
+				res, _ := r.Redact(t.Context(), "张伟 13812345678", sessScope(v))
 				if strings.Contains(res.Text, "张伟") {
 					t.Error("并发脱敏遗漏")
 					return

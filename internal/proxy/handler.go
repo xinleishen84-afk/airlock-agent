@@ -216,16 +216,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// --- 5. PII 出站脱敏 ---
-	sessionID := sessionKey(id, r)
-	var vault *anonymize.SessionVault
+	// 会话引用带租户：X-Session-Id 是调用方提供的字符串，
+	// 两个租户传同一个值就会共用一个保险库，而保险库里是明文 PII。
+	// The session reference carries the tenant: X-Session-Id is a
+	// caller-supplied string, so two tenants sending the same value would
+	// share one vault — and the vault holds plaintext PII.
+	ref := anonymize.SessionRef{
+		Tenant:  anonymize.Tenant(id.Tenant),
+		Session: sessionKey(id, r),
+	}
+	var scope anonymize.StrategyScope
 	redacting := h.deps.Redactor != nil && (h.deps.AlwaysRedact || !target.SelfHosted)
 	if redacting {
-		vault, err = h.deps.Vaults.Get(sessionID)
+		vault, err := h.deps.Vaults.Get(ref)
 		if err != nil {
 			h.reject(w, http.StatusServiceUnavailable, "会话资源不足")
 			return
 		}
-		body, err = h.redactBody(body, vault)
+		scope = anonymize.StrategyScope{Tenant: ref.Tenant, Vault: vault}
+		body, err = h.redactBody(r.Context(), body, scope)
 		if err != nil {
 			log.Error("出站脱敏失败，已阻断", "err", err)
 			h.reject(w, http.StatusBadGateway, "PII 脱敏失败，请求已阻断")
@@ -256,7 +265,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	// --- 8. 流式回传 ---
-	usage, err := h.stream(w, resp, vault, redacting, start, log)
+	usage, err := h.stream(r.Context(), w, resp, scope, redacting, start, log)
 	if err != nil {
 		log.Warn("流式传输中断", "err", err)
 	}
@@ -368,15 +377,15 @@ func (h *Handler) dispatch(
 
 // stream 把上游响应以 SSE 逐帧转发给客户端，同时做入站复原与用量统计。
 func (h *Handler) stream(
-	w http.ResponseWriter, resp *http.Response,
-	vault *anonymize.SessionVault, redacting bool,
+	ctx context.Context, w http.ResponseWriter, resp *http.Response,
+	scope anonymize.StrategyScope, redacting bool,
 	start time.Time, log *slog.Logger,
 ) (ratelimit.Usage, error) {
 	var usage ratelimit.Usage
 
 	// 非流式响应（上游报错或客户端没要 stream）直接透传
 	if !isSSE(resp.Header.Get("Content-Type")) {
-		return h.passthrough(w, resp, vault, redacting)
+		return h.passthrough(ctx, w, resp, scope, redacting)
 	}
 
 	rc := http.NewResponseController(w)
@@ -398,8 +407,8 @@ func (h *Handler) stream(
 
 	scanner := NewScanner(resp.Body, len(*buf), DefaultMaxEventSize)
 	var restorer *document.StreamRestorer
-	if redacting && vault != nil {
-		restorer = document.NewStreamRestorer(h.deps.Redactor, vault)
+	if redacting && scope.Vault != nil {
+		restorer = document.NewStreamRestorer(h.deps.Redactor, scope)
 	}
 
 	firstToken := true
@@ -421,7 +430,16 @@ func (h *Handler) stream(
 			if restorer != nil {
 				// 吐出滞留缓冲里的最后一截。包成合法的增量帧发出——
 				// 里面可能压着占位符的后半截，丢掉就是丢内容。
-				if tail := restorer.Flush(); tail != "" {
+				tail, flushErr := restorer.Flush(ctx)
+				if flushErr != nil {
+					// 复原失败时不得把滞留缓冲原样发出：里面压着的是
+					// 未复原的占位符或令牌，发出去就是把脱敏后的符号
+					// 当作原值交给终端用户。
+					// Never emit the hold-back buffer on a restore failure:
+					// it holds unrestored placeholders or tokens.
+					return usage, flushErr
+				}
+				if tail != "" {
 					if frame, err := document.MarshalPreserving(map[string]any{
 						"choices": []any{map[string]any{
 							"delta": map[string]any{"content": tail},
@@ -457,7 +475,7 @@ func (h *Handler) stream(
 			// 占位符可能横跨两个 chunk，滞留缓冲会处理，因此本帧的
 			// content 可能变成空串——那是正常的，不是丢帧，
 			// 且必须照常发出（帧里可能还带着 finish_reason 等其他字段）。
-			out = &Event{Event: event.Event, ID: event.ID, Data: restorer.Frame(event.Data)}
+			out = &Event{Event: event.Event, ID: event.ID, Data: restorer.Frame(ctx, event.Data)}
 		}
 
 		if err := WriteEvent(w, out); err != nil {
@@ -485,7 +503,8 @@ func (h *Handler) stream(
 
 // passthrough 透传非 SSE 响应（错误体、非流式调用）。
 func (h *Handler) passthrough(
-	w http.ResponseWriter, resp *http.Response, vault *anonymize.SessionVault, redacting bool,
+	ctx context.Context, w http.ResponseWriter, resp *http.Response,
+	scope anonymize.StrategyScope, redacting bool,
 ) (ratelimit.Usage, error) {
 	var usage ratelimit.Usage
 
@@ -495,9 +514,9 @@ func (h *Handler) passthrough(
 	}
 	accumulateUsage(&usage, body)
 
-	if redacting && vault != nil {
+	if redacting && scope.Vault != nil {
 		// 非流式响应同样走结构化复原，不做裸文本替换
-		body = document.RestoreBody(body, h.deps.Redactor, vault)
+		body = document.RestoreBody(ctx, body, h.deps.Redactor, scope)
 	}
 
 	copyHeaders(w.Header(), resp.Header)
@@ -634,14 +653,14 @@ func (h *Handler) collectFrom(
 // 列出的路径。协议骨架字段（role / model / function.name /
 // parameters.enum / tool_call_id 等）在物理上根本不会被访问，
 // NER 的概率性输出因此不可能污染协议结构。
-func (h *Handler) redactBody(body []byte, vault *anonymize.SessionVault) ([]byte, error) {
+func (h *Handler) redactBody(ctx context.Context, body []byte, scope anonymize.StrategyScope) ([]byte, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("解析请求体失败: %w", err)
 	}
 
 	err := document.SanitizeDocument(doc, func(text string) (string, error) {
-		res, err := h.deps.Redactor.Redact(text, vault)
+		res, err := h.deps.Redactor.Redact(ctx, text, scope)
 		if err != nil {
 			return "", err
 		}

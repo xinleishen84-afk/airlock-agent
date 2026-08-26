@@ -20,7 +20,7 @@ import (
 // hash, and the gateway hands "[hash:name:...]" to the user as a person's
 // name. The failure is silent end to end, so it must be caught at build time.
 func TestRestoringFlowRejectsIrreversibleOperators(t *testing.T) {
-	h, _ := NewHash(testKey(), 8)
+	h, _ := NewHash(testKeyring(t), 8)
 
 	t.Run("默认算子不可逆", func(t *testing.T) {
 		err := NewMatrix().Add(Flow{Name: "public_llm", Default: h, Restores: true})
@@ -48,7 +48,7 @@ func TestRestoringFlowRejectsIrreversibleOperators(t *testing.T) {
 	})
 
 	t.Run("全部可逆则通过", func(t *testing.T) {
-		tk, _ := NewTokenize(NewMemoryTokenStore())
+		tk, _ := NewTokenize(NewMemoryTokenStore(time.Hour))
 		err := NewMatrix().Add(Flow{
 			Name: "public_llm", Default: NewMask(), Restores: true,
 			ByType: map[detect.EntityType]Strategy{detect.TypeEmail: tk},
@@ -88,11 +88,11 @@ func TestUnknownDestinationIsAnError(t *testing.T) {
 func TestSameBodyThreeDestinations(t *testing.T) {
 	const text = "客户 张伟 的邮箱是 a.b@example.com，手机 13812345678"
 
-	h, err := NewHash(testKey(), 8)
+	h, err := NewHash(testKeyring(t), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := NewMemoryTokenStore()
+	store := NewMemoryTokenStore(time.Hour)
 	tk, err := NewTokenize(store)
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestSameBodyThreeDestinations(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		res, err := r.RedactTo(text, vault, flow)
+		res, err := r.RedactTo(t.Context(), text, sessScope(vault), flow)
 		if err != nil {
 			t.Fatalf("%s: %v", dest, err)
 		}
@@ -132,7 +132,7 @@ func TestSameBodyThreeDestinations(t *testing.T) {
 // 审计要的是「3 个走 hash、1 个走 drop」，不只是「处理了 4 个 PII」。
 // Audit needs "3 hashed, 1 dropped", not just "4 PII handled".
 func TestStrategyCountsAreRecorded(t *testing.T) {
-	h, _ := NewHash(testKey(), 8)
+	h, _ := NewHash(testKeyring(t), 8)
 	m := NewMatrix().MustAdd(Flow{
 		Name: "mixed", Default: h,
 		ByType: map[detect.EntityType]Strategy{detect.TypePhone: NewDrop()},
@@ -140,7 +140,7 @@ func TestStrategyCountsAreRecorded(t *testing.T) {
 	flow, _ := m.Flow("mixed")
 
 	r := newStrategyTestRedactor(t, nil)
-	res, err := r.RedactTo("邮箱 a.b@example.com，手机 13812345678", newSessionVault("s", time.Hour), flow)
+	res, err := r.RedactTo(t.Context(), "邮箱 a.b@example.com，手机 13812345678", sessScope(newSessionVault("s", time.Hour)), flow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,14 +152,14 @@ func TestStrategyCountsAreRecorded(t *testing.T) {
 // 令牌化的往返：脱敏 → 模型 → 复原。
 // The tokenize round trip: redact -> model -> restore.
 func TestTokenizeRoundTrip(t *testing.T) {
-	store := NewMemoryTokenStore()
+	store := NewMemoryTokenStore(time.Hour)
 	tk, _ := NewTokenize(store)
 	flow := Flow{Name: "pseudonymous", Default: tk, Restores: true}
 
 	r := newStrategyTestRedactor(t, store)
 	vault := newSessionVault("s", time.Hour)
 
-	res, err := r.RedactTo("请发到 a.b@example.com", vault, flow)
+	res, err := r.RedactTo(t.Context(), "请发到 a.b@example.com", sessScope(vault), flow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestTokenizeRoundTrip(t *testing.T) {
 		t.Fatalf("脱敏后仍含原值：%s", res.Text)
 	}
 
-	back := r.Unredact("好的，已发送到 "+res.Text[strings.Index(res.Text, "[tok:"):], vault)
+	back := unredactT(t, r, "好的，已发送到 "+res.Text[strings.Index(res.Text, "[tok:"):], sessScope(vault))
 	if !strings.Contains(back.Text, "a.b@example.com") {
 		t.Fatalf("复原失败：%s（phantom=%v）", back.Text, back.Phantom)
 	}
@@ -179,11 +179,11 @@ func TestTokenizeRoundTrip(t *testing.T) {
 // 模型凭空捏造的令牌不能被还原成任何真实值。
 // A token the model invented must not resolve to any real value.
 func TestPhantomTokenIsNotGuessed(t *testing.T) {
-	store := NewMemoryTokenStore()
+	store := NewMemoryTokenStore(time.Hour)
 	r := newStrategyTestRedactor(t, store)
 	vault := newSessionVault("s", time.Hour)
 
-	res := r.Unredact("已发送到 [tok:email:deadbeefcafe0000]", vault)
+	res := unredactT(t, r, "已发送到 [tok:email:deadbeefcafe0000]", sessScope(vault))
 	if strings.Contains(res.Text, "@") {
 		t.Fatalf("幻影令牌不应被还原：%s", res.Text)
 	}
@@ -197,7 +197,7 @@ func TestPhantomTokenIsNotGuessed(t *testing.T) {
 // be visible.
 func TestTokenWithoutStoreBecomesPhantom(t *testing.T) {
 	r := NewRedactor(nil, true) // 无令牌库 / no token store
-	res := r.Unredact("已发送到 [tok:email:deadbeefcafe0000]", newSessionVault("s", time.Hour))
+	res := unredactT(t, r, "已发送到 [tok:email:deadbeefcafe0000]", sessScope(newSessionVault("s", time.Hour)))
 	if strings.Contains(res.Text, "@") {
 		t.Fatal("没有令牌库时不应还原出任何值")
 	}
@@ -209,7 +209,7 @@ func TestTokenWithoutStoreBecomesPhantom(t *testing.T) {
 // Describe 是审计索取的那份材料，必须从运行中的进程产出。
 // Describe is the artefact an auditor asks for, produced from the live process.
 func TestDescribeRendersMatrix(t *testing.T) {
-	h, _ := NewHash(testKey(), 8)
+	h, _ := NewHash(testKeyring(t), 8)
 	m := NewMatrix()
 	m.MustAdd(Flow{Name: "public_llm", Default: NewMask(), Restores: true})
 	m.MustAdd(Flow{

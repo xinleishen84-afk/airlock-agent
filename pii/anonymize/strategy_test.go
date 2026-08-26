@@ -12,7 +12,37 @@ func ent(typ detect.EntityType, value string) detect.Entity {
 	return detect.Entity{Type: typ, Value: value, End: len(value), Confidence: 1}
 }
 
-func testKey() []byte { return []byte("0123456789abcdef-test-key") }
+const testTenant Tenant = "acme"
+
+func testKey() []byte { return []byte("0123456789abcdef-0123456789abcdef-test") }
+
+// sessScope 是带会话保险库的算子作用域。
+func sessScope(v *SessionVault) StrategyScope {
+	return StrategyScope{Tenant: testTenant, Vault: v}
+}
+
+// mustKeyring 用给定根密钥构造密钥环。
+func mustKeyring(t testing.TB, root string) *Keyring {
+	t.Helper()
+	k, err := NewKeyring([]byte(root), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// testScope 是不涉及会话保险库的算子作用域。
+func testScope() StrategyScope { return StrategyScope{Tenant: testTenant} }
+
+// testKeyring 构造测试用密钥环。
+func testKeyring(t testing.TB) *Keyring {
+	t.Helper()
+	k, err := NewKeyring(testKey(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
 
 // ---------------------------------------------------------------------------
 // Mask / 遮罩
@@ -25,15 +55,15 @@ func TestMaskKeepsCoreferenceStable(t *testing.T) {
 	vault := newSessionVault("s1", time.Hour)
 	m := NewMask()
 
-	first, err := m.Apply(ent(detect.TypeName, "张伟"), vault)
+	first, err := m.Apply(t.Context(), sessScope(vault), ent(detect.TypeName, "张伟"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := m.Apply(ent(detect.TypeName, "张伟"), vault)
+	again, err := m.Apply(t.Context(), sessScope(vault), ent(detect.TypeName, "张伟"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := m.Apply(ent(detect.TypeName, "李娜"), vault)
+	other, err := m.Apply(t.Context(), sessScope(vault), ent(detect.TypeName, "李娜"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +84,7 @@ func TestMaskKeepsCoreferenceStable(t *testing.T) {
 // per Chinese character and leak the length.
 func TestCharMaskCountsRunesNotBytes(t *testing.T) {
 	s := NewCharMask('*', 0)
-	got, err := s.Apply(ent(detect.TypeName, "张伟"), nil)
+	got, err := s.Apply(t.Context(), testScope(), ent(detect.TypeName, "张伟"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +95,7 @@ func TestCharMaskCountsRunesNotBytes(t *testing.T) {
 
 func TestCharMaskKeepsSuffix(t *testing.T) {
 	s := NewCharMask('*', 4)
-	got, err := s.Apply(ent(detect.TypeBankCard, "4111111111111111"), nil)
+	got, err := s.Apply(t.Context(), testScope(), ent(detect.TypeBankCard, "4111111111111111"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +109,7 @@ func TestCharMaskKeepsSuffix(t *testing.T) {
 // original dressed as redacted output.
 func TestCharMaskRefusesNoOp(t *testing.T) {
 	s := NewCharMask('*', 8)
-	if _, err := s.Apply(ent(detect.TypePhone, "1381234"), nil); err == nil {
+	if _, err := s.Apply(t.Context(), testScope(), ent(detect.TypePhone, "1381234")); err == nil {
 		t.Fatal("keep >= 值长度时应报错")
 	}
 }
@@ -89,13 +119,13 @@ func TestCharMaskRefusesNoOp(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHashIsDeterministicAndTypeScoped(t *testing.T) {
-	h, err := NewHash(testKey(), 8)
+	h, err := NewHash(testKeyring(t), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	a, _ := h.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
-	b, _ := h.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
+	a, _ := h.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
+	b, _ := h.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
 	if a != b {
 		t.Errorf("同一值必须得到同一摘要：%q vs %q", a, b)
 	}
@@ -107,8 +137,8 @@ func TestHashIsDeterministicAndTypeScoped(t *testing.T) {
 	// 否则数仓里会把两个不同群体静默关联到一起。
 	// The same string as two types must differ, or the warehouse silently
 	// joins two different populations.
-	asName, _ := h.Apply(ent(detect.TypeName, "example"), nil)
-	asOrg, _ := h.Apply(ent(detect.TypeOrg, "example"), nil)
+	asName, _ := h.Apply(t.Context(), testScope(), ent(detect.TypeName, "example"))
+	asOrg, _ := h.Apply(t.Context(), testScope(), ent(detect.TypeOrg, "example"))
 	if strings.TrimPrefix(asName, "[hash:name:") == strings.TrimPrefix(asOrg, "[hash:org:") {
 		t.Error("不同实体类型的同一字符串不应产生相同摘要")
 	}
@@ -117,11 +147,11 @@ func TestHashIsDeterministicAndTypeScoped(t *testing.T) {
 // 换密钥必须换摘要——否则密钥轮转是假的。
 // A new key must produce new digests, or key rotation is a no-op.
 func TestHashKeyRotationChangesDigests(t *testing.T) {
-	h1, _ := NewHash(testKey(), 8)
-	h2, _ := NewHash([]byte("a-completely-different-key-value"), 8)
+	h1, _ := NewHash(testKeyring(t), 8)
+	h2, _ := NewHash(mustKeyring(t, "a-completely-different-root-key-value-32b"), 8)
 
-	a, _ := h1.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
-	b, _ := h2.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
+	a, _ := h1.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
+	b, _ := h2.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
 	if a == b {
 		t.Error("不同密钥应产生不同摘要")
 	}
@@ -130,10 +160,10 @@ func TestHashKeyRotationChangesDigests(t *testing.T) {
 // 过短的密钥会让构造退化为无盐哈希，必须在构造期拒绝。
 // A short key degrades the construction to an unsalted hash; reject at build.
 func TestHashRejectsWeakKey(t *testing.T) {
-	if _, err := NewHash([]byte("short"), 8); err == nil {
+	if _, err := NewHash(nil, 8); err == nil {
 		t.Fatal("过短的密钥应被拒绝")
 	}
-	if _, err := NewHash(testKey(), 4); err == nil {
+	if _, err := NewHash(testKeyring(t), 4); err == nil {
 		t.Fatal("过短的摘要位数应被拒绝")
 	}
 }
@@ -143,14 +173,14 @@ func TestHashRejectsWeakKey(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestTokenizeIsStableAndNamespaced(t *testing.T) {
-	store := NewMemoryTokenStore()
+	store := NewMemoryTokenStore(time.Hour)
 	tk, err := NewTokenize(store)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	a, _ := tk.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
-	b, _ := tk.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
+	a, _ := tk.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
+	b, _ := tk.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
 	if a != b {
 		t.Errorf("同一值必须得到同一令牌：%q vs %q", a, b)
 	}
@@ -160,12 +190,12 @@ func TestTokenizeIsStableAndNamespaced(t *testing.T) {
 
 	// 命名空间隔离：同一字符串在两个类型下互不可见
 	// Namespace isolation: the same string is not visible across types.
-	nameTok, _ := tk.Apply(ent(detect.TypeName, "a.b@example.com"), nil)
+	nameTok, _ := tk.Apply(t.Context(), testScope(), ent(detect.TypeName, "a.b@example.com"))
 	if nameTok == a {
 		t.Error("不同命名空间不应共用令牌")
 	}
 	raw := strings.TrimSuffix(strings.TrimPrefix(a, "[tok:email:"), "]")
-	if _, ok := store.Resolve("name", raw); ok {
+	if _, ok := mustResolve(t, store, TokenKey{Tenant: testTenant, Namespace: "name"}, raw); ok {
 		t.Error("email 命名空间的令牌不应在 name 命名空间下解析成功")
 	}
 }
@@ -174,25 +204,25 @@ func TestTokenizeIsStableAndNamespaced(t *testing.T) {
 // Tokens must not be derived from the value: a derived token is a hash under
 // another name.
 func TestTokensAreNotDerivedFromValue(t *testing.T) {
-	s1, s2 := NewMemoryTokenStore(), NewMemoryTokenStore()
+	s1, s2 := NewMemoryTokenStore(time.Hour), NewMemoryTokenStore(time.Hour)
 	t1, _ := NewTokenize(s1)
 	t2, _ := NewTokenize(s2)
 
-	a, _ := t1.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
-	b, _ := t2.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
+	a, _ := t1.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
+	b, _ := t2.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
 	if a == b {
 		t.Error("两个独立令牌库对同一值不应产生相同令牌——说明令牌是由值推导的")
 	}
 }
 
 func TestTokenStoreConcurrentIssueIsStable(t *testing.T) {
-	store := NewMemoryTokenStore()
+	store := NewMemoryTokenStore(time.Hour)
 	const workers = 32
 
 	results := make(chan string, workers)
 	for i := 0; i < workers; i++ {
 		go func() {
-			tok, err := store.Issue("email", "a.b@example.com")
+			tok, err := store.Issue(t.Context(), TokenKey{Tenant: testTenant, Namespace: "email"}, "a.b@example.com")
 			if err != nil {
 				t.Error(err)
 			}
@@ -215,7 +245,7 @@ func TestTokenStoreConcurrentIssueIsStable(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDropRemovesBytes(t *testing.T) {
-	got, err := NewDrop().Apply(ent(detect.TypePhone, "13812345678"), nil)
+	got, err := NewDrop().Apply(t.Context(), testScope(), ent(detect.TypePhone, "13812345678"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,8 +261,8 @@ func TestDropRemovesBytes(t *testing.T) {
 // 可逆性是算子的硬属性，复原路径静默地依赖它。
 // Reversibility is a hard property; the restore path silently depends on it.
 func TestReversibilityDeclarations(t *testing.T) {
-	h, _ := NewHash(testKey(), 8)
-	tk, _ := NewTokenize(NewMemoryTokenStore())
+	h, _ := NewHash(testKeyring(t), 8)
+	tk, _ := NewTokenize(NewMemoryTokenStore(time.Hour))
 	g, _ := NewGeneralize(&Ontology{Terms: map[string]string{"外科医生": "医生"}},
 		GranularityDecade, NewDrop())
 
@@ -252,4 +282,49 @@ func TestReversibilityDeclarations(t *testing.T) {
 			t.Errorf("%s.Reversible() = %v, want %v", c.s.Name(), got, c.want)
 		}
 	}
+}
+
+// FeedT / FlushT 是流式复原器的测试包装，把 ctx 与错误处理收在一处。
+// Test wrappers that keep ctx and error handling in one place.
+func (s *StreamUnredactor) FeedT(t *testing.T, chunk string) string {
+	t.Helper()
+	out, err := s.Feed(t.Context(), chunk)
+	if err != nil {
+		t.Fatalf("流式复原失败: %v", err)
+	}
+	return out
+}
+
+func (s *StreamUnredactor) FlushT(t *testing.T) string {
+	t.Helper()
+	out, err := s.Flush(t.Context())
+	if err != nil {
+		t.Fatalf("流式收尾失败: %v", err)
+	}
+	return out
+}
+
+// unredactT 是复原的测试包装。
+func unredactT(t *testing.T, r *Redactor, text string, scope StrategyScope) UnredactResult {
+	t.Helper()
+	res, err := r.Unredact(t.Context(), text, scope)
+	if err != nil {
+		t.Fatalf("复原失败: %v", err)
+	}
+	return res
+}
+
+// mustResolve 是令牌解析的测试包装。
+func mustResolve(t *testing.T, s TokenStore, key TokenKey, token string) (string, bool) {
+	t.Helper()
+	v, ok, err := s.Resolve(t.Context(), key, token)
+	if err != nil {
+		t.Fatalf("解析令牌失败: %v", err)
+	}
+	return v, ok
+}
+
+// anonymize_SessionRef 是测试用的会话引用构造。
+func anonymize_SessionRef(session string) SessionRef {
+	return SessionRef{Tenant: testTenant, Session: session}
 }

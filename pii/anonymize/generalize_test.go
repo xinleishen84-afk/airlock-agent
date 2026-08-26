@@ -35,7 +35,7 @@ func TestGeneralizeDates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := g.Apply(ent(detect.TypeIDCard, c.in), nil)
+		got, err := g.Apply(t.Context(), testScope(), ent(detect.TypeIDCard, c.in))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -56,7 +56,7 @@ func TestGeneralizeOntologyTerms(t *testing.T) {
 		"Surgeon": "physician", // 大小写不敏感
 	}
 	for in, want := range cases {
-		got, err := g.Apply(ent(detect.TypeOrg, in), nil)
+		got, err := g.Apply(t.Context(), testScope(), ent(detect.TypeOrg, in))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +79,7 @@ func TestGeneralizeFallsBackForUnknownTerms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := g.Apply(ent(detect.TypeOrg, "某个词表里没有的罕见职业"), nil)
+	got, err := g.Apply(t.Context(), testScope(), ent(detect.TypeOrg, "某个词表里没有的罕见职业"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestMedicalRecordFlow(t *testing.T) {
 		{detect.TypeIDCard, "1995-10-24", "1990s"},
 		{detect.TypeOrg, "外科医生", "医生"},
 	} {
-		got, err := flow.Strategy(c.typ).Apply(ent(c.typ, c.in), nil)
+		got, err := flow.Strategy(c.typ).Apply(t.Context(), testScope(), ent(c.typ, c.in))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,7 +164,7 @@ func TestMedicalRecordFlow(t *testing.T) {
 
 	// 没被显式覆盖的类型走默认算子（切除），不会原样漏出
 	// A type without an override takes the default (drop), never passes through
-	got, err := flow.Strategy(detect.TypePhone).Apply(ent(detect.TypePhone, "13812345678"), nil)
+	got, err := flow.Strategy(detect.TypePhone).Apply(t.Context(), testScope(), ent(detect.TypePhone, "13812345678"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,28 +176,28 @@ func TestMedicalRecordFlow(t *testing.T) {
 // 令牌被 SSE 帧边界切开时，前半截不能发给终端用户。
 // A token split across SSE frames must not have its first half emitted.
 func TestStreamHoldsBackSplitToken(t *testing.T) {
-	store := NewMemoryTokenStore()
+	store := NewMemoryTokenStore(time.Hour)
 	tk, _ := NewTokenize(store)
 	r := newStrategyTestRedactor(t, store)
 	vault := newSessionVault("s", time.Hour)
 
-	full, err := tk.Apply(ent(detect.TypeEmail, "a.b@example.com"), nil)
+	full, err := tk.Apply(t.Context(), testScope(), ent(detect.TypeEmail, "a.b@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// 在令牌中间切开
 	cut := len(full) / 2
-	su := NewStreamUnredactor(r, vault)
+	su := NewStreamUnredactor(r, sessScope(vault))
 
 	var out strings.Builder
-	out.WriteString(su.Feed("已发送到 " + full[:cut]))
+	out.WriteString(su.FeedT(t, "已发送到 "+full[:cut]))
 	emitted := out.String()
 	if strings.Contains(emitted, "[tok:") {
 		t.Fatalf("半个令牌被发了出去：%q", emitted)
 	}
-	out.WriteString(su.Feed(full[cut:] + "，请查收"))
-	out.WriteString(su.Flush())
+	out.WriteString(su.FeedT(t, full[cut:]+"，请查收"))
+	out.WriteString(su.FlushT(t))
 
 	if !strings.Contains(out.String(), "a.b@example.com") {
 		t.Fatalf("跨帧令牌应被完整还原：%q", out.String())

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,20 @@ type Options struct {
 	// Backs restoration for the tokenize operator; required when it is used.
 	TokenStore anonymize.TokenStore
 
+	// TenantResolver 决定每个请求属于哪个隔离域。必填。
+	//
+	// 没有它，会话保险库就只以调用方提供的 session_id 作键——
+	// 任何猜到或拿到别人 session_id 的调用方，都能从 /v1/restore
+	// 原样取回对方的姓名、手机号和身份证号。
+	// 单租户部署请显式使用 NewStaticTenantResolver，
+	// 让「不做隔离」成为写下来的决定，而不是没人想过时的默认值。
+	//
+	// Required. Without it the vault is keyed by a caller-supplied session_id
+	// alone, and anyone who obtains another caller's session_id gets their
+	// names and ID numbers back in plaintext. Single-tenant deployments should
+	// name StaticTenantResolver explicitly.
+	TenantResolver TenantResolver
+
 	Logger *slog.Logger
 }
 
@@ -83,6 +98,18 @@ type streamEntry struct {
 func New(opts Options) (*Server, error) {
 	if opts.Detector == nil {
 		return nil, errors.New("必须提供 PII 检测器")
+	}
+	if opts.TenantResolver == nil {
+		// 没有租户解析器，会话保险库就只以调用方提供的 session_id 作键，
+		// 任何拿到别人 session_id 的调用方都能从 /v1/restore 取回其明文 PII。
+		// 单租户部署请显式传 NewStaticTenantResolver("default")——
+		// 让「不做隔离」成为一个写下来的决定。
+		// Without a resolver the vault is keyed by a caller-supplied session_id
+		// alone. Single-tenant deployments must name StaticTenantResolver.
+		return nil, errors.New("必须提供租户解析器 TenantResolver——" +
+			"缺少它时会话保险库只以调用方提供的 session_id 作键，" +
+			"任何拿到他人 session_id 的调用方都能取回对方的明文 PII。" +
+			"单租户部署请显式使用 NewStaticTenantResolver / TenantResolver is required")
 	}
 	if opts.SessionTTL <= 0 {
 		opts.SessionTTL = time.Hour
@@ -129,6 +156,7 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("POST /v1/restore", s.handleRestore)
 	m.HandleFunc("POST /v1/session/end", s.handleEndSession)
 	m.HandleFunc("GET /healthz", s.handleHealth)
+	m.HandleFunc("POST /v1/tenant/erase", s.handleTenantErase)
 	m.HandleFunc("GET /stats", s.handleStats)
 	return m
 }
@@ -170,6 +198,33 @@ func (s *Server) resolveFlow(w http.ResponseWriter, dest string) (anonymize.Flow
 	return flow, true
 }
 
+// resolveTenant 解析请求所属的租户。
+//
+// 解析失败一律阻断。回退到默认租户会把所有解析不出租户的调用方
+// 合并进同一个隔离域，而那个域里装着真实 PII。
+// A resolution failure always blocks: falling back to a default tenant merges
+// every unidentified caller into one domain that holds real PII.
+func (s *Server) resolveTenant(w http.ResponseWriter, r *http.Request) (anonymize.Tenant, bool) {
+	tenant, err := s.opts.TenantResolver.Resolve(r)
+	if err != nil {
+		s.fail(w, http.StatusForbidden, err.Error(), false)
+		return "", false
+	}
+	return tenant, true
+}
+
+// scopeFor 取出租户作用域内的会话保险库。
+// scopeFor fetches the session vault inside the tenant's scope.
+func (s *Server) scopeFor(w http.ResponseWriter, tenant anonymize.Tenant, session string) (
+	anonymize.StrategyScope, bool) {
+	vault, err := s.vaults.Get(anonymize.SessionRef{Tenant: tenant, Session: session})
+	if err != nil {
+		s.fail(w, http.StatusServiceUnavailable, err.Error(), false)
+		return anonymize.StrategyScope{}, false
+	}
+	return anonymize.StrategyScope{Tenant: tenant, Vault: vault}, true
+}
+
 // handleRedact applies structured, AST-directed sanitization to an outbound
 // payload.
 // 对出站载荷执行结构化 AST 定向清洗。
@@ -186,21 +241,26 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vault, err := s.vaults.Get(req.SessionID)
-	if err != nil {
-		s.fail(w, http.StatusServiceUnavailable, err.Error(), false)
+	tenant, ok := s.resolveTenant(w, r)
+	if !ok {
 		return
 	}
-
 	flow, ok := s.resolveFlow(w, req.Destination)
 	if !ok {
 		return
 	}
 
+	scope, ok := s.scopeFor(w, tenant, req.SessionID)
+	if !ok {
+		return
+	}
+	vault := scope.Vault
+	ctx := r.Context()
+
 	counts := map[string]int{}
 	stratCounts := map[string]int{}
 	transform := func(text string) (string, error) {
-		res, err := s.redactor.RedactTo(text, vault, flow)
+		res, err := s.redactor.RedactTo(ctx, text, scope, flow)
 		if err != nil {
 			return "", err
 		}
@@ -263,15 +323,19 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vault, err := s.vaults.Get(req.SessionID)
-	if err != nil {
-		s.fail(w, http.StatusServiceUnavailable, err.Error(), false)
+	tenant, ok := s.resolveTenant(w, r)
+	if !ok {
 		return
 	}
+	scope, ok := s.scopeFor(w, tenant, req.SessionID)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
 
 	// 流式分片：占位符可能横跨两片，必须复用同一个滞留缓冲
 	if req.Streaming {
-		s.handleStreamRestore(w, req, vault)
+		s.handleStreamRestore(w, r, req, scope)
 		return
 	}
 
@@ -282,7 +346,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		restored := 0
 		var phantom []string
 		err := document.RestoreDocument(doc, func(text string) (string, error) {
-			res := s.redactor.Unredact(text, vault)
+			res, err := s.redactor.Unredact(ctx, text, scope)
+			if err != nil {
+				return "", err
+			}
 			restored += res.Restored
 			phantom = append(phantom, res.Phantom...)
 			return res.Text, nil
@@ -293,7 +360,11 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = RestoreResponse{Payload: doc, Restored: restored, Phantom: phantom}
 	case req.Text != "":
-		res := s.redactor.Unredact(req.Text, vault)
+		res, err := s.redactor.Unredact(ctx, req.Text, scope)
+		if err != nil {
+			s.fail(w, http.StatusInternalServerError, err.Error(), false)
+			return
+		}
 		resp = RestoreResponse{Text: res.Text, Restored: res.Restored, Phantom: res.Phantom}
 	default:
 		s.fail(w, http.StatusBadRequest, "payload 与 text 必须提供其一", false)
@@ -309,12 +380,19 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 
 // handleStreamRestore restores a streaming chunk.
 // 处理流式分片的复原。
-func (s *Server) handleStreamRestore(w http.ResponseWriter, req RestoreRequest, vault *anonymize.SessionVault) {
+func (s *Server) handleStreamRestore(w http.ResponseWriter, r *http.Request,
+	req RestoreRequest, scope anonymize.StrategyScope) {
+	// 流式缓冲同样按租户+会话作键：仅以会话作键会让另一个租户的分片
+	// 落进同一个滞留缓冲，把两条流的文本拼在一起。
+	// The stream buffers are keyed by tenant and session for the same reason:
+	// session-only keys would let another tenant's chunk land in this buffer.
+	streamKey := string(scope.Tenant) + "\x00" + req.SessionID
+
 	s.streamMu.Lock()
-	entry, ok := s.streamers[req.SessionID]
+	entry, ok := s.streamers[streamKey]
 	if !ok {
-		entry = &streamEntry{restorer: document.NewStreamRestorer(s.redactor, vault)}
-		s.streamers[req.SessionID] = entry
+		entry = &streamEntry{restorer: document.NewStreamRestorer(s.redactor, scope)}
+		s.streamers[streamKey] = entry
 	}
 	entry.lastUsed = time.Now()
 	restorer := entry.restorer
@@ -327,26 +405,33 @@ func (s *Server) handleStreamRestore(w http.ResponseWriter, req RestoreRequest, 
 			s.fail(w, http.StatusBadRequest, "序列化分片失败", false)
 			return
 		}
-		out := restorer.Frame(raw)
+		out := restorer.Frame(r.Context(), raw)
 		var doc map[string]any
 		if json.Unmarshal(out, &doc) == nil {
 			resp.Payload = doc
 		}
 	} else {
 		// 纯文本分片：Frame 期望 JSON，此处退回逐段复原
-		res := s.redactor.Unredact(req.Text, vault)
+		res, err := s.redactor.Unredact(r.Context(), req.Text, scope)
+		if err != nil {
+			s.fail(w, http.StatusInternalServerError, err.Error(), false)
+			return
+		}
 		resp.Text = res.Text
 		resp.Restored = res.Restored
 		resp.Phantom = res.Phantom
 	}
 
 	if req.Final {
-		if tail := restorer.Flush(); tail != "" {
-			resp.Text += tail
+		tail, err := restorer.Flush(r.Context())
+		if err != nil {
+			s.fail(w, http.StatusInternalServerError, err.Error(), false)
+			return
 		}
+		resp.Text += tail
 		resp.Phantom = append(resp.Phantom, restorer.Phantom()...)
 		s.streamMu.Lock()
-		delete(s.streamers, req.SessionID)
+		delete(s.streamers, streamKey)
 		s.streamMu.Unlock()
 	}
 	s.writeJSON(w, http.StatusOK, resp)
@@ -365,11 +450,83 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &req) {
 		return
 	}
-	s.vaults.Drop(req.SessionID)
+	tenant, ok := s.resolveTenant(w, r)
+	if !ok {
+		return
+	}
+	// 只能结束自己租户下的会话：不带租户的 Drop 等于让任何调用方
+	// 用一个猜出来的 session_id 清掉别人正在进行的对话映射。
+	// Only sessions inside the caller's own tenant: a tenant-free Drop lets
+	// anyone wipe another tenant's live conversation with a guessed id.
+	s.vaults.Drop(anonymize.SessionRef{Tenant: tenant, Session: req.SessionID})
 	s.streamMu.Lock()
-	delete(s.streamers, req.SessionID)
+	delete(s.streamers, string(tenant)+"\x00"+req.SessionID)
 	s.streamMu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTenantErase performs GDPR Article 17 erasure for one tenant.
+// 对单个租户执行 GDPR 第 17 条擦除。
+//
+// 擦除必须同时覆盖两处状态，漏掉任何一处，擦除都只做了一半：
+//   - 会话保险库：内存中活着的「占位符 → 真实姓名/手机号」
+//   - 令牌库：持久化的「令牌 → 原值」
+//
+// 返回条数不是便利功能。第 17 条的擦除要拿得出证据，
+// 而「我们调了这个接口」不算证据——一次因租户串写错而匹配到零条的擦除，
+// 与一次真正成功的擦除，从外面看完全一样。
+//
+// Erasure must cover both pieces of state; missing either leaves it half done.
+// The counts are evidence: an erasure that matched nothing because the tenant
+// string was wrong looks identical to one that worked.
+func (s *Server) handleTenantErase(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.resolveTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sessions, err := s.vaults.PurgeTenant(tenant)
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, err.Error(), false)
+		return
+	}
+
+	tokens := 0
+	if s.opts.TokenStore != nil {
+		tokens, err = s.opts.TokenStore.Clear(r.Context(), tenant)
+		if err != nil {
+			// 令牌库擦不掉时绝不能报告成功：一次「部分擦除」被当作完成，
+			// 会让运维在合规回执上签字，而数据还在库里。
+			// Never report success on a partial erasure: it gets signed off
+			// as complete while the data is still in the store.
+			s.fail(w, http.StatusInternalServerError,
+				"会话映射已擦除 "+itoa(sessions)+" 条，但令牌库擦除失败，"+
+					"本次擦除不完整: "+err.Error(), false)
+			return
+		}
+	}
+
+	// 同一租户的流式滞留缓冲同样持有已复原的明文
+	// The tenant's stream hold-back buffers also hold restored plaintext.
+	prefix := string(tenant) + "\x00"
+	s.streamMu.Lock()
+	for k := range s.streamers {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.streamers, k)
+		}
+	}
+	s.streamMu.Unlock()
+
+	s.logger.Info("已执行租户数据擦除",
+		"tenant", tenant, "sessions_erased", sessions, "tokens_erased", tokens)
+	s.writeJSON(w, http.StatusOK, EraseResponse{
+		Tenant: string(tenant), SessionsErased: sessions, TokensErased: tokens,
+	})
+}
+
+// itoa 是 strconv.Itoa 的本地别名，避免为一次拼接引入 import。
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }
 
 // handleHealth 是健康检查。

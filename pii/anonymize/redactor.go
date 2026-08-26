@@ -17,6 +17,7 @@
 package anonymize
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
@@ -143,8 +144,8 @@ type RedactResult struct {
 //
 // Entities are applied in offset order so that earlier offsets stay valid.
 // 按偏移顺序处理，保证前面实体的偏移量不会失效。
-func (r *Redactor) Redact(text string, vault *SessionVault) (RedactResult, error) {
-	return r.RedactTo(text, vault, maskOnlyFlow)
+func (r *Redactor) Redact(ctx context.Context, text string, scope StrategyScope) (RedactResult, error) {
+	return r.RedactTo(ctx, text, scope, maskOnlyFlow)
 }
 
 // maskOnlyFlow is the policy Redact uses: placeholders for everything.
@@ -166,7 +167,7 @@ func DefaultMaskFlow() Flow { return maskOnlyFlow }
 //
 // Entities are applied in offset order so that earlier offsets stay valid.
 // 按偏移顺序处理，保证前面实体的偏移量不会失效。
-func (r *Redactor) RedactTo(text string, vault *SessionVault, flow Flow) (RedactResult, error) {
+func (r *Redactor) RedactTo(ctx context.Context, text string, scope StrategyScope, flow Flow) (RedactResult, error) {
 	if flow.Default == nil {
 		return RedactResult{}, fmt.Errorf("%w: 链路 %q 没有默认算子 / flow %q has no default strategy",
 			ErrRedactionFailed, flow.Name, flow.Name)
@@ -214,7 +215,7 @@ func (r *Redactor) RedactTo(text string, vault *SessionVault, flow Flow) (Redact
 			continue // should not happen after overlap resolution; defensive / 防御性跳过
 		}
 		strategy := flow.Strategy(e.Type)
-		replacement, err := strategy.Apply(e, vault)
+		replacement, err := strategy.Apply(ctx, scope, e)
 		if err != nil {
 			// 算子失败一律阻断，不受 fail_closed 影响：fail_closed 说的是
 			// 「检测器不可用时怎么办」，而算子失败意味着这个已经检出的 PII
@@ -258,9 +259,12 @@ type UnredactResult struct {
 // never guessed at.
 // 容忍模型对占位符的常见改写（大小写、反引号或方括号包裹）。
 // 还原不了的占位符原样保留并记录——绝不猜测。
-func (r *Redactor) Unredact(text string, vault *SessionVault) UnredactResult {
+func (r *Redactor) Unredact(ctx context.Context, text string, scope StrategyScope) (UnredactResult, error) {
 	if text == "" {
-		return UnredactResult{Text: text}
+		return UnredactResult{Text: text}, nil
+	}
+	if scope.Vault == nil {
+		return UnredactResult{}, fmt.Errorf("复原需要会话保险库 / restore requires a session vault")
 	}
 
 	res := UnredactResult{}
@@ -278,7 +282,7 @@ func (r *Redactor) Unredact(text string, vault *SessionVault) UnredactResult {
 			continue
 		}
 		token := strings.ToUpper(text[start:end])
-		value, ok := vault.Resolve(token)
+		value, ok := scope.Vault.Resolve(token)
 		if !ok {
 			res.Phantom = append(res.Phantom, token)
 			continue // 原样保留：不改写 cursor，整段匹配随后续拷贝原样输出
@@ -292,9 +296,16 @@ func (r *Redactor) Unredact(text string, vault *SessionVault) UnredactResult {
 	res.Text = b.String()
 
 	if r.tokens != nil {
-		r.unredactTokens(&res)
+		if err := r.unredactTokens(ctx, scope, &res); err != nil {
+			// 存储故障绝不能长得像「令牌不存在」：前者可重试，
+			// 后者说明模型编造了令牌。把两者混为一谈，
+			// 会让一次故障看起来像一次幻觉，并同时掩盖两者。
+			// A store failure must never look like "token not found": the
+			// first is retryable, the second means the model invented it.
+			return UnredactResult{}, err
+		}
 	}
-	return res
+	return res, nil
 }
 
 // tokenRe matches a tokenize-operator output.
@@ -313,10 +324,10 @@ var completeTokenRe = regexp.MustCompile(`\[tok:[a-z0-9_]+:[0-9a-fA-F]{8,64}\]`)
 // the gateway to invent a plausible-looking person.
 // 解析不了的令牌与占位符一样，记为幻影并原样保留。
 // 模型凭空造出一个像模像样的令牌，不能让网关跟着造出一个像模像样的人。
-func (r *Redactor) unredactTokens(res *UnredactResult) {
+func (r *Redactor) unredactTokens(ctx context.Context, scope StrategyScope, res *UnredactResult) error {
 	text := res.Text
 	if !strings.Contains(text, "[tok:") {
-		return
+		return nil
 	}
 
 	var b strings.Builder
@@ -325,7 +336,10 @@ func (r *Redactor) unredactTokens(res *UnredactResult) {
 	for _, m := range tokenRe.FindAllStringSubmatchIndex(text, -1) {
 		ns := text[m[2]:m[3]]
 		tok := strings.ToLower(text[m[4]:m[5]])
-		value, ok := r.tokens.Resolve(ns, tok)
+		value, ok, err := r.tokens.Resolve(ctx, TokenKey{Tenant: scope.Tenant, Namespace: ns}, tok)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			res.Phantom = append(res.Phantom, text[m[0]:m[1]])
 			continue
@@ -337,6 +351,7 @@ func (r *Redactor) unredactTokens(res *UnredactResult) {
 	}
 	b.WriteString(text[cursor:])
 	res.Text = b.String()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -363,21 +378,21 @@ const maxPlaceholderLen = 64
 // 本类型非并发安全：一条流由一个 goroutine 独占处理。
 type StreamUnredactor struct {
 	redactor *Redactor
-	vault    *SessionVault
+	scope    StrategyScope
 	buffer   strings.Builder
 	phantom  []string
 }
 
 // NewStreamUnredactor creates an incremental restorer for one stream.
 // 为一条流创建增量复原器。
-func NewStreamUnredactor(r *Redactor, vault *SessionVault) *StreamUnredactor {
-	return &StreamUnredactor{redactor: r, vault: vault}
+func NewStreamUnredactor(r *Redactor, scope StrategyScope) *StreamUnredactor {
+	return &StreamUnredactor{redactor: r, scope: scope}
 }
 
 // Feed consumes one incremental chunk and returns the restored text that is
 // safe to forward downstream.
 // 吃进一个增量分片，返回可安全下发给业务端的已复原文本。
-func (s *StreamUnredactor) Feed(chunk string) string {
+func (s *StreamUnredactor) Feed(ctx context.Context, chunk string) (string, error) {
 	s.buffer.WriteString(chunk)
 	buffered := s.buffer.String()
 
@@ -386,24 +401,34 @@ func (s *StreamUnredactor) Feed(chunk string) string {
 	s.buffer.WriteString(held)
 
 	if safe == "" {
-		return ""
+		return "", nil
 	}
-	res := s.redactor.Unredact(safe, s.vault)
+	res, err := s.redactor.Unredact(ctx, safe, s.scope)
+	if err != nil {
+		// 令牌库故障时不得下发这一片：半复原的分片已经把令牌泄露给了
+		// 终端用户，而它本该是被还原掉的那个值。
+		// A store failure must not emit the chunk: a half-restored chunk has
+		// already handed the token to the end user in place of the value.
+		return "", err
+	}
 	s.phantom = append(s.phantom, res.Phantom...)
-	return res.Text
+	return res.Text, nil
 }
 
 // Flush emits whatever remains in the hold-back buffer at end of stream.
 // 在流结束时吐出缓冲残留。
-func (s *StreamUnredactor) Flush() string {
+func (s *StreamUnredactor) Flush(ctx context.Context) (string, error) {
 	held := s.buffer.String()
 	s.buffer.Reset()
 	if held == "" {
-		return ""
+		return "", nil
 	}
-	res := s.redactor.Unredact(held, s.vault)
+	res, err := s.redactor.Unredact(ctx, held, s.scope)
+	if err != nil {
+		return "", err
+	}
 	s.phantom = append(s.phantom, res.Phantom...)
-	return res.Text
+	return res.Text, nil
 }
 
 // Phantom returns the placeholders the model invented across the whole stream.

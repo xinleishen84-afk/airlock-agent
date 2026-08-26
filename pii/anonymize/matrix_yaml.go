@@ -29,9 +29,10 @@ import (
 // MatrixDeps supplies what configuration is not allowed to carry.
 // 提供配置不允许携带的东西。
 type MatrixDeps struct {
-	// HashKey is the HMAC key, read from a secret mount by the caller.
-	// 是 HMAC 密钥，由调用方从密钥挂载点读取。
-	HashKey []byte
+	// Keyring derives per-tenant keys from a root secret the caller read from
+	// a secret mount.
+	// 从调用方在密钥挂载点读到的根密钥派生每个租户的子密钥。
+	Keyring *Keyring
 
 	// TokenStore backs the tokenize operator.
 	// 支撑令牌化算子。
@@ -277,13 +278,13 @@ func (o MatrixOptions) build(name string, deps MatrixDeps) (Strategy, error) {
 		if digits == 0 {
 			digits = 8
 		}
-		if len(deps.HashKey) == 0 {
+		if deps.Keyring == nil {
 			return nil, fmt.Errorf(
-				"%w: 配置使用了 hash 算子但未提供 HMAC 密钥——"+
-					"密钥必须来自密钥挂载点，不能写在配置文件里 / hash requires an HMAC key",
+				"%w: 配置使用了 hash 算子但未提供密钥环——"+
+					"根密钥必须来自密钥挂载点，不能写在配置文件里 / hash requires a keyring",
 				ErrStrategy)
 		}
-		return NewHash(deps.HashKey, digits)
+		return NewHash(deps.Keyring, digits)
 
 	case "tokenize":
 		if deps.TokenStore == nil {

@@ -60,10 +60,12 @@ func TestStreamRestoreHandlesSplitPlaceholder(t *testing.T) {
 	}, false, 2)
 	r := anonymize.NewRedactor(detect.NewCompositeDetector([]detect.Detector{gaz}, 0), true)
 	reg := anonymize.NewVaultRegistry(time.Hour, 10)
-	vault, _ := reg.Get("s")
-	r.Redact(`联系李"小"娜`, vault) // 登记 ANONYMIZED_NAME_0
+	vault, _ := reg.Get(docSessionRef("s"))
+	if _, err := r.Redact(t.Context(), `联系李"小"娜`, docScope(vault)); err != nil { // 登记 ANONYMIZED_NAME_0
+		t.Fatal(err)
+	}
 
-	restorer := NewStreamRestorer(r, vault)
+	restorer := NewStreamRestorer(r, anonymize.StrategyScope{Tenant: docTenant, Vault: vault})
 	frames := []string{
 		`{"choices":[{"delta":{"content":"已通知 ANONYMIZED_NA"}}]}`,
 		`{"choices":[{"delta":{"content":"ME_0 处理"}}]}`,
@@ -71,7 +73,7 @@ func TestStreamRestoreHandlesSplitPlaceholder(t *testing.T) {
 
 	var assembled strings.Builder
 	for _, f := range frames {
-		out := restorer.Frame([]byte(f))
+		out := restorer.Frame(t.Context(), []byte(f))
 		var probe map[string]any
 		if err := json.Unmarshal(out, &probe); err != nil {
 			t.Fatalf("输出帧非法 JSON: %s (%v)", out, err)
@@ -80,9 +82,24 @@ func TestStreamRestoreHandlesSplitPlaceholder(t *testing.T) {
 			assembled.WriteString(c.(string))
 		}
 	}
-	assembled.WriteString(restorer.Flush())
+	tail, err := restorer.Flush(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assembled.WriteString(tail)
 
 	if !strings.Contains(assembled.String(), `李"小"娜`) {
 		t.Errorf("跨帧占位符未正确复原，拼接结果: %q", assembled.String())
 	}
+}
+
+// docSessionRef 是测试用的会话引用构造。
+const docTenant anonymize.Tenant = "acme"
+
+func docSessionRef(session string) anonymize.SessionRef {
+	return anonymize.SessionRef{Tenant: docTenant, Session: session}
+}
+
+func docScope(v *anonymize.SessionVault) anonymize.StrategyScope {
+	return anonymize.StrategyScope{Tenant: docTenant, Vault: v}
 }

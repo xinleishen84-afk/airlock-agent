@@ -1,6 +1,7 @@
 package anonymize
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -195,7 +196,7 @@ func (GeneralizeStrategy) Name() string { return "generalize" }
 func (GeneralizeStrategy) Reversible() bool { return false }
 
 // Apply implements Strategy.
-func (s GeneralizeStrategy) Apply(e detect.Entity, vault *SessionVault) (string, error) {
+func (s GeneralizeStrategy) Apply(ctx context.Context, scope StrategyScope, e detect.Entity) (string, error) {
 	value := strings.TrimSpace(e.Value)
 
 	if out, ok := s.generalizeDate(value); ok {
@@ -204,7 +205,7 @@ func (s GeneralizeStrategy) Apply(e detect.Entity, vault *SessionVault) (string,
 	if h, ok := s.ontology.lookup(value); ok {
 		return h, nil
 	}
-	return s.fallback.Apply(e, vault)
+	return s.fallback.Apply(ctx, scope, e)
 }
 
 // generalizeDate coarsens a date to the configured granularity.

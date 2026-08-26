@@ -228,7 +228,46 @@ func NewVaultRegistry(ttl time.Duration, maxSessions int) *VaultRegistry {
 	return r
 }
 
-// shardFor 按会话 ID 哈希选择分片。
+// SessionRef identifies one session inside one tenant.
+// 标识某个租户下的某个会话。
+//
+// # Why the tenant is in the key
+// # 为什么租户在键里
+//
+// The vault holds placeholder → real value. Keyed by session ID alone, anyone
+// who guesses or obtains another tenant's session ID gets their names, phone
+// numbers and ID numbers back in plaintext from the restore endpoint — and
+// session IDs are caller-supplied strings that travel through logs and client
+// code. This is the most severe IDOR this system can have, because unlike a
+// token the vault returns the value itself.
+// 保险库持有「占位符 → 真实值」。仅以会话 ID 作键时，
+// 任何猜到或拿到别的租户会话 ID 的人，都能从复原端点原样取回
+// 他们的姓名、手机号和身份证号——而会话 ID 是调用方提供的字符串，
+// 会流经日志和客户端代码。这是本系统可能存在的最严重的越权漏洞，
+// 因为与令牌不同，保险库直接返回值本身。
+type SessionRef struct {
+	Tenant  Tenant
+	Session string
+}
+
+// Validate checks the reference.
+// 校验引用。
+func (s SessionRef) Validate() error {
+	if err := ValidateTenant(s.Tenant); err != nil {
+		return err
+	}
+	if s.Session == "" {
+		return fmt.Errorf("会话 ID 不能为空 / session id is required")
+	}
+	return nil
+}
+
+// key renders the composite key. The separator is forbidden in tenant IDs, so
+// no two distinct references can collide.
+// 渲染复合键。分隔符在租户 ID 中是禁止字符，因此任何两个不同的引用都不会撞车。
+func (s SessionRef) key() string { return string(s.Tenant) + "\x00" + s.Session }
+
+// shardFor 按复合键哈希选择分片。
 func (r *VaultRegistry) shardFor(sessionID string) *vaultShard {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(sessionID))
@@ -236,7 +275,11 @@ func (r *VaultRegistry) shardFor(sessionID string) *vaultShard {
 }
 
 // Get 取得（或创建）某会话的保险库，顺带回收本分片的过期会话。
-func (r *VaultRegistry) Get(sessionID string) (*SessionVault, error) {
+func (r *VaultRegistry) Get(ref SessionRef) (*SessionVault, error) {
+	if err := ref.Validate(); err != nil {
+		return nil, err
+	}
+	sessionID := ref.key()
 	shard := r.shardFor(sessionID)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -271,7 +314,8 @@ func (r *VaultRegistry) collectExpiredLocked(shard *vaultShard) {
 }
 
 // Drop 显式结束会话并清除映射。
-func (r *VaultRegistry) Drop(sessionID string) {
+func (r *VaultRegistry) Drop(ref SessionRef) {
+	sessionID := ref.key()
 	shard := r.shardFor(sessionID)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -292,6 +336,46 @@ func (r *VaultRegistry) PurgeAll() {
 		}
 		shard.mu.Unlock()
 	}
+}
+
+// PurgeTenant erases one tenant's session vaults and reports the count.
+// 抹除某个租户的会话保险库，并报告条数。
+//
+// 这是 GDPR 第 17 条擦除在会话层的落点：令牌库里清掉了令牌，
+// 而内存里这些还活着的映射同样是「占位符 → 真实姓名/手机号」，
+// 漏掉它们等于擦除只做了一半，且做没做完从外面看不出来。
+//
+// This is where Article 17 erasure lands at the session layer. The token store
+// is only half of it: these live mappings are also placeholder → real name,
+// and missing them makes the erasure half-done in a way nothing observes.
+//
+// 遍历全部分片而不是靠索引：租户的会话分散在各分片上，
+// 而维护一份租户到会话的索引，就是又一处必须与主表保持一致的状态——
+// 擦除路径是最不该依赖「两处状态没有漂移」的地方。
+// Every shard is walked rather than consulting an index: a tenant-to-session
+// index is one more piece of state that must stay consistent with the main
+// table, and the erasure path is the last place that should depend on two
+// pieces of state not having drifted.
+func (r *VaultRegistry) PurgeTenant(tenant Tenant) (int, error) {
+	if err := ValidateTenant(tenant); err != nil {
+		return 0, err
+	}
+	prefix := string(tenant) + "\x00"
+
+	erased := 0
+	for i := range r.shards {
+		shard := &r.shards[i]
+		shard.mu.Lock()
+		for id, v := range shard.vaults {
+			if len(id) >= len(prefix) && id[:len(prefix)] == prefix {
+				v.Purge()
+				delete(shard.vaults, id)
+				erased++
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return erased, nil
 }
 
 // ActiveSessions 返回当前活跃会话数。
