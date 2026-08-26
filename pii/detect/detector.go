@@ -349,31 +349,94 @@ func (d *CompositeDetector) CoveredTypes() []EntityType {
 // confidence.
 // 贪心消解重叠：长度优先，其次置信度优先。
 func ResolveOverlaps(entities []Entity) []Entity {
+	if len(entities) < 2 {
+		return append([]Entity(nil), entities...)
+	}
+
+	// 先按起点排序，把实体切成互不相交的「连通块」，再在每块内部做原来的贪心。
+	//
+	// 语义与逐个比对全部已接受实体的写法完全一致——两个不相交的连通块之间
+	// 本来就不可能冲突，所以跨块的比较每一次都是在做无用功。
+	// 区别只在复杂度：原来的内层循环长度是「已接受实体总数」，
+	// 现在是「本块内的实体数」。在一份 384KB、检出三千多个实体的文档上，
+	// 前者实测 8.8ms，而这份文档的整体处理也不过八十几毫秒。
+	//
+	// Sort by start, cut the entities into disjoint connected components, then
+	// run the original greedy inside each. The semantics are identical —
+	// entities in different components cannot conflict, so every cross-component
+	// comparison was doing nothing. Only the complexity changes: the inner loop
+	// was bounded by the total accepted count, and is now bounded by the size of
+	// one component.
 	ordered := make([]Entity, len(entities))
 	copy(ordered, entities)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if ordered[i].Len() != ordered[j].Len() {
-			return ordered[i].Len() > ordered[j].Len()
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Start < ordered[j].Start })
+
+	accepted := make([]Entity, 0, len(ordered))
+	start := 0
+	maxEnd := ordered[0].End
+
+	flush := func(component []Entity) {
+		accepted = append(accepted, resolveComponent(component)...)
+	}
+
+	for i := 1; i < len(ordered); i++ {
+		if ordered[i].Start >= maxEnd {
+			flush(ordered[start:i])
+			start = i
+			maxEnd = ordered[i].End
+			continue
 		}
-		if ordered[i].Confidence != ordered[j].Confidence {
-			return ordered[i].Confidence > ordered[j].Confidence
+		if ordered[i].End > maxEnd {
+			maxEnd = ordered[i].End
 		}
-		return ordered[i].Start < ordered[j].Start
+	}
+	flush(ordered[start:])
+
+	sort.Slice(accepted, func(i, j int) bool { return accepted[i].Start < accepted[j].Start })
+	return accepted
+}
+
+// resolveComponent runs longest-wins greedy inside one overlapping group.
+// 在一个相互重叠的分组内部执行「长者优先」的贪心。
+//
+// 排序键与原实现逐字相同：先长度、再置信度、最后起点。
+// 这个顺序是有代价的判断——把「更长的匹配」排在「置信度更高的匹配」之前，
+// 意味着一个跨越了两个实体的贪婪匹配会赢过它们两个。
+// 边界检查与校验位存在的理由，正是让这种匹配根本不要产生。
+//
+// The sort key is identical to the original: length, then confidence, then
+// start. That order is a judgement with a cost — a greedy match spanning two
+// entities beats both of them — and boundary checks and check digits exist to
+// stop such a match from being produced in the first place.
+func resolveComponent(component []Entity) []Entity {
+	if len(component) == 1 {
+		return component
+	}
+
+	ranked := make([]Entity, len(component))
+	copy(ranked, component)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].Len() != ranked[j].Len() {
+			return ranked[i].Len() > ranked[j].Len()
+		}
+		if ranked[i].Confidence != ranked[j].Confidence {
+			return ranked[i].Confidence > ranked[j].Confidence
+		}
+		return ranked[i].Start < ranked[j].Start
 	})
 
-	var accepted []Entity
-	for _, e := range ordered {
+	kept := make([]Entity, 0, len(ranked))
+	for _, e := range ranked {
 		conflict := false
-		for _, kept := range accepted {
-			if e.Overlaps(kept) {
+		for _, k := range kept {
+			if e.Overlaps(k) {
 				conflict = true
 				break
 			}
 		}
 		if !conflict {
-			accepted = append(accepted, e)
+			kept = append(kept, e)
 		}
 	}
-	sort.Slice(accepted, func(i, j int) bool { return accepted[i].Start < accepted[j].Start })
-	return accepted
+	return kept
 }

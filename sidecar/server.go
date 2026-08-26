@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+	"github.com/xinleishen84-afk/airlock-agent/pii/audit"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
 )
@@ -63,7 +65,43 @@ type Options struct {
 	// name StaticTenantResolver explicitly.
 	TenantResolver TenantResolver
 
+	// Auditor 发送 GDPR 安全审计事件。为 nil 时不发送。
+	//
+	// 记下「脱敏了什么」的网关，是把 PII 搬了个地方而不是移除了它——
+	// 因此事件只携带计数、枚举与带密钥的指纹。
+	// A gateway that logs what it redacted has moved the PII, not removed it;
+	// events therefore carry counts, enums and a keyed fingerprint only.
+	Auditor *audit.Recorder
+
+	// Jurisdictions 是已装配的国家包代码，供管理快照展示。
+	// The configured country pack codes, for the admin snapshot.
+	Jurisdictions []string
+
+	// RosterSizes 是各名册的条目数量。
+	//
+	// 数量，不是条目。姓名名册就是一份员工与客户姓名清单——
+	// 它不是「碰巧含有 PII 的配置」，它就是 PII，只不过以配置形式加载。
+	// Counts, never entries: the name roster is a list of people.
+	RosterSizes map[string]int
+
+	// RecognizerCatalog 是已装配识别器的清单，供健康度快照使用。
+	// The catalog of assembled recognizers, for the health snapshot.
+	RecognizerCatalog []RecognizerInfo
+
+	// Fingerprinter 把会话标识转成带密钥摘要，供运维日志使用。
+	// Turns session identifiers into keyed digests for the operator's log.
+	Fingerprinter *audit.Fingerprinter
+
 	Logger *slog.Logger
+}
+
+// RecognizerInfo describes one assembled recognizer for the admin snapshot.
+// 为管理快照描述一条已装配的识别器。
+type RecognizerInfo struct {
+	Name string
+	Type string
+	// Source is "pack:CN" or "tenant:acme-corp".
+	Source string
 }
 
 // Server is the PII redaction sidecar.
@@ -79,6 +117,12 @@ type Server struct {
 	streamMu    sync.Mutex
 	streamers   map[string]*streamEntry
 	stopJanitor func()
+
+	startedAt   time.Time
+	recognizers *recognizerStats
+
+	auditEmitted atomic.Int64
+	auditDropped atomic.Int64
 
 	redactCalls  atomic.Int64
 	restoreCalls atomic.Int64
@@ -131,6 +175,8 @@ func New(opts Options) (*Server, error) {
 		vaults:       anonymize.NewVaultRegistry(opts.SessionTTL, opts.MaxSessions),
 		logger:       opts.Logger,
 		streamers:    map[string]*streamEntry{},
+		startedAt:    time.Now(),
+		recognizers:  newRecognizerStats(),
 		entityCounts: map[string]int64{},
 	}
 	s.stopJanitor = s.vaults.StartJanitor(time.Minute)
@@ -158,6 +204,7 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("GET /healthz", s.handleHealth)
 	m.HandleFunc("POST /v1/tenant/erase", s.handleTenantErase)
 	m.HandleFunc("GET /stats", s.handleStats)
+	m.HandleFunc("GET /v1/admin/inspect", s.handleInspect)
 	return m
 }
 
@@ -256,9 +303,11 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 	}
 	vault := scope.Vault
 	ctx := r.Context()
+	started := time.Now()
 
 	counts := map[string]int{}
 	stratCounts := map[string]int{}
+	var entities []detect.Entity
 	transform := func(text string) (string, error) {
 		res, err := s.redactor.RedactTo(ctx, text, scope, flow)
 		if err != nil {
@@ -270,6 +319,7 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 		for name, n := range res.StrategyCounts {
 			stratCounts[name] += n
 		}
+		entities = append(entities, res.Entities...)
 		return res.Text, nil
 	}
 
@@ -285,7 +335,14 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 		// 纵深防御：清洗后断言载荷中不含任何已登记的真实值
 		if leaked := s.scanLeak(doc, vault); len(leaked) > 0 {
 			s.blockedCalls.Add(1)
-			s.logger.Error("出站终检发现未脱敏 PII", "types", leaked, "session", req.SessionID)
+			// 日志里只写类型与会话指纹：session_id 是调用方提供的自由文本，
+			// 而调用方会拿邮箱当会话 ID——原样记录会在一个没人把它归类为
+			// PII 的字段上泄露 PII，而这个请求的载荷本身脱敏得干干净净。
+			// Types and a fingerprint only: session_id is caller-supplied free
+			// text, and callers routinely use an email address as one.
+			s.logger.Error("出站终检发现未脱敏 PII",
+				"types", leaked, "session_fp", s.sessionFP(tenant, req.SessionID))
+			s.emitBlock(ctx, tenant, req.SessionID, audit.ErrLeakDetected, counts)
 			s.writeJSON(w, http.StatusOK, RedactResponse{
 				Blocked: true,
 				Reason:  fmt.Sprintf("终检发现未脱敏的 PII 类型：%v", leaked),
@@ -306,6 +363,12 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.recordEntities(counts)
+	s.recognizers.record(entities)
+	s.emitRedaction(ctx, audit.Redaction{
+		Tenant: tenant, Session: req.SessionID, Destination: string(flow.Name),
+		Entities: entities, TypeCounts: counts, Strategies: stratCounts,
+		Duration: time.Since(started),
+	})
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
@@ -371,6 +434,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.emitRestoration(ctx, audit.Restoration{
+		Tenant: tenant, Session: req.SessionID,
+		Restored: resp.Restored, Phantom: len(resp.Phantom),
+	})
 	if len(resp.Phantom) > 0 {
 		s.logger.Warn("响应含模型捏造的占位符",
 			"session", req.SessionID, "count", len(resp.Phantom))
@@ -499,6 +566,7 @@ func (s *Server) handleTenantErase(w http.ResponseWriter, r *http.Request) {
 			// 会让运维在合规回执上签字，而数据还在库里。
 			// Never report success on a partial erasure: it gets signed off
 			// as complete while the data is still in the store.
+			s.emitErasure(r.Context(), tenant, sessions, 0, audit.ErrTokenStore)
 			s.fail(w, http.StatusInternalServerError,
 				"会话映射已擦除 "+itoa(sessions)+" 条，但令牌库擦除失败，"+
 					"本次擦除不完整: "+err.Error(), false)
@@ -519,6 +587,7 @@ func (s *Server) handleTenantErase(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("已执行租户数据擦除",
 		"tenant", tenant, "sessions_erased", sessions, "tokens_erased", tokens)
+	s.emitErasure(r.Context(), tenant, sessions, tokens, audit.ErrNone)
 	s.writeJSON(w, http.StatusOK, EraseResponse{
 		Tenant: string(tenant), SessionsErased: sessions, TokensErased: tokens,
 	})
@@ -690,4 +759,82 @@ func deepCopyValue(v any) any {
 	default:
 		return v
 	}
+}
+
+// handleInspect returns a read-only snapshot of what the gateway is enforcing.
+// 返回网关正在执行什么的只读快照。
+//
+// 快照不含密钥、盐、映射记录，也不含名册条目或租户名单——
+// 只有计数、枚举与配置名。有一条用例用反射遍历快照结构体，
+// 拒绝任何可能装下原值的新字段。
+//
+// The snapshot carries no keys, salts, mapping records, roster entries or
+// tenant list — only counts, enumerations and configuration names.
+func (s *Server) handleInspect(w http.ResponseWriter, _ *http.Request) {
+	s.writeJSON(w, http.StatusOK, s.Inspect())
+}
+
+// ---------------------------------------------------------------------------
+// 审计发送 / Audit emission
+// ---------------------------------------------------------------------------
+//
+// 每个发送点都走这几个包装，而不是直接调用 Recorder。
+// 理由是计数：发出去多少、丢了多少，必须在管理快照里看得见——
+// 丢掉的审计事件是一个问责缺口，而没人知道的缺口比看得见的更糟。
+//
+// Every emission goes through these wrappers rather than calling the Recorder
+// directly, so that emitted and dropped counts reach the admin snapshot: a
+// dropped audit event is an accountability gap, and an unknown one is worse
+// than a visible one.
+
+func (s *Server) emitRedaction(ctx context.Context, in audit.Redaction) {
+	if s.opts.Auditor == nil {
+		return
+	}
+	s.opts.Auditor.EmitRedaction(ctx, in)
+	s.auditEmitted.Add(1)
+}
+
+func (s *Server) emitRestoration(ctx context.Context, in audit.Restoration) {
+	if s.opts.Auditor == nil {
+		return
+	}
+	s.opts.Auditor.EmitRestoration(ctx, in)
+	s.auditEmitted.Add(1)
+}
+
+func (s *Server) emitBlock(ctx context.Context, tenant anonymize.Tenant, session string,
+	class audit.ErrorClass, counts map[string]int) {
+	if s.opts.Auditor == nil {
+		return
+	}
+	s.opts.Auditor.EmitBlock(ctx, tenant, session, class, counts)
+	s.auditEmitted.Add(1)
+}
+
+func (s *Server) emitErasure(ctx context.Context, tenant anonymize.Tenant,
+	sessions, tokens int, class audit.ErrorClass) {
+	if s.opts.Auditor == nil {
+		return
+	}
+	s.opts.Auditor.EmitErasure(ctx, tenant, sessions, tokens, class)
+	s.auditEmitted.Add(1)
+}
+
+// sessionFP renders a session fingerprint for the operator's own log.
+// 为运维自己的日志渲染会话指纹。
+//
+// 没有配置审计器时返回空串，而不是退回原始会话 ID：
+// 那个回退正是这个函数存在的理由所要防的东西。
+// Returns empty without an auditor rather than falling back to the raw session
+// id, which is exactly what this function exists to keep out of the log.
+func (s *Server) sessionFP(tenant anonymize.Tenant, session string) string {
+	if s.opts.Fingerprinter == nil {
+		return ""
+	}
+	fp, err := s.opts.Fingerprinter.Fingerprint(tenant, session)
+	if err != nil {
+		return ""
+	}
+	return fp
 }

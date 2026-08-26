@@ -90,6 +90,15 @@ func (r *Registry) MustRegister(rec Recognizer) {
 	}
 }
 
+// Get returns a registered recognizer by name.
+// 按名称取出已注册的识别器。
+func (r *Registry) Get(name string) (Recognizer, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.recognizers[name]
+	return rec, ok
+}
+
 // Remove unregisters a recognizer by name.
 // 按名注销一个识别器。
 //

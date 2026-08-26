@@ -378,6 +378,38 @@ func (r *VaultRegistry) PurgeTenant(tenant Tenant) (int, error) {
 	return erased, nil
 }
 
+// ActiveTenants 返回当前有活跃会话的租户数量。
+// Returns how many tenants currently hold live sessions.
+//
+// 数量，不是名单。租户名单就是客户名单——一份「我们服务了哪些公司」的清单，
+// 是这家公司不会想让人从一个监控接口拉走的东西。
+// A count, not a list: the tenant list is a customer list.
+func (r *VaultRegistry) ActiveTenants() int {
+	seen := map[string]bool{}
+	for i := range r.shards {
+		shard := &r.shards[i]
+		shard.mu.Lock()
+		for id := range shard.vaults {
+			if idx := indexByte(id, 0); idx >= 0 {
+				seen[id[:idx]] = true
+			}
+		}
+		shard.mu.Unlock()
+	}
+	return len(seen)
+}
+
+// indexByte finds a byte without importing strings for one call.
+// 查找一个字节，避免为一次调用引入 strings。
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
 // ActiveSessions 返回当前活跃会话数。
 func (r *VaultRegistry) ActiveSessions() int {
 	total := 0

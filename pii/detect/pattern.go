@@ -49,6 +49,9 @@ type PatternRecognizer struct {
 	baseScore    float64
 	contexts     []string
 	contextBoost float64
+	// requireContext turns the context words into a necessary condition.
+	// 让上下文词成为必要条件。
+	requireContext bool
 	// contextWindow is how many bytes on either side are scanned for context
 	// words. Too wide and unrelated text leaks in; too narrow and a natural
 	// phrasing like "the customer's card number is ..." falls outside.
@@ -135,6 +138,10 @@ func NewPatternRecognizer(
 
 // Name returns the recognizer identifier.
 // 返回识别器标识。
+// Pattern returns the compiled regex, for building a combined scan gate.
+// 返回已编译的正则，供构建合并扫描门控使用。
+func (p *PatternRecognizer) Pattern() *regexp.Regexp { return p.pattern }
+
 func (p *PatternRecognizer) Name() string { return p.name }
 
 // EntityType returns the entity type produced.
@@ -177,6 +184,12 @@ func (p *PatternRecognizer) Recognize(text string) ([]Entity, error) {
 			if score > 1 {
 				score = 1
 			}
+		} else if p.requireContext {
+			// 这个类型的裸形态与常见的无害文本字面相同，
+			// 上下文是唯一可用的信号。见 WithRequiredContext。
+			// This type's bare form is lexically identical to common harmless
+			// text; context is the only signal available.
+			continue
 		}
 		found = append(found, Entity{
 			Type: p.entityType, Value: raw, Start: start, End: end,
@@ -284,4 +297,48 @@ func (p *PatternRecognizer) WithoutPrefilter() *PatternRecognizer {
 	clone := *p
 	clone.prefilter = nil
 	return &clone
+}
+
+// WithRequiredContext makes a nearby context word a necessary condition rather
+// than a confidence boost.
+// 让附近出现上下文词成为必要条件，而不是置信度加权。
+//
+// # When this is the right tool, and when it is a mistake
+// # 什么时候它是对的工具，什么时候是个错误
+//
+// WithContext boosts and never penalizes, because for a format with a
+// distinctive shape the absence of a keyword says nothing — a card number is a
+// card number whether or not the sentence mentions cards, and penalizing it
+// would drop real PII that simply had no nearby keyword.
+// WithContext 只加权、不惩罚，因为对形态独特的格式而言，
+// 没有关键词什么也说明不了——一个卡号无论句子里提不提「卡」都是卡号，
+// 惩罚它会漏掉「恰好附近没有关键词」的真实 PII。
+//
+// This option is for the other case: a format that is lexically identical to
+// something common and harmless. An IPv4 address and a four-segment version
+// number are the same string — 5.15.0.91 is a valid address and a plausible
+// kernel version, and no pattern can separate them because there is nothing to
+// separate. Context is the only signal available, so for these types it has to
+// be a condition rather than a hint.
+// 本选项用于另一种情形：某个格式与常见且无害的东西在字面上完全相同。
+// IPv4 地址与四段式版本号就是同一个字符串——5.15.0.91 既是合法地址，
+// 也是像模像样的内核版本号，而没有任何模式能把它们分开，
+// 因为根本没有可分的东西。上下文是唯一可用的信号，
+// 因此对这类类型它必须是条件而非提示。
+//
+// The cost is real and must be stated: an address in a bare log line with no
+// surrounding words will be missed. That is a false negative bought
+// deliberately, in exchange for not reporting every version string in every
+// changelog as personal data.
+// 代价是真实的，必须说明：一条没有任何周边文字的裸日志行里的地址会被漏掉。
+// 这是一次刻意买下的漏报，换来的是不再把每份变更日志里的每个版本号
+// 都报成个人数据。
+func WithRequiredContext(words ...string) PatternOption {
+	return func(p *PatternRecognizer) {
+		p.contexts = append(p.contexts, words...)
+		p.requireContext = true
+		if p.contextBoost == 0 {
+			p.contextBoost = 0.05
+		}
+	}
 }

@@ -33,7 +33,7 @@ func init() {
 					opts: []detect.PatternOption{
 						detect.WithPrefilter(detect.RequireDigit),
 						detect.WithBoundary(detect.BoundaryDigitSep),
-						detect.WithValidator(detect.BankCardLuhnValid, true),
+						detect.WithValidator(detect.BankCardValid, true),
 						detect.WithContext(contextBoost, "卡号", "银行卡", "信用卡", "card", "credit"),
 					},
 				},
@@ -43,7 +43,7 @@ func init() {
 					opts: []detect.PatternOption{
 						detect.WithPrefilter(detect.RequireDigit),
 						detect.WithBoundary(detect.BoundaryDigitSep),
-						detect.WithValidator(detect.BankCardLuhnValid, false),
+						detect.WithValidator(detect.BankCardValid, false),
 						detect.WithContext(contextBoost, "卡号", "银行卡", "信用卡", "card", "credit"),
 					},
 				},
@@ -70,12 +70,28 @@ func init() {
 					},
 				},
 				{
+					// IPv4 与四段式版本号在字面上完全相同：5.15.0.91 既是合法
+					// 地址，也是像模像样的内核版本号，没有任何模式能把它们分开，
+					// 因为根本没有可分的东西。上下文是唯一可用的信号，
+					// 因此这里把它从「加权」提升为「必要条件」。
+					//
+					// 代价是真实的：一条没有任何周边文字的裸日志行里的地址会被
+					// 漏掉。这是刻意买下的漏报，换来的是不再把每份变更日志里的
+					// 每个版本号都报成个人数据。
+					//
+					// IPv4 and a four-segment version string are the same
+					// string, so context is a condition here, not a hint. The
+					// cost — an address in a bare log line is missed — is
+					// bought deliberately.
 					name: "ipv4", typ: detect.TypeIP, score: 0.70,
 					expr: `(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}` +
 						`(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])`,
 					opts: []detect.PatternOption{
 						detect.WithPrefilter(detect.RequireByte(".")),
 						detect.WithBoundary(detect.BoundaryDigit),
+						detect.WithRequiredContext(
+							"ip", "IP", "地址", "服务器", "主机", "网关", "内网", "外网",
+							"host", "server", "addr", "gateway", "endpoint", "上游"),
 					},
 				},
 				// Credentials: the worst blast radius in the set. A leaked API

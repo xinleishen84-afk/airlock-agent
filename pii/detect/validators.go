@@ -239,3 +239,129 @@ func IBANValid(value string) bool {
 	}
 	return remainder == 1
 }
+
+// cardNetworks are the issuer identification number ranges assigned by
+// ISO/IEC 7812, with the card lengths each network issues.
+// 是 ISO/IEC 7812 分配的发卡行识别号区间，以及各卡组织实际签发的长度。
+//
+// # Why Luhn alone is not enough
+// # 为什么只靠 Luhn 不够
+//
+// Luhn is a single check digit, so one in ten arbitrary digit runs passes it.
+// A production corpus is full of long digit runs — order numbers, millisecond
+// timestamps, invoice sequences — and one in ten of them being reported as a
+// card number buries the real alerts under noise that looks exactly like a
+// finding.
+// Luhn 只有一位校验位，因此任意数字串有十分之一的概率能通过。
+// 真实语料里到处是长数字串——订单号、毫秒时间戳、发票流水——
+// 其中十分之一被报成卡号，会把真正的告警埋在「看起来一模一样」的噪音底下。
+//
+// The IIN prefix is a second, independent structural constraint, and unlike a
+// context keyword it is a property of the number itself: 20240131000012345 is
+// not a card number no matter what sentence it appears in, because no issuer
+// was ever assigned the 20 range.
+// IIN 前缀是第二个独立的结构约束，而且与上下文关键词不同，
+// 它是数字本身的属性：20240131000012345 无论出现在哪句话里都不是卡号，
+// 因为 20 这个区间从未分配给任何发卡行。
+var cardNetworks = []struct {
+	name    string
+	lengths []int
+	match   func(d string) bool
+}{
+	{"Visa", []int{13, 16, 19}, func(d string) bool { return d[0] == '4' }},
+	{"Mastercard", []int{16}, func(d string) bool {
+		p2 := d[:2]
+		if p2 >= "51" && p2 <= "55" {
+			return true
+		}
+		p4 := d[:4]
+		return p4 >= "2221" && p4 <= "2720"
+	}},
+	{"Amex", []int{15}, func(d string) bool { return d[:2] == "34" || d[:2] == "37" }},
+	{"UnionPay", []int{16, 17, 18, 19}, func(d string) bool { return d[:2] == "62" }},
+	{"JCB", []int{16, 17, 18, 19}, func(d string) bool {
+		p4 := d[:4]
+		return p4 >= "3528" && p4 <= "3589"
+	}},
+	{"Diners", []int{14, 16, 19}, func(d string) bool {
+		p2 := d[:2]
+		if p2 == "36" || p2 == "38" || p2 == "39" {
+			return true
+		}
+		p3 := d[:3]
+		return p3 >= "300" && p3 <= "305"
+	}},
+	{"Discover", []int{16, 19}, func(d string) bool {
+		if d[:4] == "6011" || d[:2] == "65" {
+			return true
+		}
+		p6 := d[:6]
+		return p6 >= "622126" && p6 <= "622925"
+	}},
+	{"Maestro", []int{12, 13, 14, 15, 16, 17, 18, 19}, func(d string) bool {
+		p4 := d[:4]
+		return p4 == "5018" || p4 == "5020" || p4 == "5038" || p4 == "6304" ||
+			p4 == "6759" || p4 == "6761" || p4 == "6762" || p4 == "6763"
+	}},
+}
+
+// BankCardValid validates a payment card number: an assigned IIN prefix, a
+// length that network issues, and the Luhn check digit.
+// 校验支付卡号：已分配的 IIN 前缀、该卡组织实际签发的长度、以及 Luhn 校验位。
+//
+// All three must hold. Dropping any one of them was measured: with Luhn alone,
+// a corpus of order numbers and timestamps produced false card detections at
+// roughly the rate the single check digit predicts.
+// 三者必须同时成立。少任何一个的后果是实测过的：只用 Luhn 时，
+// 一份由订单号与时间戳构成的语料，产出误报卡号的比例
+// 大致就是单位校验位所预测的那个比例。
+func BankCardValid(digits string) bool {
+	if len(digits) < 12 || len(digits) > 19 {
+		return false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return false
+		}
+	}
+	if !cardNetworkKnown(digits) {
+		return false
+	}
+	return LuhnValid(digits)
+}
+
+// cardNetworkKnown reports whether the prefix and length match an issuer.
+// 报告前缀与长度是否与某个发卡组织相符。
+func cardNetworkKnown(digits string) bool {
+	for _, n := range cardNetworks {
+		if !n.match(digits) {
+			continue
+		}
+		for _, l := range n.lengths {
+			if len(digits) == l {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CardNetwork returns the issuing network's name, for audit output.
+// 返回发卡组织名称，供审计输出使用。
+//
+// The name, never the number. Knowing that a Visa was redacted is useful for an
+// analyst; knowing which one is the thing the redaction removed.
+// 只给名称，绝不给号码。知道「一张 Visa 被脱敏了」对分析师有用；
+// 知道是哪一张，恰恰是脱敏刚刚移除的东西。
+func CardNetwork(digits string) string {
+	for _, n := range cardNetworks {
+		if n.match(digits) {
+			for _, l := range n.lengths {
+				if len(digits) == l {
+					return n.name
+				}
+			}
+		}
+	}
+	return ""
+}
