@@ -133,6 +133,30 @@ type Chain struct {
 	// global default: the more a type's bare form resembles non-PII, the more
 	// it should be on.
 	RejectUnverified bool
+
+	// RejectUnverifiedBelow 在 RejectUnverified 为 false 时，按置信度分档否决。
+	//
+	// 「按类型一刀切」是不够的，实测证明了这一点：给人名配 RejectUnverified
+	// = false 是为了保住真实人名（大多数周围没有线索词），但同一条策略
+	// 也放行了姓氏识别器产出的 0.45 分候选——于是「王者荣耀」里的「王者荣」、
+	// 「李子」「杨梅」全部通过，反例语料上多出 14 处误报，而证据链一处都没拦。
+	//
+	// 真正的判据不是类型，是这个实体**从哪来**：名册命中（0.98）与启发式
+	// 姓氏候选（0.45）都是 NAME，但前者是确定的、后者是猜的。
+	// 置信度正好携带了这个信息。
+	//
+	// 0 表示不启用分档。
+	//
+	// Keying on type alone is not enough, as measured: RejectUnverified=false
+	// protects real names (most have no cues) but also admits the 0.45-scored
+	// candidates a surname generator emits — 王者荣 out of 王者荣耀, plus 李子
+	// and 杨梅, fourteen false positives the chain caught none of.
+	//
+	// The real criterion is not the type but where the entity came from: a
+	// roster hit (0.98) and a heuristic surname candidate (0.45) are both NAME,
+	// but one is determined and the other is guessed. Confidence carries
+	// exactly that. Zero disables the tier.
+	RejectUnverifiedBelow float64
 }
 
 // ExtensionRule stretches an entity's boundary forward while evidence holds.
@@ -301,6 +325,29 @@ func (v *EvidenceValidator) Validate(text string, e detect.Entity) Decision {
 			Extended: extended,
 		}
 	}
+	// 置信度为 0 表示「没有这个信息」，不表示「置信度很低」。
+	//
+	// 两者在脱敏系统里的后果是反的：把「没信息」当成「低置信度」会导致否决，
+	// 而对人名来说否决就是不脱敏、就是泄露。任何未设置置信度的检出——
+	// 手工构造的、或某个忘了填这个字段的检测器产出的——都必须走安全的
+	// 那一边，也就是继续脱敏。
+	//
+	// A zero confidence means "no information", not "low confidence". In a
+	// redaction system those have opposite consequences: treating the former
+	// as the latter causes a rejection, and for a name a rejection means no
+	// redaction, which means a leak. Anything with an unset confidence takes
+	// the safe side.
+	if chain.RejectUnverifiedBelow > 0 && entity.Confidence > 0 &&
+		entity.Confidence < chain.RejectUnverifiedBelow {
+		return Decision{
+			Verdict: VerdictDrop, Entity: entity, Score: score, Evidence: evidence,
+			Reason: fmt.Sprintf(
+				"证据得分 %.2f 未达阈值 %.2f，且检出置信度 %.2f 低于 %.2f——"+
+					"这是一个猜出来的候选，没有证据支撑就不该留下",
+				score, chain.Threshold, entity.Confidence, chain.RejectUnverifiedBelow),
+			Extended: extended,
+		}
+	}
 	return Decision{
 		Verdict: VerdictUnknown, Entity: entity, Score: score, Evidence: evidence,
 		Reason: fmt.Sprintf("证据得分 %.2f 未达阈值 %.2f，但该类型证据不足不否决",
@@ -438,10 +485,19 @@ func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // supported it. Verdict strength is therefore the key, with length demoted to
 // a final tie-break.
 func ResolveByEvidence(decisions []Decision) []Decision {
-	if len(decisions) < 2 {
-		return append([]Decision(nil), decisions...)
-	}
-
+	// 没有「只有一个候选就直接返回」的快路径。
+	//
+	// 曾经有，而它跳过了下面的 DROP 过滤：只产出一个候选的文本，
+	// 那个候选即使被否决也会被原样返回。实测「王者荣耀的新赛季已经开启」
+	// 恰好只产出一个候选，于是「王者荣」被证据链判为 DROP 之后照样进了结果。
+	// 反例语料上因此多出 7 处误报，而单独调 Validate 看到的却是 DROP——
+	// 两处行为不一致，问题藏在那条为「省一次排序」而写的快路径里。
+	//
+	// There is no fast path for a single candidate. There used to be, and it
+	// skipped the DROP filter below: a text producing exactly one candidate
+	// returned it even when rejected. Measured, 王者荣 came back after the
+	// chain had dropped it, because that sentence yields exactly one
+	// candidate — seven false positives whose isolated Validate call said DROP.
 	ranked := make([]Decision, 0, len(decisions))
 	for _, d := range decisions {
 		if d.Verdict == VerdictDrop {

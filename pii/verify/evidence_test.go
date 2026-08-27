@@ -262,3 +262,91 @@ func contains(list []string, want string) bool {
 	}
 	return false
 }
+
+// 只有一个候选时，被否决的那个也必须被过滤掉。
+// A single rejected candidate must still be filtered.
+//
+// ResolveByEvidence 曾经有一条「少于两个候选就直接返回」的快路径，
+// 它跳过了 DROP 过滤。症状极其隐蔽：单独调 Validate 看到的是 DROP，
+// 而走 ValidateAll 的流水线却把它留下了——两处行为不一致，
+// 且只在「文本恰好只产出一个候选」时显形。
+//
+// ResolveByEvidence had a "fewer than two, return as-is" fast path that
+// skipped the DROP filter. The symptom was subtle: an isolated Validate said
+// DROP while the pipeline kept it, diverging only when a text yields exactly
+// one candidate.
+func TestSingleRejectedCandidateIsFiltered(t *testing.T) {
+	v := validator(t)
+	const text = "func retry(n int) error { return nil }"
+
+	// 恰好一个候选，且它应当被否决
+	one := []detect.Entity{person(text, "retry(n")}
+
+	if d := v.Validate(text, one[0]); d.Verdict != VerdictDrop {
+		t.Fatalf("前提不成立：单独验证应为 DROP，实际 %s", d.Verdict)
+	}
+
+	kept := v.ValidateAll(text, one)
+	if len(kept) != 0 {
+		t.Errorf("被否决的唯一候选必须被过滤掉，实际留下 %d 个：%+v", len(kept), kept)
+	}
+}
+
+// 空输入与全部否决的输入都必须返回空。
+// Empty input and all-rejected input must both return empty.
+func TestValidateAllEdgeCases(t *testing.T) {
+	v := validator(t)
+
+	if got := v.ValidateAll("任意文本", nil); len(got) != 0 {
+		t.Errorf("空输入应返回空，实际 %d", len(got))
+	}
+
+	const code = "func a() { return b(); }"
+	all := []detect.Entity{person(code, "a"), person(code, "b")}
+	if got := v.ValidateAll(code, all); len(got) != 0 {
+		t.Errorf("全部否决时应返回空，实际 %d：%+v", len(got), got)
+	}
+}
+
+// 低置信度候选无证据即否决，高置信度候选不受影响。
+// Low-confidence candidates are rejected without evidence; high-confidence
+// ones are not.
+func TestConfidenceTieredRejection(t *testing.T) {
+	v := validator(t)
+	const text = "王者荣耀的新赛季已经开启。"
+
+	// 启发式姓氏候选：0.45
+	guess := detect.Entity{
+		Type: detect.TypeName, Value: "王者荣", Confidence: 0.45,
+		Start: 0, End: len("王者荣"),
+	}
+	if d := v.Validate(text, guess); d.Verdict != VerdictDrop {
+		t.Errorf("0.45 的猜测候选无证据时应被否决，实际 %s（%s）", d.Verdict, d.Reason)
+	}
+
+	// 名册命中：0.98
+	roster := guess
+	roster.Confidence = 0.98
+	if d := v.Validate(text, roster); d.Verdict == VerdictDrop {
+		t.Errorf("0.98 的名册命中不应因缺证据被否决：%s", d.Reason)
+	}
+}
+
+// 置信度未设置时必须走安全的那一边 —— 继续脱敏，而不是否决。
+// An unset confidence must take the safe side: keep redacting, not reject.
+//
+// 「没有这个信息」与「置信度很低」在脱敏系统里后果相反：把前者当成后者
+// 会导致否决，而对人名来说否决就是不脱敏、就是泄露。
+func TestUnsetConfidenceTakesTheSafeSide(t *testing.T) {
+	v := validator(t)
+	const text = "张三目前住在杭州。"
+
+	e := person(text, "张三") // person() 不设置 Confidence，即为 0
+	if e.Confidence != 0 {
+		t.Fatalf("前提不成立：本用例需要未设置的置信度，实际 %v", e.Confidence)
+	}
+
+	if d := v.Validate(text, e); d.Verdict == VerdictDrop {
+		t.Errorf("置信度未设置的人名不应被否决——否决就是不脱敏：%s", d.Reason)
+	}
+}

@@ -125,6 +125,21 @@ func PersonChain() *Chain {
 			},
 		},
 		Threshold: 0.5,
+		// 低置信度的候选，证据不足即否决。
+		//
+		// 0.5 这条线把「确定的」与「猜的」分开：名册命中是 0.98，
+		// 复姓候选是 0.70，单姓候选是 0.45。单姓在中文里到处都是——
+		// 「王者荣耀」「李子」「杨梅」「金额」里都有姓——因此它必须拿出证据；
+		// 复姓与名册则不必。
+		//
+		// 这条线是实测定的：不设它时，反例语料上多出 14 处误报，
+		// 而证据链一处都没拦下。
+		//
+		// The line separates determined from guessed: a roster hit scores 0.98,
+		// a compound-surname candidate 0.70, a single-surname candidate 0.45.
+		// Single surnames are everywhere in Chinese, so they must show
+		// evidence; compound surnames and roster hits need not.
+		RejectUnverifiedBelow: 0.5,
 		// 人名证据不足时**不**否决。
 		//
 		// 这是本文件里最容易配错的一处。人名是最该被脱敏的实体，而大量真实
