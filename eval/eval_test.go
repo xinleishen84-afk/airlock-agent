@@ -13,7 +13,7 @@ func rosterDetector(t testing.TB) detect.Detector {
 	t.Helper()
 	gaz, err := detect.NewGazetteerDetector(map[detect.EntityType][]string{
 		detect.TypeName: {"张伟", "李娜"},
-		detect.TypeOrg:  {"星辰科技"},
+		detect.TypeOrg:  {"星辰科技 有限公司"}, // 名册存注册全名，与语料标注一致
 	}, false, 2)
 	if err != nil {
 		t.Fatal(err)

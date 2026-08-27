@@ -452,6 +452,72 @@ func overlapsAny(e Entity, settled []Entity) bool {
 	return false
 }
 
+// RequireScript builds a trigger that only wakes the model for text whose
+// script matches what the model was trained on.
+// 构造一个触发判据：只有文字系统与模型训练语料相符时才唤醒模型。
+//
+// # 为什么这不是过拟合
+// # Why this is not overfitting
+//
+// 拿中文模型去判拉丁文，得到的是分布外的胡乱输出。实测：把英语、意大利语、
+// 德语的样本送进 zh_core_web_md，它把 declined、leaked、Codice、Steuer
+// 判成人名或地址——这四处误报没有一处来自中文文本。
+//
+// 这不是「模型不够准」，是问错了对象。契约里的 language 字段就是为了让
+// 调用方按语言路由到对应的模型；在只挂了一个中文模型的部署里，
+// 正确的做法是不问它拉丁文。
+//
+// A Chinese model asked about Latin text returns out-of-distribution noise.
+// Measured: fed English, Italian and German samples, zh_core_web_md labelled
+// declined, leaked, Codice and Steuer as names or addresses — not one of those
+// four false positives came from Chinese text.
+//
+// This is not "the model is inaccurate"; it is the wrong model being asked.
+// The contract's language field exists so callers can route by language; a
+// deployment with only a Chinese model should not ask it about Latin script.
+//
+// # 代价必须说清楚
+// # The cost, stated
+//
+// 开了这道闸，拉丁文里的人名（Margaret Okonkwo）就完全不会被检测——
+// 不是判错，是根本不问。在只有中文模型的部署里这本来就检不出来（实测如此），
+// 因此这道闸把「检不出还带一堆误报」变成了「检不出」。
+// 但一旦接上了英文模型，就必须按语言路由，而不是把这道闸一直开着。
+//
+// With this gate, a Latin-script name is never detected — not misjudged, not
+// asked about. In a Chinese-only deployment it was not detected anyway
+// (measured), so the gate turns "missed, plus false positives" into "missed".
+// Once an English model is wired up, route by language instead of leaving this
+// gate on.
+func RequireScript(minCJKRatio float64) func(string) (bool, string) {
+	return func(text string) (bool, string) {
+		if ok, reason := DefaultNERTrigger(text); !ok {
+			return false, reason
+		}
+
+		cjk, letters := 0, 0
+		for _, r := range text {
+			if !unicode.IsLetter(r) {
+				continue
+			}
+			letters++
+			if unicode.Is(unicode.Han, r) {
+				cjk++
+			}
+		}
+		if letters == 0 {
+			return false, "不含字母"
+		}
+		ratio := float64(cjk) / float64(letters)
+		if ratio < minCJKRatio {
+			return false, fmt.Sprintf(
+				"汉字占字母的 %.0f%%，低于 %.0f%%——中文模型对拉丁文是分布外输入",
+				ratio*100, minCJKRatio*100)
+		}
+		return true, ""
+	}
+}
+
 // DefaultNERTrigger decides whether a text is worth sending to the model.
 // 判断一段文本是否值得送进模型。
 //

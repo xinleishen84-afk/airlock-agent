@@ -101,11 +101,45 @@ type Cue struct {
 	Window int
 }
 
+// ShapeRule rejects an entity by the shape of its own text.
+// 按实体自身文本的形态否决它。
+//
+// # 与上下文线索的分工
+// # How this differs from a context cue
+//
+// 上下文线索看的是实体**周围**有什么，形态规则看的是实体**本身**长什么样。
+// 两者缺一不可，实测证明了这一点：
+//
+// A context cue looks at what surrounds the entity; a shape rule looks at the
+// entity itself. Both are needed, as measured:
+//
+//   - retry(n 被判成人名，靠周围的 func / return 挡下——这是上下文的活
+//
+//   - deps、ST、SSE 被判成人名或机构，周围全是正常的中文散文，
+//     没有任何代码特征。挡住它们只能靠一件事：它们自己不长得像人名
+//
+//   - retry(n is caught by the func / return around it — context's job
+//
+//   - deps, ST and SSE sit in ordinary Chinese prose with no code markers
+//     nearby; the only thing that catches them is that they do not look like
+//     names themselves
+type ShapeRule struct {
+	// Name identifies the rule in audit output.
+	Name string
+
+	// Reject 返回 true 时否决该实体。
+	Reject func(value string) bool
+}
+
 // Chain is the evidence policy for one entity type.
 // 是某个实体类型的证据策略。
 type Chain struct {
 	Type detect.EntityType
 	Cues []Cue
+
+	// Shapes 是对实体自身形态的否决规则。
+	// Rejection rules on the entity's own shape.
+	Shapes []ShapeRule
 
 	// Threshold 是确认所需的 Should 总分。
 	Threshold float64
@@ -266,6 +300,24 @@ func (v *EvidenceValidator) Validate(text string, e detect.Entity) Decision {
 			extended = newEnd - entity.End
 			entity.End = newEnd
 			entity.Value = text[entity.Start:entity.End]
+		}
+	}
+
+	// 形态规则先跑：它不需要看上下文，也不需要算分，而一个形态上就不可能
+	// 是该类型的实体，再多的上下文证据也不该救它。
+	//
+	// Shape rules run first: they need neither context nor scoring, and no
+	// amount of contextual evidence should rescue an entity whose own shape
+	// rules it out.
+	for _, shape := range chain.Shapes {
+		if shape.Reject(entity.Value) {
+			return Decision{
+				Verdict:  VerdictDrop,
+				Entity:   entity,
+				Evidence: []string{shape.Name},
+				Reason:   fmt.Sprintf("实体形态命中否决规则 %s", shape.Name),
+				Extended: extended,
+			}
 		}
 	}
 

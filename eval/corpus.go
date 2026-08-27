@@ -186,8 +186,19 @@ func Positives() []Sample {
 		// --- 姓名/机构：只有名册能覆盖 ---
 		mark("roster_name", "名册可覆盖",
 			"请联系 {{NAME|张伟}} 处理此事。"),
+		// 标注机构全名，而不是只标字号。
+		//
+		// 原来只标了「星辰科技」，于是 NER 给出更完整的「星辰科技 有限公司」
+		// 反而被计为「边界不符」——语料把一个更好的答案判成了错。
+		// 语料是量具；量出来的错要先怀疑量具。
+		//
+		// The full name, not just the distinctive part. It used to be only
+		// 星辰科技, so the NER's more complete span scored as a boundary miss:
+		// the corpus scored a better answer as wrong. The corpus is the
+		// instrument, and a surprising reading is the instrument's suspect
+		// first.
 		mark("roster_org", "名册可覆盖",
-			"合同方为 {{ORG|星辰科技}} 有限公司。"),
+			"合同方为 {{ORG|星辰科技 有限公司}}。"),
 	}
 }
 

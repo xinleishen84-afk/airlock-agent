@@ -115,8 +115,26 @@ func TestCodeMisclassificationIsRejected(t *testing.T) {
 				t.Errorf("代码里的 %q 应被否决，实际 %s（证据 %v）",
 					c.detected, d.Verdict, d.Evidence)
 			}
-			if !contains(d.Evidence, "代码语法") {
-				t.Errorf("否决理由应是代码语法，实际 %v", d.Evidence)
+			// 理由可以是形态规则也可以是上下文线索，两条路都成立。
+			//
+			// 形态规则先跑：它不需要看上下文。retry(n 自身就长得像函数调用，
+			// nil / MASK / main 自身就是拉丁缩写形态——这些不需要周围有
+			// func 或 return 才能判定。断言写死某一条理由，会让「换了一条
+			// 更早、更硬的路把它挡下」看起来像回归。
+			//
+			// Either a shape rule or a context cue is a valid reason. Shape
+			// rules run first because they need no context. Asserting one
+			// specific reason makes "caught earlier by a harder rule" look
+			// like a regression.
+			rejectedBy := map[string]bool{"代码语法": true, "代码形态": true, "拉丁缩写": true}
+			ok := false
+			for _, name := range d.Evidence {
+				if rejectedBy[name] {
+					ok = true
+				}
+			}
+			if !ok {
+				t.Errorf("否决理由应来自代码或缩写规则，实际 %v", d.Evidence)
 			}
 		})
 	}
@@ -348,5 +366,66 @@ func TestUnsetConfidenceTakesTheSafeSide(t *testing.T) {
 
 	if d := v.Validate(text, e); d.Verdict == VerdictDrop {
 		t.Errorf("置信度未设置的人名不应被否决——否决就是不脱敏：%s", d.Reason)
+	}
+}
+
+// 形态规则挡住上下文挡不住的那一类。
+// Shape rules catch what context cues cannot.
+//
+// 实测：中文模型把散文里的 deps、ST、SSE 判成人名或机构，而它们周围全是
+// 正常的中文，没有任何代码特征——上下文线索完全挡不住。三层级联接上之后
+// 的第一次评测，反例语料上正是这三处误报。
+//
+// Measured: the Chinese model labels deps, ST and SSE in ordinary prose, with
+// no code markers nearby for a context cue to catch. These three were the only
+// false positives in the first full-stack evaluation.
+func TestLatinAbbreviationsAreRejected(t *testing.T) {
+	v := validator(t)
+
+	reject := []struct{ text, value string }{
+		{"deps: react@18.2.0, typescript@5.3.3", "deps"},
+		{"心电图示 ST 段压低，诊断为不稳定型心绞痛。", "ST"},
+		{"网关 SSE 逐帧 flush 保持 TTFT。", "SSE"},
+		{"用 API 调用即可。", "API"},
+	}
+	for _, c := range reject {
+		t.Run(c.value, func(t *testing.T) {
+			if d := v.Validate(c.text, person(c.text, c.value)); d.Verdict != VerdictDrop {
+				t.Errorf("拉丁缩写 %q 不该被判成人名，实际 %s", c.value, d.Verdict)
+			}
+		})
+	}
+}
+
+// 但真实的拉丁人名必须留下 —— 收紧不能以漏掉真人为代价。
+// Real Latin names must survive: tightening must not cost real people.
+func TestLatinNamesSurviveShapeRules(t *testing.T) {
+	v := validator(t)
+
+	keep := []struct{ text, value string }{
+		{"Mr. Smith will attend the meeting.", "Smith"},
+		{"请联系 Margaret Okonkwo 确认。", "Margaret Okonkwo"},
+		{"经办人 Johnson 已签字。", "Johnson"},
+		{"客户 Alexander 的订单。", "Alexander"},
+	}
+	for _, c := range keep {
+		t.Run(c.value, func(t *testing.T) {
+			d := v.Validate(c.text, person(c.text, c.value))
+			if d.Verdict == VerdictDrop {
+				t.Errorf("真实人名 %q 被形态规则误杀：%s", c.value, d.Reason)
+			}
+		})
+	}
+}
+
+// 中文人名不归拉丁缩写规则管。
+// The Latin-abbreviation rule must not touch Chinese names.
+func TestChineseNamesUnaffectedByLatinRule(t *testing.T) {
+	v := validator(t)
+	for _, name := range []string{"张伟", "李娜", "欧阳志远", "周慧敏"} {
+		text := "请联系" + name + "处理。"
+		if d := v.Validate(text, person(text, name)); d.Verdict == VerdictDrop {
+			t.Errorf("中文人名 %q 被误杀：%s", name, d.Reason)
+		}
 	}
 }

@@ -1,6 +1,12 @@
 package verify
 
-import "github.com/xinleishen84-afk/airlock-agent/pii/detect"
+import (
+	"regexp"
+	"strings"
+	"unicode"
+
+	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
+)
 
 // # 内置证据链
 // # Built-in evidence chains
@@ -96,7 +102,8 @@ func AddressChain() *Chain {
 // it an identifier with near certainty.
 func PersonChain() *Chain {
 	return &Chain{
-		Type: detect.TypeName,
+		Type:   detect.TypeName,
+		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape()},
 		Cues: []Cue{
 			{
 				Name: "代码语法",
@@ -172,7 +179,8 @@ func PersonChain() *Chain {
 // a roster or a larger model.
 func OrgChain() *Chain {
 	return &Chain{
-		Type: detect.TypeOrg,
+		Type:   detect.TypeOrg,
+		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape()},
 		Cues: []Cue{
 			{
 				Name:        "机构后缀",
@@ -196,6 +204,81 @@ func OrgChain() *Chain {
 		Threshold:        0.5,
 		RejectUnverified: false,
 		DefaultWindow:    32,
+	}
+}
+
+// codeShape 否决形如函数调用或标识符的实体。
+//
+// 对应方案里的「语法启发式」：retry(n)、doThing()、a.b.c 这类东西
+// 无论周围写着什么都不是人名。它比上下文线索更硬——上下文可能恰好没有
+// 代码特征词，而形态是实体自带的。
+//
+// The syntactic heuristic: retry(n), doThing(), a.b.c are not names whatever
+// surrounds them. Harder than a context cue, which can be defeated by a code
+// snippet that happens to contain no marker words.
+func codeShape() ShapeRule {
+	callOrIdent := regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\s*[(\[.]`)
+	return ShapeRule{
+		Name: "代码形态",
+		Reject: func(v string) bool {
+			if callOrIdent.MatchString(v) {
+				return true
+			}
+			// 含代码专属符号的，同样不是人名
+			return strings.ContainsAny(v, "(){}[];=<>|&")
+		},
+	}
+}
+
+// latinAbbreviationShape 否决拉丁字母的缩写。
+//
+// 实测出来的：中文模型把散文里的 deps、ST、SSE 判成人名或机构，
+// 而它们周围全是正常的中文，没有任何代码特征——上下文线索完全挡不住。
+//
+// 人名的拉丁写法有稳定形态：首字母大写、其余小写，且通常是两段
+// （Margaret Okonkwo）。全大写的短串是缩写，全小写的短串是标识符或词根。
+// 这条规则挡住后两者，放过前者。
+//
+// Measured: the Chinese model labels deps, ST and SSE in ordinary prose as
+// names or organizations, with no code markers nearby for a context cue to
+// catch. A Latin personal name has a stable shape — initial capital, the rest
+// lower case, usually two tokens. An all-caps or all-lower short token is an
+// abbreviation or an identifier.
+func latinAbbreviationShape() ShapeRule {
+	const maxAbbrev = 5
+	return ShapeRule{
+		Name: "拉丁缩写",
+		Reject: func(v string) bool {
+			v = strings.TrimSpace(v)
+			if v == "" || strings.ContainsAny(v, " \t") {
+				// 含空格的多段拉丁串是人名的常见写法，放过
+				// A multi-token Latin string is the usual shape of a name.
+				return false
+			}
+			letters, upper, lower, nonLatin := 0, 0, 0, 0
+			for _, r := range v {
+				switch {
+				case r >= 'A' && r <= 'Z':
+					letters++
+					upper++
+				case r >= 'a' && r <= 'z':
+					letters++
+					lower++
+				case unicode.IsDigit(r) || r == '.' || r == '-' || r == '_':
+				default:
+					nonLatin++
+				}
+			}
+			if nonLatin > 0 || letters == 0 {
+				// 含中文等非拉丁字符的，不归本规则管
+				return false
+			}
+			if len([]rune(v)) > maxAbbrev {
+				return false
+			}
+			// 全大写（ST、SSE）或全小写（deps）的短串
+			return upper == letters || lower == letters
+		},
 	}
 }
 
