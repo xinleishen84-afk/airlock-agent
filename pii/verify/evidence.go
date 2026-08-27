@@ -150,6 +150,16 @@ type Chain struct {
 	// Extension 描述如何向后拉伸边界。nil 表示不拉伸。
 	Extension *ExtensionRule
 
+	// Backward 描述如何向前补全边界。nil 表示不补全。
+	//
+	// 与 Extension 是两件事，不是一件事的两个方向：地址丢的是后面的门牌，
+	// 机构丢的是前面的字号，而后者才是识别到具体一家的那部分。
+	//
+	// Not two directions of one thing: an address loses its trailing house
+	// number, an organization loses its leading distinctive name — and the
+	// latter is the part that identifies one specific entity.
+	Backward *BackwardExtension
+
 	// RejectUnverified 决定证据不足时是否否决。
 	//
 	// 这是本文件里最要紧的一个开关，因为它决定「证据不足」倒向哪边。
@@ -295,11 +305,22 @@ func (v *EvidenceValidator) Validate(text string, e detect.Entity) Decision {
 
 	entity := e
 	extended := 0
+	var backwardEvidence []string
+
 	if chain.Extension != nil {
 		if newEnd := extendBoundary(text, entity, chain.Extension); newEnd > entity.End {
 			extended = newEnd - entity.End
 			entity.End = newEnd
 			entity.Value = text[entity.Start:entity.End]
+		}
+	}
+	if chain.Backward != nil {
+		newStart, _, evidence := chain.Backward.extendBackward(text, entity)
+		if newStart < entity.Start {
+			extended += entity.Start - newStart
+			entity.Start = newStart
+			entity.Value = text[entity.Start:entity.End]
+			backwardEvidence = evidence
 		}
 	}
 
@@ -364,7 +385,8 @@ func (v *EvidenceValidator) Validate(text string, e detect.Entity) Decision {
 
 	if score >= chain.Threshold {
 		return Decision{
-			Verdict: VerdictKeep, Entity: entity, Score: score, Evidence: evidence,
+			Verdict: VerdictKeep, Entity: entity, Score: score,
+			Evidence: append(evidence, backwardEvidence...),
 			Reason:   fmt.Sprintf("证据得分 %.2f 达到阈值 %.2f", score, chain.Threshold),
 			Extended: extended,
 		}

@@ -195,9 +195,21 @@ func PersonChain() *Chain {
 // that. This chain only scores; the boundary problem is a known gap that needs
 // a roster or a larger model.
 func OrgChain() *Chain {
+	backward, err := DefaultBackwardExtension()
+	if err != nil {
+		// 锚点词表是本包写死的常量，编译不了说明代码本身有问题，
+		// 而不是配置问题——这时候返回一个「没有逆向补全」的链，
+		// 会让机构名从此静默地只脱敏通名。
+		//
+		// The anchor list is a constant in this package; failing to compile it
+		// is a bug, not a misconfiguration. Returning a chain without backward
+		// completion would silently redact only the generic suffix from then on.
+		panic("内置机构锚点词表无法编译 / built-in anchor list failed to compile: " + err.Error())
+	}
 	return &Chain{
-		Type:   detect.TypeOrg,
-		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape(), versionShape()},
+		Backward: backward,
+		Type:     detect.TypeOrg,
+		Shapes:   []ShapeRule{codeShape(), latinAbbreviationShape(), versionShape()},
 		Cues: []Cue{
 			{
 				Name:        "机构后缀",
