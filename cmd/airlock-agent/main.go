@@ -25,8 +25,9 @@ import (
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
-	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
+	"github.com/xinleishen84-afk/airlock-agent/pii/preset"
+	"github.com/xinleishen84-afk/airlock-agent/pii/verify"
 	"github.com/xinleishen84-afk/airlock-agent/sidecar"
 )
 
@@ -48,6 +49,10 @@ var (
 			"一个都不装意味着任何文本都扫不出 PII，且看起来像「数据很干净」")
 	tenantRules = flag.String("tenant-rules", "",
 		"租户自定义 YAML 规则目录（工号、资产编号等企业内部标识）")
+	surnames = flag.Bool("surnames", true,
+		"启用复姓识别。零依赖、确定性——统计模型对复姓是系统性零召回")
+	singleSurnames = flag.Bool("single-surnames", false,
+		"启用单姓识别。实测在对抗性语料上召回零增益、误报十四处，因此默认关闭")
 	matrixFile = flag.String("redaction-matrix", "",
 		"脱敏策略矩阵配置。配置后请求必须带 destination 字段")
 	hashKeyFile = flag.String("hash-key-file", "",
@@ -72,7 +77,7 @@ func main() {
 	logger := newLogger(*logLevel)
 	slog.SetDefault(logger)
 
-	detector, err := buildDetector(logger)
+	detector, evidence, err := buildDetector(logger)
 	if err != nil {
 		logger.Error("构造检测器失败", "err", err)
 		os.Exit(1)
@@ -84,6 +89,21 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("租户隔离已生效", "resolver", resolver.Name())
+
+	// 证据链在 Core 模式同样必要，而且理由就在上面那段复姓识别里。
+	//
+	// 复姓识别产出的是**候选**不是判决：复姓候选 0.70 分、单姓候选 0.45 分。
+	// 证据链的 RejectUnverifiedBelow 把没有证据支撑的低分候选挡下——
+	// 不接它，这些候选会原样进入脱敏管线，实测在对抗性语料上多出十四处误报。
+	//
+	// 也就是说：把复姓识别加进 Core 而不同时加证据链，是把召回换成了误报。
+	//
+	// The evidence chain is required in Core, and the reason is the surname
+	// recognizer just above: it emits candidates, not verdicts. Without
+	// verification they enter the pipeline verbatim — fourteen false positives
+	// on the adversarial corpus. Adding surnames without the chain trades
+	// recall for false positives.
+	logger.Info("证据链已装配", "覆盖类型", evidence.Types())
 
 	matrix, tokenStore, err := buildMatrix()
 	if err != nil {
@@ -97,6 +117,7 @@ func main() {
 
 	srv, err := sidecar.New(sidecar.Options{
 		Detector:       detector,
+		Evidence:       evidence,
 		Matrix:         matrix,
 		TokenStore:     tokenStore,
 		TenantResolver: resolver,
@@ -148,56 +169,46 @@ func main() {
 }
 
 // buildDetector 按命令行参数组装检测器。
-func buildDetector(logger *slog.Logger) (detect.Detector, error) {
-	var disabled []detect.EntityType
-	for _, t := range splitCSV(*disableTypes) {
-		disabled = append(disabled, detect.EntityType(strings.ToUpper(t)))
-	}
-	reg, err := packs.NewRegistry(splitCSV(*jurisdictions), disabled...)
-	if err != nil {
-		return nil, err
-	}
-	if *tenantRules != "" {
-		if err := packs.LoadYAMLInto(reg, *tenantRules); err != nil {
-			return nil, fmt.Errorf("装配租户规则: %w", err)
-		}
-	}
-	logger.Info("已装配国家包",
-		"jurisdictions", *jurisdictions, "识别器数", len(reg.Names()))
-	detectors := []detect.Detector{reg}
-
+// buildDetector 按 Core 模式的标准装配构造检测器与证据链。
+//
+// 装配逻辑在 pii/preset 里，不在这里。
+//
+// 曾经它在这里，而评测在测试里手工搭了另一份。两份看起来一样，实际不一样：
+// 评测那份装了复姓识别，这份没装。于是我拿评测的数字描述了这个二进制的
+// 能力——报告「Core 覆盖 90.5%，复姓 欧阳志远 ✓」，而它对
+// 「经办人欧阳志远」返回的是 {PHONE: 1}，一个字都没认出来。
+//
+// The assembly lives in pii/preset. It used to live here while the evaluation
+// hand-built another; they looked identical and were not, so the measured
+// numbers described a configuration this binary could not produce.
+func buildDetector(logger *slog.Logger) (detect.Detector, *verify.EvidenceValidator, error) {
 	roster := map[detect.EntityType][]string{}
 	if names, err := readRoster(*nameRoster); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if len(names) > 0 {
 		roster[detect.TypeName] = names
 	}
 	if orgs, err := readRoster(*orgRoster); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if len(orgs) > 0 {
 		roster[detect.TypeOrg] = orgs
 	}
-	if len(roster) > 0 {
-		gaz, err := detect.NewGazetteerDetector(roster, false, 2)
-		if err != nil {
-			return nil, fmt.Errorf("构造名册检测器: %w", err)
-		}
-		detectors = append(detectors, gaz)
+
+	var disabled []detect.EntityType
+	for _, t := range splitCSV(*disableTypes) {
+		disabled = append(disabled, detect.EntityType(strings.ToUpper(t)))
 	}
 
-	if *nerEndpoint != "" {
-		ner, err := detect.NewRemoteNERDetector(detect.RemoteNEROptions{
-			Endpoint: *nerEndpoint,
-			Timeout:  *nerTimeout,
-			FailOpen: !*failClosed,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("构造 NER 检测器: %w", err)
-		}
-		detectors = append(detectors, ner)
-	}
+	opts := preset.DefaultCoreOptions(splitCSV(*jurisdictions))
+	opts.Roster = roster
+	opts.DisabledTypes = disabled
+	opts.Surnames = *surnames
+	opts.SingleSurnames = *singleSurnames
 
-	comp := detect.NewCompositeDetector(detectors, 0)
+	detector, validator, err := preset.Core(opts)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// Core 模式必须自陈它做不到什么。
 	//
@@ -205,26 +216,23 @@ func buildDetector(logger *slog.Logger) (detect.Detector, error) {
 	// 都在正常处理请求、都在报告检出数。区别只在「姓名、地址、机构名
 	// 有没有被检测」——而没被检测的那些不会出现在任何计数里。
 	//
-	// 因此这一段不是提示，是这套配置的能力声明：它必须出现在启动日志的
-	// 第一屏，而不是等某人去翻文档。
-	//
-	// Core mode must state what it cannot do. A deployment with only regexes
-	// and a roster looks identical in the logs to one with NER: both process
-	// requests and report counts. The difference is whether names, addresses
-	// and organizations are scanned at all — and what is not scanned appears
-	// in no counter.
+	// Without this, a regex-only deployment is indistinguishable in the logs
+	// from one with NER: what is not scanned appears in no counter.
 	logger.Info("运行在 Core 模式",
 		"外部依赖", "无（单二进制，无跨进程调用）",
-		"覆盖", "结构化标识：身份证/银行卡/统一代码/IBAN/税号/护照/车牌/密钥；"+
-			"静态名册与复姓",
+		"复姓识别", *surnames,
+		"单姓识别", *singleSurnames,
 		"实测覆盖率", "语料 90.5%（结构化 37/37，非结构化 1/5）")
-	if missing := comp.Missing(); len(missing) > 0 {
-		logger.Warn("Core 模式检测不到这几类——它们没有字面特征，正则找不到",
-			"类型", missing,
-			"补法", "配 --name-roster/--org-roster 覆盖已知的，"+
-				"或改用 airlock-agent-advanced 接 NER sidecar 覆盖未知的")
+
+	if comp, ok := detector.(*detect.CompositeDetector); ok {
+		if missing := comp.Missing(); len(missing) > 0 {
+			logger.Warn("Core 模式检测不到这几类——它们没有字面特征，正则找不到",
+				"类型", missing,
+				"补法", "配 --name-roster/--org-roster 覆盖已知的，"+
+					"或改用 airlock-agent-advanced 接 NER sidecar 覆盖未知的")
+		}
 	}
-	return comp, nil
+	return detector, validator, nil
 }
 
 // readRoster 从文件读取名册，每行一个词条。

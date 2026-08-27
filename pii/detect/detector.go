@@ -317,6 +317,24 @@ func (d *GazetteerDetector) CoveredTypes() []EntityType { return d.covered }
 // 长度优先的理由：18 位身份证会同时被身份证规则和银行卡规则部分命中，
 // 取长的那个才是正确语义。
 type CompositeDetector struct {
+	// deferOverlaps 让本检测器保留重叠候选，把消解交给下游。
+	//
+	// 默认 false：绝大多数调用方要的是一份已经消解好的结果。
+	//
+	// 但接了证据链的管线不能用默认值。ResolveOverlaps 是「长者优先」，
+	// 而姓氏识别器产出的是候选：「尉迟恭」与「尉迟恭负」同时出现时，
+	// 长的那个多吞了一个动词却会赢——等验证器拿到结果，短的那个已经没了。
+	//
+	// 实测后果：Core 二进制把「尉迟恭负责本次验收」脱敏成
+	// 「ANONYMIZED_NAME_1责本次验收」，而单独调验证器时它明明选对了。
+	//
+	// Defaults to false: most callers want a resolved result. A pipeline with
+	// an evidence chain must not use the default. ResolveOverlaps prefers
+	// length, and the surname recognizer emits candidates — 尉迟恭 and
+	// 尉迟恭负 — where the longer one has swallowed a verb and still wins. By
+	// the time the validator runs, the right candidate is gone.
+	deferOverlaps bool
+
 	detectors     []Detector
 	minConfidence float64
 	warnOnce      sync.Once
@@ -326,6 +344,22 @@ type CompositeDetector struct {
 // NewCompositeDetector combines detectors, recording any name-class coverage
 // gap so it can be surfaced — the most dangerous silent misconfiguration.
 // 组合若干检测器。缺少姓名类检测能力时记录缺口——这是最危险的静默配置。
+// NewCompositeDetectorDeferred is NewCompositeDetector with overlap resolution
+// left to the caller.
+// 与 NewCompositeDetector 相同，但把重叠消解留给调用方。
+//
+// 接了证据链时必须用这个：证据链要按结论强度与得分取舍，而那需要看到
+// 全部候选，包括会被「长者优先」淘汰掉的那些。
+//
+// Required when an evidence chain follows: it resolves by verdict strength and
+// score, which needs to see every candidate — including the ones length-first
+// resolution would have discarded.
+func NewCompositeDetectorDeferred(detectors []Detector, minConfidence float64) *CompositeDetector {
+	d := NewCompositeDetector(detectors, minConfidence)
+	d.deferOverlaps = true
+	return d
+}
+
 func NewCompositeDetector(detectors []Detector, minConfidence float64) *CompositeDetector {
 	covered := map[EntityType]bool{}
 	for _, d := range detectors {
@@ -370,6 +404,9 @@ func (d *CompositeDetector) Detect(text string) ([]Entity, error) {
 				candidates = append(candidates, e)
 			}
 		}
+	}
+	if d.deferOverlaps {
+		return candidates, nil
 	}
 	return ResolveOverlaps(candidates), nil
 }

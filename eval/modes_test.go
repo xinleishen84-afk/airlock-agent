@@ -9,7 +9,8 @@ import (
 	"time"
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
-	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
+	"github.com/xinleishen84-afk/airlock-agent/pii/preset"
+	"github.com/xinleishen84-afk/airlock-agent/pii/verify"
 )
 
 // # Core 模式能覆盖多少
@@ -28,29 +29,36 @@ import (
 // with unstructured entities hides both that the former are nearly all caught
 // and that the latter depend entirely on the model.
 
-// coreDetector 是 Core 模式的检测器：正则 + 校验位 + 静态名册 + 复姓。
-// 不含任何跨进程调用，不含任何外部依赖。
+// coreDetector 走 preset 的标准装配 —— 与二进制完全同一份。
+//
+// 手工搭一份是这个文件原来的做法，而它与二进制搭的那份不一样：
+// 这里装了复姓识别、二进制没装。于是这里量出来的数字描述的是一个
+// 二进制产不出的配置，而我把它写进了报告和 README。
+//
+// This used to hand-build an assembly that differed from the binary's, so the
+// numbers here described a configuration the binary could not produce.
 func coreDetector(t testing.TB, roster map[detect.EntityType][]string) detect.Detector {
 	t.Helper()
-	detectors := []detect.Detector{
-		packs.MustNewRegistry([]string{"GEN", "CN", "US", "IT", "DE", "ES"}),
-	}
-	if len(roster) > 0 {
-		gaz, err := detect.NewGazetteerDetector(roster, false, 2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		detectors = append(detectors, gaz)
-	}
-	sr, err := detect.NewSurnameRecognizer(detect.DefaultSurnameOptions())
+	opts := preset.DefaultCoreOptions([]string{"GEN", "CN", "US", "IT", "DE", "ES"})
+	opts.Roster = roster
+	d, _, err := preset.Core(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg := detect.NewRegistry()
-	if err := reg.Register(sr); err != nil {
+	return d
+}
+
+// coreStack 返回检测器与证据链，供需要完整 Core 行为的用例使用。
+func coreStack(t testing.TB, roster map[detect.EntityType][]string) (
+	detect.Detector, *verify.EvidenceValidator) {
+	t.Helper()
+	opts := preset.DefaultCoreOptions([]string{"GEN", "CN", "US", "IT", "DE", "ES"})
+	opts.Roster = roster
+	d, v, err := preset.Core(opts)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return detect.NewCompositeDetector(append(detectors, reg), 0)
+	return d, v
 }
 
 // Core 模式的覆盖率，按实体性质分开报。

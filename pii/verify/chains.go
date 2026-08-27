@@ -138,8 +138,24 @@ func PersonChain() *Chain {
 				Requirement: Should, Direction: Either, Weight: 0.7, Window: 24,
 			},
 			{
-				Name:        "人类动作",
-				Words:       []string{"说", "问", "答", "联系", "通知", "告诉", "签字", "签署", "负责", "提交", "审批", "出席", "参会", "打电话", "发邮件"},
+				Name: "人类动作",
+				// 这份词表的作用不只是「加分」，它同时是边界判据：
+				// 「尉迟恭负责」里的「负责」紧跟在正确边界之后，
+				// 而多吞一字的「尉迟恭负」把它咬掉了半个，于是得分更低。
+				// 词表漏一个常见动词，对应的那个边界就分不出来——
+				// 实测漏了「提出」，「诸葛亮提出隆中对」被切成「诸葛亮提」。
+				//
+				// This list is also a boundary criterion, not only a bonus:
+				// 负责 sits just past the correct edge of 尉迟恭, and the
+				// over-long 尉迟恭负 bites half of it away and scores lower. A
+				// missing common verb means that boundary cannot be resolved —
+				// measured, 提出 was missing and 诸葛亮提出 was cut to 诸葛亮提.
+				Words: []string{
+					"说", "问", "答", "联系", "通知", "告诉", "签字", "签署",
+					"负责", "提交", "提出", "提议", "审批", "出席", "参会",
+					"表示", "认为", "指出", "强调", "建议", "主张", "回复",
+					"打电话", "发邮件", "来电", "到访", "入职", "离职",
+				},
 				Requirement: Should, Direction: Either, Weight: 0.5, Window: 32,
 			},
 			{

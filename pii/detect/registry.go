@@ -176,3 +176,45 @@ func (r *Registry) Detect(text string) ([]Entity, error) {
 	}
 	return ResolveOverlaps(found), nil
 }
+
+// AsDetector adapts a Recognizer to the Detector interface without resolving
+// overlaps.
+// 把 Recognizer 适配为 Detector，且不做重叠消解。
+//
+// # 为什么不用 Registry 包一层
+// # Why not wrap it in a Registry
+//
+// Registry.Detect 内部会跑 ResolveOverlaps。对一个产出**候选**的识别器来说，
+// 那是错的：姓氏识别器同时产出「尉迟恭」与「尉迟恭负」，而「长者优先」
+// 会让多吞了一个动词的那个赢——等下游的证据链拿到结果，正确的那个已经没了。
+//
+// 实测：Core 二进制把「尉迟恭负责本次验收」脱敏成
+// 「ANONYMIZED_NAME_1责本次验收」。而且这次消解发生在两个地方——
+// Registry 里一次，CompositeDetector 里又一次；只堵住后者不够。
+//
+// Registry.Detect runs ResolveOverlaps internally, which is wrong for a
+// recognizer that emits candidates: the surname recognizer produces both
+// 尉迟恭 and 尉迟恭负, and length-first resolution lets the one that swallowed
+// a verb win before the evidence chain ever sees the alternative. Measured, and
+// it happens in two places — the Registry and the CompositeDetector — so
+// blocking only the latter is not enough.
+func AsDetector(r Recognizer) Detector {
+	return recognizerDetector{inner: r}
+}
+
+// recognizerDetector wraps one Recognizer.
+type recognizerDetector struct{ inner Recognizer }
+
+// Name implements Detector.
+func (d recognizerDetector) Name() string { return d.inner.Name() }
+
+// CoveredTypes implements Detector.
+func (d recognizerDetector) CoveredTypes() []EntityType {
+	return []EntityType{d.inner.EntityType()}
+}
+
+// Detect implements Detector, returning every candidate unresolved.
+// 实现 Detector，原样返回全部候选。
+func (d recognizerDetector) Detect(text string) ([]Entity, error) {
+	return d.inner.Recognize(text)
+}

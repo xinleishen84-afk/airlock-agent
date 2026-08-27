@@ -201,7 +201,7 @@ type Gateway struct {
 func buildGateway(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "gateway")
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/gateway")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/airlock-gateway")
 	cmd.Dir = "../.."
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("编译网关失败: %v\n%s", err, out)
