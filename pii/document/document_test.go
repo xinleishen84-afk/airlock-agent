@@ -11,7 +11,7 @@ import (
 // 用它模拟 NER 的概率性输出「大杀四方」的极端情形。凡是被送进净化的
 // 字段都会变成占位符，因此测试只需断言协议骨架字段**没变**，
 // 就能证明它们物理上没被触碰。
-func markAll(s string) (string, error) {
+func markAll(_, s string) (string, error) {
 	if s == "" {
 		return s, nil
 	}
@@ -324,7 +324,7 @@ func TestTransformErrorPropagates(t *testing.T) {
 	var doc map[string]any
 	json.Unmarshal([]byte(`{"messages":[{"role":"user","content":"x"}]}`), &doc)
 
-	err := SanitizeDocument(doc, func(string) (string, error) {
+	err := SanitizeDocument(doc, func(_, _ string) (string, error) {
 		return "", errBoom
 	})
 	if err == nil {

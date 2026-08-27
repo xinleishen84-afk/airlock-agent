@@ -26,7 +26,7 @@ func TestRestoreProtocolFieldsUntouched(t *testing.T) {
 	}`
 	json.Unmarshal([]byte(raw), &doc)
 
-	err := RestoreDocument(doc, func(s string) (string, error) {
+	err := RestoreDocument(doc, func(_, s string) (string, error) {
 		return strings.ReplaceAll(s, "ANONYMIZED_NAME_0", "张伟"), nil
 	})
 	if err != nil {

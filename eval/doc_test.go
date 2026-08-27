@@ -57,7 +57,7 @@ func TestDocumentIntegrityProbe(t *testing.T) {
 	vlt, _ := vaults.Get(anonymize.SessionRef{Tenant: "acme", Session: "s"})
 	scope := anonymize.StrategyScope{Tenant: "acme", Vault: vlt}
 
-	err = document.SanitizeDocument(doc, func(text string) (string, error) {
+	err = document.SanitizeDocument(doc, func(_, text string) (string, error) {
 		res, err := r.RedactTo(t.Context(), text, scope, flow)
 		if err != nil {
 			return "", err

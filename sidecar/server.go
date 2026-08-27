@@ -354,7 +354,8 @@ func (s *Server) handleRedact(w http.ResponseWriter, r *http.Request) {
 	case req.Payload != nil:
 		// 深拷贝后再改，避免把调用方传来的结构改坏
 		doc := deepCopyMap(req.Payload)
-		if err := document.SanitizeDocument(doc, transform); err != nil {
+		keyed := func(_, text string) (string, error) { return transform(text) }
+		if err := document.SanitizeDocument(doc, keyed); err != nil {
 			s.blocked(w, err)
 			return
 		}
@@ -434,7 +435,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		doc := deepCopyMap(req.Payload)
 		restored := 0
 		var phantom []string
-		err := document.RestoreDocument(doc, func(text string) (string, error) {
+		err := document.RestoreDocument(doc, func(_, text string) (string, error) {
 			res, err := s.redactor.Unredact(ctx, text, scope)
 			if err != nil {
 				return "", err

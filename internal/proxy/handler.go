@@ -659,7 +659,7 @@ func (h *Handler) redactBody(ctx context.Context, body []byte, scope anonymize.S
 		return nil, fmt.Errorf("解析请求体失败: %w", err)
 	}
 
-	err := document.SanitizeDocument(doc, func(text string) (string, error) {
+	err := document.SanitizeDocument(doc, func(_, text string) (string, error) {
 		res, err := h.deps.Redactor.Redact(ctx, text, scope)
 		if err != nil {
 			return "", err

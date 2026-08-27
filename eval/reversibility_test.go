@@ -217,7 +217,7 @@ func TestStructuredRoundTrip(t *testing.T) {
 			}},
 		},
 	}
-	if err := document.SanitizeDocument(request, func(text string) (string, error) {
+	if err := document.SanitizeDocument(request, func(_, text string) (string, error) {
 		res, err := r.RedactTo(t.Context(), text, scope, maskFlow())
 		if err != nil {
 			return "", err
@@ -252,7 +252,7 @@ func TestStructuredRoundTrip(t *testing.T) {
 			}},
 		},
 	}
-	if err := document.RestoreDocument(response, func(text string) (string, error) {
+	if err := document.RestoreDocument(response, func(_, text string) (string, error) {
 		res, err := r.Unredact(t.Context(), text, scope)
 		if err != nil {
 			return "", err

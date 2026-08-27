@@ -286,7 +286,7 @@ func checkSanitizer(rep *Report) {
 		return
 	}
 
-	err := document.SanitizeDocument(doc, func(s string) (string, error) {
+	err := document.SanitizeDocument(doc, func(_, s string) (string, error) {
 		return "REDACTED", nil
 	})
 	if err != nil {

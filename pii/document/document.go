@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+	"strconv"
 	"strings"
 )
 
@@ -172,7 +173,19 @@ func seg(parts ...string) []segment {
 
 // textTransform sanitizes one span of natural language (redact or restore).
 // 是对一段自然语言的净化函数（脱敏或复原）。
-type textTransform func(string) (string, error)
+//
+// key 是该段文本在文档里的结构路径（如
+// choices.0.delta.tool_calls.0.function.arguments）。脱敏是逐段无状态的，
+// 用不上它；但流式复原要为每股文本流维护独立的滞留缓冲，必须靠它把
+// 「正文」与「第 N 个工具调用的入参」区分开——这两者在不同帧里可能
+// 恰好都是帧内第一个可复原字段。
+//
+// key is the field's structural path within the document. Redaction is
+// stateless per span and ignores it; streaming restoration needs it to keep a
+// separate hold-back buffer per text stream, because the message body and the
+// Nth tool call's arguments can each be the first restorable field in their
+// own frame.
+type textTransform func(key, text string) (string, error)
 
 // SanitizeDocument applies targeted sanitization to a parsed request document.
 // 对已解析的请求文档执行定向清洗。
@@ -184,7 +197,7 @@ type textTransform func(string) (string, error)
 // 完全不认识的新字段——不会被访问，因此在物理上不可能被污染。
 func SanitizeDocument(doc map[string]any, transform textTransform) error {
 	for _, r := range sanitizeRules {
-		if err := walk(doc, r.path, r.kind, transform); err != nil {
+		if err := walk(doc, "", r.path, r.kind, transform); err != nil {
 			return fmt.Errorf("清洗路径 %s 失败: %w", r.desc, err)
 		}
 	}
@@ -202,7 +215,7 @@ func SanitizeDocument(doc map[string]any, transform textTransform) error {
 // 期望字符串）直接静默返回——那说明这条规则不适用于当前形态，
 // 由另一条规则覆盖。不报错是刻意的：请求体形态多样，
 // 一条规则不匹配是常态而非异常。
-func walk(node any, path []segment, kind valueKind, transform textTransform) error {
+func walk(node any, key string, path []segment, kind valueKind, transform textTransform) error {
 	if len(path) == 0 {
 		return fmt.Errorf("内部错误：空路径")
 	}
@@ -220,16 +233,17 @@ func walk(node any, path []segment, kind valueKind, transform textTransform) err
 		if !exists {
 			return nil
 		}
+		childKey := joinKey(key, current.name)
 		if len(rest) == 0 {
 			// 到达叶子：这是唯一会调用 transform 的地方
-			newVal, err := applyTransform(child, kind, transform)
+			newVal, err := applyTransform(child, childKey, kind, transform)
 			if err != nil {
 				return err
 			}
 			obj[current.name] = newVal
 			return nil
 		}
-		return walk(child, rest, kind, transform)
+		return walk(child, childKey, rest, kind, transform)
 
 	case segIndex:
 		arr, ok := node.([]any)
@@ -237,15 +251,16 @@ func walk(node any, path []segment, kind valueKind, transform textTransform) err
 			return nil
 		}
 		for i, item := range arr {
+			itemKey := joinKey(key, elementID(item, i))
 			if len(rest) == 0 {
-				newVal, err := applyTransform(item, kind, transform)
+				newVal, err := applyTransform(item, itemKey, kind, transform)
 				if err != nil {
 					return err
 				}
 				arr[i] = newVal
 				continue
 			}
-			if err := walk(item, rest, kind, transform); err != nil {
+			if err := walk(item, itemKey, rest, kind, transform); err != nil {
 				return err
 			}
 		}
@@ -254,7 +269,7 @@ func walk(node any, path []segment, kind valueKind, transform textTransform) err
 	case segDeepAny:
 		// 任意深度下探，但**只在剩余路径匹配时才净化**。
 		// 用于 JSON Schema 里任意嵌套层级的 description 字段。
-		return walkDeep(node, rest, kind, transform)
+		return walkDeep(node, key, rest, kind, transform)
 	}
 	return nil
 }
@@ -268,11 +283,11 @@ func walk(node any, path []segment, kind valueKind, transform textTransform) err
 // 每一层都尝试匹配 rest，同时继续向下递归。这样
 // parameters.properties.city.description 与
 // parameters.properties.a.items.properties.b.description 都能命中。
-func walkDeep(node any, rest []segment, kind valueKind, transform textTransform) error {
+func walkDeep(node any, key string, rest []segment, kind valueKind, transform textTransform) error {
 	switch n := node.(type) {
 	case map[string]any:
 		// Try to match at this level. / 在本层尝试匹配
-		if err := walk(n, rest, kind, transform); err != nil {
+		if err := walk(n, key, rest, kind, transform); err != nil {
 			return err
 		}
 		// 继续下探。注意：不能对已匹配的键再下探，否则
@@ -281,13 +296,13 @@ func walkDeep(node any, rest []segment, kind valueKind, transform textTransform)
 			if len(rest) > 0 && rest[0].kind == segKey && rest[0].name == k {
 				continue
 			}
-			if err := walkDeep(v, rest, kind, transform); err != nil {
+			if err := walkDeep(v, joinKey(key, k), rest, kind, transform); err != nil {
 				return err
 			}
 		}
 	case []any:
-		for _, item := range n {
-			if err := walkDeep(item, rest, kind, transform); err != nil {
+		for i, item := range n {
+			if err := walkDeep(item, joinKey(key, strconv.Itoa(i)), rest, kind, transform); err != nil {
 				return err
 			}
 		}
@@ -297,7 +312,7 @@ func walkDeep(node any, rest []segment, kind valueKind, transform textTransform)
 
 // applyTransform sanitizes according to the value kind.
 // 按值类型执行净化。
-func applyTransform(value any, kind valueKind, transform textTransform) (any, error) {
+func applyTransform(value any, key string, kind valueKind, transform textTransform) (any, error) {
 	s, ok := value.(string)
 	if !ok {
 		return value, nil // type mismatch: rule does not apply / 类型不符，规则不适用
@@ -305,10 +320,10 @@ func applyTransform(value any, kind valueKind, transform textTransform) (any, er
 
 	switch kind {
 	case kindText:
-		return transform(s)
+		return transform(key, s)
 
 	case kindJSONString:
-		return transformJSONString(s, transform)
+		return transformJSONString(s, key, transform)
 	}
 	return value, nil
 }
@@ -334,13 +349,13 @@ func applyTransform(value any, kind valueKind, transform textTransform) (any, er
 // handle the format error.
 // 解析失败时原样返回：模型偶尔会生成非法 JSON，此时不该整个请求失败，
 // 由上游自行处理格式错误。
-func transformJSONString(raw string, transform textTransform) (any, error) {
+func transformJSONString(raw, key string, transform textTransform) (any, error) {
 	var parsed any
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return raw, nil
 	}
 
-	sanitized, err := transformJSONValue(parsed, transform)
+	sanitized, err := transformJSONValue(parsed, key, transform)
 	if err != nil {
 		return nil, err
 	}
@@ -353,15 +368,15 @@ func transformJSONString(raw string, transform textTransform) (any, error) {
 
 // transformJSONValue recursively sanitizes JSON values, keeping every key.
 // 递归净化 JSON 值，保留全部键名。
-func transformJSONValue(value any, transform textTransform) (any, error) {
+func transformJSONValue(value any, key string, transform textTransform) (any, error) {
 	switch v := value.(type) {
 	case string:
-		return transform(v)
+		return transform(key, v)
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, item := range v {
 			// 键名是 schema 定义的参数名，属于协议骨架，绝不净化
-			r, err := transformJSONValue(item, transform)
+			r, err := transformJSONValue(item, joinKey(key, k), transform)
 			if err != nil {
 				return nil, err
 			}
@@ -371,7 +386,7 @@ func transformJSONValue(value any, transform textTransform) (any, error) {
 	case []any:
 		out := make([]any, len(v))
 		for i, item := range v {
-			r, err := transformJSONValue(item, transform)
+			r, err := transformJSONValue(item, joinKey(key, strconv.Itoa(i)), transform)
 			if err != nil {
 				return nil, err
 			}
@@ -471,7 +486,7 @@ var responseRules = []pathRule{
 // 对已解析的响应文档执行定向复原。
 func RestoreDocument(doc map[string]any, transform textTransform) error {
 	for _, r := range responseRules {
-		if err := walk(doc, r.path, r.kind, transform); err != nil {
+		if err := walk(doc, "", r.path, r.kind, transform); err != nil {
 			return err
 		}
 	}
@@ -526,14 +541,36 @@ func (s *StreamRestorer) Frame(ctx context.Context, data []byte) []byte {
 		return data
 	}
 
-	// 用路径标识区分不同的文本流。这里用规则描述作为键，
-	// 同一条规则下的所有实例共用一个缓冲——单条流里
-	// 同时出现多个 choice 或多个并行工具调用的情形极少，
-	// 真出现时最坏结果只是滞留缓冲多滞留一帧。
-	idx := 0
-	err := RestoreDocument(doc, func(text string) (string, error) {
-		key := s.keyFor(idx)
-		idx++
+	// 用结构路径区分不同的文本流。
+	//
+	// 这里曾按「帧内第几个可复原字段」做键，理由是「同一位置在各帧间
+	// 是同一股文本流」。那个前提对 agent 流量不成立：各帧携带的字段
+	// 集合是变的——某帧只有 delta.content，下一帧只有
+	// delta.tool_calls[0].function.arguments，两者都是帧内第 0 个字段，
+	// 于是共用同一个滞留缓冲。
+	//
+	// 实测后果：正文压住的占位符前缀被拼到工具入参前面，整段入参被判为
+	// 疑似占位符继续滞留，下游工具收到空参数；而入参 JSON 最终随 Flush
+	// 作为正文增量帧吐给了用户。三处都不报错。
+	//
+	// 结构路径同时解决并行工具调用：数组下标在路径里，
+	// tool_calls.0 与 tool_calls.1 天然落到两个缓冲上。
+	//
+	// This was keyed by ordinal position within the frame, on the premise that
+	// the same position across frames is the same text stream. That premise
+	// fails for agent traffic: frames carry different field subsets, so
+	// delta.content and delta.tool_calls[0].function.arguments are each the
+	// frame's first restorable field and shared one buffer.
+	//
+	// Measured: the body's held-back placeholder prefix was prepended to the
+	// tool arguments, the whole argument was then held as a suspected
+	// placeholder so the tool received empty arguments, and the argument JSON
+	// was finally emitted to the user as a content delta on Flush. None of the
+	// three raised an error.
+	//
+	// Structural paths also separate parallel tool calls: the array index is
+	// part of the path, so tool_calls.0 and tool_calls.1 get their own buffers.
+	err := RestoreDocument(doc, func(key, text string) (string, error) {
 		buf, ok := s.buffers[key]
 		if !ok {
 			buf = anonymize.NewStreamUnredactor(s.redactor, s.scope)
@@ -583,14 +620,6 @@ func (s *StreamRestorer) Phantom() []string {
 	return out
 }
 
-// keyFor 生成滞留缓冲的键。
-func (s *StreamRestorer) keyFor(index int) string {
-	// The Nth restorable field within a frame. The same position across
-	// frames belongs to the same text stream.
-	// 单帧内的第 N 个可复原字段。同一位置在各帧间是同一股文本流。
-	return "f" + string(rune('0'+index%10))
-}
-
 // RestoreBody applies targeted restoration to a non-streaming response body.
 // 对非流式响应体执行定向复原。
 func RestoreBody(ctx context.Context, body []byte, redactor *anonymize.Redactor,
@@ -599,7 +628,7 @@ func RestoreBody(ctx context.Context, body []byte, redactor *anonymize.Redactor,
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return body
 	}
-	err := RestoreDocument(doc, func(text string) (string, error) {
+	err := RestoreDocument(doc, func(_, text string) (string, error) {
 		res, err := redactor.Unredact(ctx, text, scope)
 		if err != nil {
 			return "", err
@@ -614,4 +643,57 @@ func RestoreBody(ctx context.Context, body []byte, redactor *anonymize.Redactor,
 		return body
 	}
 	return out
+}
+
+// joinKey 拼接结构路径，用作流式滞留缓冲的键。
+// Joins a structural path, used as the streaming hold-back buffer's key.
+func joinKey(prefix, seg string) string {
+	if prefix == "" {
+		return seg
+	}
+	return prefix + "." + seg
+}
+
+// elementID 返回数组元素在流式协议里的稳定身份。
+// Returns an array element's stable identity in the streaming protocol.
+//
+// # 数组位置不是身份
+// # Array position is not identity
+//
+// OpenAI 流式里 choices 与 tool_calls 的元素都带显式 index 字段，而每个
+// delta 帧只携带发生变化的那几个元素。于是「第 1 个工具调用」在某一帧里
+// 可能是数组的第 0 个元素——用数组位置做身份，两股文本流就会错位。
+//
+// 实测：首帧带调用 0 与调用 1（调用 1 的入参在占位符中间被切断），
+// 次帧只带调用 1 的尾巴。按数组位置算，次帧那个元素落到调用 0 的滞留
+// 缓冲上，占位符的两半被分到两个缓冲里，永远拼不回来——工具收到的是
+// 字面量 "ME_0"，而另一半 "ANONYMIZED_NA" 挂在流末尾。全程不报错。
+//
+// 请求侧的 messages[*] 没有 index 字段，落回数组位置，这是对的：
+// 请求体是完整文档而非增量分片，位置本身就是身份。
+//
+// In OpenAI streaming both choices and tool_calls elements carry an explicit
+// index, and each delta frame carries only the elements that changed — so
+// "tool call 1" can be array element 0 in a given frame. Keying by array
+// position misaligns the streams.
+//
+// Measured: frame one carried calls 0 and 1 with call 1's arguments cut
+// mid-placeholder; frame two carried only call 1's tail. By array position that
+// element landed in call 0's buffer, splitting the placeholder across two
+// buffers so it could never be rejoined — the tool received the literal "ME_0"
+// while "ANONYMIZED_NA" dangled at end of stream. Nothing errored.
+//
+// Request-side messages[*] has no index field and falls back to position, which
+// is correct: a request body is a whole document, not an incremental fragment,
+// so position is identity.
+func elementID(item any, pos int) string {
+	obj, ok := item.(map[string]any)
+	if !ok {
+		return strconv.Itoa(pos)
+	}
+	// JSON 数字统一解码为 float64
+	if n, ok := obj["index"].(float64); ok {
+		return strconv.Itoa(int(n))
+	}
+	return strconv.Itoa(pos)
 }
