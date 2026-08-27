@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package pii.v1;
+
+option go_package = "github.com/xinleishen84-afk/airlock-agent/nerclient/genproto/piiv1;piiv1";
+
+// NERService 是 Go 网关与 Python 推理进程之间的唯一契约。
+//
+// NERService is the only contract between the Go gateway and the Python
+// inference process.
+//
+// # 为什么是 gRPC over UDS
+// # Why gRPC over a Unix domain socket
+//
+// 这条调用在 TTFT 关键路径上：每个未命中前两层的请求都要等它。走本地
+// TCP 环回要经过完整的协议栈——三次握手、Nagle、内核收发缓冲、校验和——
+// 而这些对同机进程间通信没有任何价值。UDS 绕过整个网络栈，只做一次
+// 内核内存拷贝。
+//
+// This call sits on the TTFT critical path. Local TCP loopback pays for the
+// full stack — handshake, Nagle, socket buffers, checksums — none of which
+// buys anything between two processes on one machine. A Unix domain socket
+// skips the network stack entirely.
+service NERService {
+  // Analyze 对一段文本做实体识别。
+  rpc Analyze(AnalyzeRequest) returns (AnalyzeResponse);
+
+  // Health 供 Go 侧在启动期确认模型已加载。
+  //
+  // 分开一个方法而不是靠 Analyze 探活：模型加载失败时 Analyze 也会失败，
+  // 但那时候第一个真实请求已经进来了。启动期就该知道。
+  //
+  // A separate method rather than probing with Analyze: a failed model load
+  // makes Analyze fail too, but by then the first real request has arrived.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message AnalyzeRequest {
+  string text = 1;
+
+  // language 是语言上下文，默认 "zh"。
+  string language = 2;
+
+  // entity_types 限定需要识别的类型。留空表示全部。
+  //
+  // 由调用方指定而不是让服务端全返回：前两层已经处理掉的类型不必再算，
+  // 而模型对每个类型的开销是实打实的。
+  //
+  // Specified by the caller rather than returning everything: types the first
+  // two layers already handled need not be computed.
+  repeated string entity_types = 3;
+}
+
+message NEREntity {
+  string entity_type = 1;
+
+  // start / end 是**字符**偏移（Unicode code point），不是字节偏移。
+  //
+  // 这是整套架构里最容易出错的一处，因此写在契约里而不是留给约定：
+  // Python 的 str 按字符索引，Go 的 string 按字节索引，一个汉字占 3 字节。
+  // 拿 Python 的 [2:4] 直接去切 Go 的字符串，切出来的是「你」字的一部分——
+  // 敏感词没洗掉，报文还被切成了非法 UTF-8。
+  //
+  // Go 侧必须在收到响应后做 rune→byte 映射。text 字段的存在就是为了让
+  // 这次映射可以被立即验证：映射后切出来的字节必须与 text 逐字相同。
+  //
+  // Character offsets (Unicode code points), not bytes. This is the single
+  // most error-prone point in the architecture, so it is stated in the
+  // contract rather than left to convention: Python indexes str by character,
+  // Go indexes string by byte, and a Chinese character is three bytes. Slicing
+  // Go's string with Python's [2:4] yields part of a character — the sensitive
+  // value survives and the payload becomes invalid UTF-8.
+  //
+  // The Go side must map rune→byte on receipt. The text field exists so that
+  // mapping can be verified immediately: the mapped bytes must equal it.
+  int32 start = 2;
+  int32 end = 3;
+
+  // text 是被识别出的文本原文。
+  //
+  // 它不只是给人看的：Go 侧用它来验证偏移映射是否正确。少了它，一次错位
+  // 只会表现为「脱敏了错的几个字」，而没有任何东西能发现这件事。
+  //
+  // Not merely informational: the Go side verifies the offset mapping against
+  // it. Without it, a misalignment shows up only as "the wrong characters were
+  // redacted", which nothing detects.
+  string text = 4;
+
+  // score 是模型给出的置信度。
+  //
+  // 不是所有后端都有真实分数：spaCy 的默认 EntityRecognizer 不输出逐实体
+  // 概率。服务端在没有真分数时应当返回一个明显恒定的值，而不是编一个
+  // 像模像样的 0.95——下游按阈值判定时，看到所有实体分数完全相同
+  // 就会立刻发现这件事。
+  //
+  // Not every backend has a real score. A backend without one should return a
+  // visibly constant value rather than inventing a plausible 0.95.
+  float score = 5;
+}
+
+message AnalyzeResponse {
+  repeated NEREntity entities = 1;
+
+  // model 标识实际产出这批实体的后端，例如 "spacy:zh_core_web_md"。
+  //
+  // 审计需要知道这批判定是谁做的。换模型是一次会改变检出结果的变更，
+  // 而没有这个字段时，那次变更在日志里不留痕迹。
+  //
+  // Audit needs to know which backend produced these. Swapping the model
+  // changes what is detected, and without this field that change leaves no
+  // trace in the logs.
+  string model = 2;
+
+  // 服务端自报的推理耗时（微秒），用于把网络往返与模型耗时分开。
+  // Server-side inference time, to separate round-trip from model cost.
+  int64 inference_micros = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+  string model = 2;
+  // supported_types 是本后端实际能产出的类型。
+  //
+  // 供 Go 侧做覆盖度自检：一个不产出 ORGANIZATION 的后端，配上一条要求
+  // 脱敏机构名的策略，是一个静默的缺口。
+  //
+  // Lets the Go side check coverage: a backend that never emits ORGANIZATION,
+  // paired with a policy that redacts organizations, is a silent gap.
+  repeated string supported_types = 3;
+  string detail = 4;
+}
