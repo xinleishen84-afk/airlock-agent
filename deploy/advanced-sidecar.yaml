@@ -1,0 +1,85 @@
+# Advanced 模式（同 Pod sidecar）：网关与分析器在一个 Pod 里，走 UDS。
+#
+# Advanced mode, same-Pod sidecar: gateway and analyzer share a Pod over a
+# Unix socket.
+#
+# 选它的理由是延迟：实测净 IPC 110µs，而独立 Service 是 154µs——
+# 且后者还没算 Service 转发那一跳。
+#
+# 代价是两者绑在一起扩缩容：每多一个网关副本就多一份 622MB 的模型内存。
+# 网关是 CPU 密集、分析器是内存密集，把它们绑在一起意味着按其中一个的
+# 需求去扩，另一个必然浪费。
+#
+# The reason to choose it is latency: 110µs of IPC versus 154µs for a separate
+# Service, before the Service hop. The cost is that they scale together: each
+# gateway replica carries another 622MB of model. The gateway is CPU-bound and
+# the analyzer memory-bound, so scaling for one always wastes the other.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airlock-agent-advanced
+  labels: {app: airlock-agent, mode: advanced-sidecar}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: airlock-agent, mode: advanced-sidecar}
+  template:
+    metadata:
+      labels: {app: airlock-agent, mode: advanced-sidecar}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: agent
+          image: ghcr.io/xinleishen84-afk/airlock-agent-advanced:latest
+          args:
+            - --addr=:8888
+            - --jurisdictions=GEN,CN
+            - --tenant-header=X-Tenant-Id
+            - --ner-socket=/var/run/airlock/ner.sock
+            - --ner-timeout=500ms
+          ports:
+            - {name: http, containerPort: 8888}
+          resources:
+            requests: {cpu: 200m, memory: 64Mi}
+            limits:   {cpu: "2",  memory: 256Mi}
+          volumeMounts:
+            - {name: ipc, mountPath: /var/run/airlock}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            # 网关在启动期就要连上分析器并做一次 Health——模型加载要几十秒，
+            # 探针给得太紧会让 Pod 在模型还没好时就被重启。
+            initialDelaySeconds: 20
+            periodSeconds: 5
+
+        - name: analyzer
+          image: ghcr.io/xinleishen84-afk/airlock-analyzer:latest
+          args:
+            - --socket=/var/run/airlock/ner.sock
+            - --models=zh=zh_core_web_md,en=en_core_web_lg
+          resources:
+            # 两模型实测常驻 622MB。requests 给 1Gi 是因为加载期的峰值
+            # 高于稳态——按稳态申请会让 Pod 在加载模型时被 OOM 杀掉。
+            #
+            # Measured 622MB resident for both models. The request is 1Gi
+            # because the load-time peak exceeds the steady state; requesting
+            # the steady state gets the Pod OOM-killed while loading.
+            requests: {cpu: "1", memory: 1Gi}
+            limits:   {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: ipc, mountPath: /var/run/airlock}
+          startupProbe:
+            exec:
+              command: ["test", "-S", "/var/run/airlock/ner.sock"]
+            # 模型加载要几十秒，且随模型大小变化。failureThreshold 给足，
+            # 否则大模型永远起不来，而症状是 Pod 反复重启、日志停在加载中。
+            periodSeconds: 5
+            failureThreshold: 36
+      volumes:
+        # emptyDir 承载 UDS：它是 Pod 生命周期内的共享内存目录，
+        # 两个容器都能看到，Pod 消失时一起消失——正是 socket 该有的生命周期。
+        #
+        # emptyDir carries the socket: shared for the Pod's lifetime and gone
+        # with it, which is exactly a socket's correct lifetime.
+        - name: ipc
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}

@@ -1,0 +1,69 @@
+# Core 模式：单二进制，无 sidecar，无外部依赖。
+#
+# Core mode: one binary, no sidecar, no external dependencies.
+#
+# 实测：语料覆盖 90.5%（结构化标识 37/37，非结构化 1/5），
+# 10 核 254.8k QPS，常驻堆 1.9MB。
+#
+# 检测不到姓名、地址、机构名——它们没有字面特征。已知的那部分用名册覆盖，
+# 未知的需要 advanced.yaml。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airlock-agent
+  labels: {app: airlock-agent, mode: core}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: airlock-agent, mode: core}
+  template:
+    metadata:
+      labels: {app: airlock-agent, mode: core}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: agent
+          image: ghcr.io/xinleishen84-afk/airlock-agent:latest
+          args:
+            - --addr=:8888
+            - --jurisdictions=GEN,CN
+            - --tenant-header=X-Tenant-Id
+            - --name-roster=/rosters/names.txt
+          ports:
+            - {name: http, containerPort: 8888}
+          # 1.9MB 常驻堆 + 名册。给 64Mi 是留给名册与 Go 运行时的余量，
+          # 不是给检测器的——检测器本身几乎不占。
+          resources:
+            requests: {cpu: 200m, memory: 64Mi}
+            limits:   {cpu: "2",  memory: 256Mi}
+          volumeMounts:
+            - {name: rosters, mountPath: /rosters, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        # 名册就是 PII：它是一份员工与客户姓名清单。
+        # 用 Secret 而不是 ConfigMap —— ConfigMap 在很多集群里是宽松可读的。
+        #
+        # The roster is PII: a list of employee and customer names. A Secret
+        # rather than a ConfigMap, which is broadly readable in many clusters.
+        - name: rosters
+          secret: {secretName: airlock-rosters}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airlock-agent
+spec:
+  selector: {app: airlock-agent, mode: core}
+  ports:
+    - {name: http, port: 8888, targetPort: http}

@@ -1,0 +1,100 @@
+# Advanced 模式（独立 Service）：分析器单独部署，网关通过 gRPC 访问。
+#
+# Advanced mode, separate Service: the analyzer is its own Deployment.
+#
+# 选它的理由是伸缩：分析器是内存密集（622MB/副本）、网关是 CPU 密集，
+# 分开之后各按各的需求扩，不必为对方的资源画像买单。
+#
+# 代价是延迟：实测净 IPC 从 110µs 涨到 154µs（本机 loopback），
+# 而 K8s 里还要多一跳 Service 转发与真实网络。
+#
+# 两者不能兼得。这一页与 advanced-sidecar.yaml 是一次二选一，
+# 而依据是「延迟敏感」还是「资源画像差异大」。
+#
+# Scaling versus latency; the two cannot both be had. This file and
+# advanced-sidecar.yaml are a choice, decided by whether latency or divergent
+# resource profiles dominates.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airlock-analyzer
+  labels: {app: airlock-analyzer}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: airlock-analyzer}
+  template:
+    metadata:
+      labels: {app: airlock-analyzer}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: analyzer
+          image: ghcr.io/xinleishen84-afk/airlock-analyzer:latest
+          args:
+            - --listen=0.0.0.0:9090
+            - --models=zh=zh_core_web_md,en=en_core_web_lg
+          ports:
+            - {name: grpc, containerPort: 9090}
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits:   {cpu: "2", memory: 2Gi}
+          startupProbe:
+            tcpSocket: {port: grpc}
+            periodSeconds: 5
+            failureThreshold: 36
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airlock-analyzer
+spec:
+  selector: {app: airlock-analyzer}
+  ports:
+    - {name: grpc, port: 9090, targetPort: grpc}
+---
+# 这个端口返回「PII 在哪」。UDS 靠文件权限拦住同机其他用户，
+# 换成 TCP 之后那道闸静默消失了——必须用 NetworkPolicy 补回来。
+#
+# This port returns where the PII is. The Unix socket's file-permission gate
+# disappears silently when it becomes a TCP port; a NetworkPolicy restores it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: airlock-analyzer
+spec:
+  podSelector:
+    matchLabels: {app: airlock-analyzer}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: airlock-agent}
+      ports:
+        - {protocol: TCP, port: 9090}
+---
+# 分析器是内存密集且加载慢的，按 CPU 扩缩容会在模型还没加载完时
+# 就把新副本算进容量。按并发请求数扩更贴近它的实际瓶颈。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: airlock-analyzer
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: airlock-analyzer}
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+  behavior:
+    scaleUp:
+      # 新副本要几十秒才能加载完模型。扩得太快会在它们就绪前就再扩一批，
+      # 而那批同样要几十秒——最后是一群正在加载模型的 Pod 和一个仍然过载的服务。
+      stabilizationWindowSeconds: 120
+    scaleDown:
+      stabilizationWindowSeconds: 300

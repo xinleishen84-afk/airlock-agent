@@ -198,11 +198,31 @@ func buildDetector(logger *slog.Logger) (detect.Detector, error) {
 	}
 
 	comp := detect.NewCompositeDetector(detectors, 0)
+
+	// Core 模式必须自陈它做不到什么。
+	//
+	// 一个只装了正则与名册的部署，与一个接了 NER 的部署，在日志上长得一样：
+	// 都在正常处理请求、都在报告检出数。区别只在「姓名、地址、机构名
+	// 有没有被检测」——而没被检测的那些不会出现在任何计数里。
+	//
+	// 因此这一段不是提示，是这套配置的能力声明：它必须出现在启动日志的
+	// 第一屏，而不是等某人去翻文档。
+	//
+	// Core mode must state what it cannot do. A deployment with only regexes
+	// and a roster looks identical in the logs to one with NER: both process
+	// requests and report counts. The difference is whether names, addresses
+	// and organizations are scanned at all — and what is not scanned appears
+	// in no counter.
+	logger.Info("运行在 Core 模式",
+		"外部依赖", "无（单二进制，无跨进程调用）",
+		"覆盖", "结构化标识：身份证/银行卡/统一代码/IBAN/税号/护照/车牌/密钥；"+
+			"静态名册与复姓",
+		"实测覆盖率", "语料 90.5%（结构化 37/37，非结构化 1/5）")
 	if missing := comp.Missing(); len(missing) > 0 {
-		// 正则检测不出人名——这是最危险的静默配置，必须显式告警
-		logger.Warn("PII 检测存在覆盖缺口，这几类实体将完全裸奔",
-			"missing", missing,
-			"hint", "配置 --name-roster / --org-roster 或接入 --ner")
+		logger.Warn("Core 模式检测不到这几类——它们没有字面特征，正则找不到",
+			"类型", missing,
+			"补法", "配 --name-roster/--org-roster 覆盖已知的，"+
+				"或改用 airlock-agent-advanced 接 NER sidecar 覆盖未知的")
 	}
 	return comp, nil
 }

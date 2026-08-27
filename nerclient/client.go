@@ -33,7 +33,28 @@ import (
 // 配置客户端。
 type Options struct {
 	// SocketPath 是 Python 服务监听的 Unix domain socket。
+	//
+	// 与 Address 二选一。同 Pod 的 sidecar 用它——绕开整个网络协议栈，
+	// 实测 IPC 往返 98–251µs。
+	//
+	// Mutually exclusive with Address. A same-Pod sidecar uses this: it skips
+	// the network stack entirely, measured at 98–251µs per round trip.
 	SocketPath string
+
+	// Address 是 host:port，供分析器独立部署为 Service 时使用。
+	//
+	// 与 SocketPath 二选一。这是「把依赖负担转嫁给 K8s」那种部署形态的代价：
+	// 独立 Deployment 可以单独水平扩缩容，但 UDS 的延迟优势也就没了——
+	// 流量要重新走完整的 TCP 协议栈，还要多一跳 Service 转发。
+	//
+	// 两者不能兼得，这一点必须在选型时就知道，而不是上线后才发现。
+	//
+	// Mutually exclusive with SocketPath. This is what "push the dependency
+	// burden onto K8s" costs: a separate Deployment scales independently, but
+	// the Unix socket's latency advantage is gone — traffic goes back through
+	// the full TCP stack plus a Service hop. You cannot have both, and that
+	// should be known at selection time rather than after rollout.
+	Address string
 
 	// Timeout 是单次调用的超时。
 	//
@@ -98,8 +119,15 @@ type Client struct {
 // by then the first real request has arrived and the gateway has already
 // reported itself ready.
 func New(ctx context.Context, opts Options) (*Client, error) {
-	if opts.SocketPath == "" {
-		return nil, fmt.Errorf("必须指定 socket 路径 / socket path is required")
+	switch {
+	case opts.SocketPath != "" && opts.Address != "":
+		return nil, fmt.Errorf(
+			"SocketPath 与 Address 只能选一个——同时配置时无从判断实际走的是哪条 / " +
+				"SocketPath and Address are mutually exclusive")
+	case opts.SocketPath == "" && opts.Address == "":
+		return nil, fmt.Errorf(
+			"必须指定 SocketPath（同 Pod sidecar）或 Address（独立 Service）/ " +
+				"either SocketPath or Address is required")
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = 300 * time.Millisecond
@@ -111,25 +139,38 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 		opts.Language = "auto"
 	}
 
-	if info, err := os.Stat(opts.SocketPath); err != nil {
-		return nil, fmt.Errorf(
-			"socket %s 不可用：%w\n"+
-				"请先启动 Python 侧：python -m pii.service.ner_server --socket %s",
-			opts.SocketPath, err, opts.SocketPath)
-	} else if info.Mode()&os.ModeSocket == 0 {
-		return nil, fmt.Errorf(
-			"路径 %s 存在但不是 socket / path exists but is not a socket",
-			opts.SocketPath)
+	var dialTarget string
+	var dialOpts []grpc.DialOption
+	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	if opts.SocketPath != "" {
+		// socket 文件在拨号前就检查：gRPC 是惰性连接的，路径错了要到第一次
+		// 调用才报错，而那时候网关已经对外声称自己就绪了。
+		//
+		// Checked before dialing: gRPC connects lazily, so a wrong path only
+		// errors on the first call — by which time the gateway has reported
+		// itself ready.
+		if info, err := os.Stat(opts.SocketPath); err != nil {
+			return nil, fmt.Errorf(
+				"socket %s 不可用：%w\n"+
+					"请先启动 Python 侧：python -m pii.service.ner_server --socket %s",
+				opts.SocketPath, err, opts.SocketPath)
+		} else if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf(
+				"路径 %s 存在但不是 socket / path exists but is not a socket",
+				opts.SocketPath)
+		}
+		dialTarget = "unix:" + opts.SocketPath
+		dialOpts = append(dialOpts, grpc.WithContextDialer(
+			func(ctx context.Context, addr string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", strings.TrimPrefix(addr, "unix:"))
+			}))
+	} else {
+		dialTarget = opts.Address
 	}
 
-	conn, err := grpc.NewClient(
-		"unix:"+opts.SocketPath,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", strings.TrimPrefix(addr, "unix:"))
-		}),
-	)
+	conn, err := grpc.NewClient(dialTarget, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("连接 NER 服务失败 / dialing NER service: %w", err)
 	}
@@ -167,6 +208,21 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 
 // Close releases the connection.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// Transport reports which transport is in use, for the admin snapshot.
+// 报告实际使用的传输方式，供管理快照使用。
+//
+// 快照里必须看得见：UDS 与 TCP 的延迟差着一个数量级，而配置错了
+// 两者都能跑通——差别只在延迟上，不会报错。
+//
+// Visible in the snapshot because the two differ by an order of magnitude in
+// latency and both work when misconfigured: only the latency differs.
+func (c *Client) Transport() string {
+	if c.opts.SocketPath != "" {
+		return "uds:" + c.opts.SocketPath
+	}
+	return "tcp:" + c.opts.Address
+}
 
 // Model returns the backend identifier reported by the service.
 // 返回服务端自报的后端标识。

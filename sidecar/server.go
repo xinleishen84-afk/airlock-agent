@@ -17,6 +17,7 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/pii/audit"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
+	"github.com/xinleishen84-afk/airlock-agent/pii/verify"
 )
 
 // Options configures the sidecar.
@@ -92,6 +93,25 @@ type Options struct {
 	// Turns session identifiers into keyed digests for the operator's log.
 	Fingerprinter *audit.Fingerprinter
 
+	// Evidence 是证据链验证器。为 nil 时不做验证。
+	//
+	// 不接它的后果是静默的：概率性抽取器的输出会原样进入脱敏管线——
+	// 模型给出的「上海市」和「浦东」会被当成两个独立地址各自脱敏，
+	// 留下「新区世纪大道100号」原样出境，而 entity_counts 会显示
+	// ADDRESS:2，看起来比正确答案还多检出了一个。
+	//
+	// 这个字段是端到端跑通两个模式时发现漏掉的：验证器在测试里一直接着，
+	// 在真实二进制里从来没接上。
+	//
+	// Without it, a probabilistic extractor's output enters the redaction
+	// pipeline verbatim: 上海市 and 浦东 are redacted as two separate
+	// addresses while 新区世纪大道100号 leaves untouched — and entity_counts
+	// reads ADDRESS:2, which looks like more coverage than the right answer.
+	//
+	// Found by running the two modes end to end: the validator was wired in
+	// every test and in no binary.
+	Evidence *verify.EvidenceValidator
+
 	Logger *slog.Logger
 }
 
@@ -143,6 +163,12 @@ func New(opts Options) (*Server, error) {
 	if opts.Detector == nil {
 		return nil, errors.New("必须提供 PII 检测器")
 	}
+	// 证据链包在检测器外面，使验证发生在所有脱敏路径的共同上游。
+	// Wrapped around the detector so verification is upstream of every path.
+	if opts.Evidence != nil {
+		opts.Detector = verifyingDetector{inner: opts.Detector, validator: opts.Evidence}
+	}
+
 	if opts.TenantResolver == nil {
 		// 没有租户解析器，会话保险库就只以调用方提供的 session_id 作键，
 		// 任何拿到别人 session_id 的调用方都能从 /v1/restore 取回其明文 PII。

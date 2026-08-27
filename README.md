@@ -55,11 +55,11 @@ store, and that store **is** persistent — it is a PII database.</sub>
 
 **做不到**
 
-- **人名、地址、机构名的召回率是 0%**（不接 NER 模型时）。
-  这不是调参问题——人名没有字面特征，正则找不到「周慧敏」，也找不到
-  「Margaret Okonkwo」。本项目留好了 NER 接口和企业名册接口，
-  但**没有内置模型，我也没有在真实模型上验证过**。
+- **Core 模式下人名、地址、机构名基本检不出**（除非在名册里）。
+  这不是调参问题——人名没有字面特征。接上 Advanced 模式的 NER sidecar
+  之后可解，代价是 622MB 内存与一次跨进程调用（实测 2.5ms/请求）。
 - 出站侧**没有流式脱敏**（复原是流式的，脱敏要拿到完整载荷）
+- 容器镜像与 K8s 清单已写好但**未在真实集群里跑过**——本机验证到进程级为止
 - 多副本部署的会话映射共享（当前在单实例内存中，需要会话亲和路由）
 - Envoy `ext_proc` gRPC 适配层（HTTP 接口可用，Envoy 侧需一层薄翻译）
 
@@ -72,6 +72,83 @@ store, and that store **is** persistent — it is a PII database.</sub>
 | 已实测 | 检测准确率、延迟分位、吞吐、还原准确率（见下节） |
 | **未实测** | Testcontainers 用例（开发机无 Docker）、OTel 处理器未用 `ocb` 构建进真实 Collector、生产规模压测 |
 | **零外部验证** | 没有任何人在生产里跑过它 |
+
+---
+
+## 两种模式:先拿 Core,需要时再唤醒 Sidecar
+
+依赖是加进去容易、拿出来难的东西。所以这里是**两个二进制**,不是一个二进制加开关
+—— 做成开关,gRPC 与 protobuf 的依赖树就会进到每一个部署里,包括那些只想要 Core 的。
+
+| | **Core** | **Advanced** |
+|---|---|---|
+| 二进制 | `airlock-agent` · **11MB** | `airlock-agent-advanced` · 18MB |
+| 外部依赖 | **1 个**(yaml) | 8 个(gRPC + protobuf) |
+| 额外进程 | 无 | Python 分析器 sidecar |
+| 额外内存 | **0** | 622MB(中英双模型) |
+| 吞吐 | **254.8k QPS**(10 核) | 受模型限制,~400 req/s/副本 |
+| 单请求 | **3.9µs** | 2.5ms(含一次跨进程调用) |
+| 语料覆盖 | **90.5%** | 100% |
+
+```bash
+# Core:零额外依赖,单进程
+airlock-agent --jurisdictions GEN,CN --tenant-header X-Tenant-Id \
+              --name-roster ./names.txt
+
+# Advanced:只有需要非结构化实体时才配
+airlock-agent-advanced --jurisdictions GEN,CN --tenant-header X-Tenant-Id \
+                       --ner-socket /var/run/airlock/ner.sock
+```
+
+### Core 覆盖什么、不覆盖什么(实测,逐条)
+
+```
+✓ Core   身份证 11010519491231002X          校验位 GB 11643
+✓ Core   银行卡 4111111111111111            Luhn + ISO/IEC 7812 IIN
+✓ Core   统一代码 91110108MA01ABCD71         GB 32100
+✓ Core   Codice Fiscale MRTMTT25D09F205Z   CIN 控制字符
+✓ Core   Steuer-ID 86095742719             ISO 7064 + 结构规则
+✓ Core   手机/邮箱/密钥/护照/车牌              正则
+✓ Core   张伟                               静态名册
+✓ Core   欧阳志远                            复姓表 + AC 自动机
+✗ 需要 Advanced   周慧敏                      名册外中文人名
+✗ 需要 Advanced   上海市浦东新区世纪大道100号      非结构化地址
+✗ 需要 Advanced   临安远景机械制造有限公司         非结构化机构名
+✗ 需要 Advanced   Margaret Okonkwo          拉丁人名
+```
+
+**Core 模式在启动时自陈这件事**,不用翻文档:
+
+```
+[INFO] 运行在 Core 模式  实测覆盖率=语料 90.5%（结构化 37/37，非结构化 1/5）
+[WARN] Core 模式检测不到这几类——它们没有字面特征，正则找不到
+       类型=[NAME ADDRESS ORG]
+       补法=配 --name-roster/--org-roster 覆盖已知的，
+            或改用 airlock-agent-advanced 接 NER sidecar 覆盖未知的
+```
+
+一个只装了正则的部署,与一个接了 NER 的部署,**在日志上长得一样**——都在正常处理
+请求、都在报告检出数。区别只在「姓名、地址、机构名有没有被检测」,而没被检测的
+那些不会出现在任何计数里。所以这段自陈是能力声明,不是提示。
+
+### Advanced 的三种部署形态
+
+重型依赖封在 `Dockerfile.analyzer` 里,对 Go 网关彻底屏蔽。**痛苦没有消失,
+只是从「每个用网关的人」转移到了「运维这一个镜像的人」。**
+
+| 形态 | 清单 | 净 IPC | 换来什么 | 代价 |
+|---|---|---|---|---|
+| Core | `deploy/core.yaml` | — | 无依赖、无额外内存 | 非结构化实体检不出 |
+| 同 Pod sidecar | `deploy/advanced-sidecar.yaml` | **110µs** | 最低延迟 | 每副本 +622MB,绑定扩缩容 |
+| 独立 Service | `deploy/advanced-service.yaml` | 154µs | 独立水平扩缩容 | 延迟 1.4×,还要多一跳 Service 转发 |
+
+**两者不能兼得。** 网关是 CPU 密集、分析器是内存密集,绑在一起意味着按其中一个
+的需求去扩、另一个必然浪费;拆开则要把流量放回完整的 TCP 协议栈。这是一次二选一,
+依据是「延迟敏感」还是「资源画像差异大」。
+
+> **换成 TCP 时有一道闸会静默消失。** UDS 靠文件权限(0600)拦住同机其他用户;
+> TCP 没有这个。而这个端口返回的是**「PII 在哪」**——`advanced-service.yaml`
+> 里配了 NetworkPolicy 把它补回来,服务端启动时也会打一条 WARNING。
 
 ---
 

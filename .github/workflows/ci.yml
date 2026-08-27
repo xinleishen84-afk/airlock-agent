@@ -68,6 +68,43 @@ jobs:
         working-directory: otelprocessor
         run: go test ./... -race -count=1 -timeout 5m
 
+  # nerclient：Advanced 模式的模块，同样单独成模块、同样需要单独跑
+  #
+  # 它带着 gRPC 与 protobuf 的依赖树，正是主模块要挡在外面的东西。
+  # 而「单独成模块」在 CI 里最容易变成「没人跑」——主模块的 go test ./...
+  # 走不进这个目录。
+  nerclient:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache-dependency-path: nerclient/go.sum
+
+      - name: 格式检查
+        working-directory: nerclient
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化：" && echo "$out"
+            exit 1
+          fi
+
+      - name: vet
+        working-directory: nerclient
+        run: go vet ./...
+
+      # 需要 Python 分析器的用例会自行跳过；这里只保证编译与不依赖
+      # sidecar 的那部分逻辑是绿的
+      - name: 单元测试
+        working-directory: nerclient
+        run: go test ./... -count=1 -timeout 5m
+
+      - name: Advanced 二进制可构建
+        working-directory: nerclient
+        run: go build -o /tmp/airlock-advanced ./cmd/airlock-agent-advanced
+
   # 配置自检：验证装配结果
   #
   # 与单元测试的分工：单元测试跑的是组件逻辑，dry-run 跑的是装配结果。
