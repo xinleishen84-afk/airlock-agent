@@ -64,9 +64,12 @@ func buildStack(t *testing.T, cfg stackConfig) (detect.Detector, *verify.Evidenc
 		if err != nil {
 			t.Fatal(err)
 		}
-		// 只有中文模型时按文字系统设闸：拿中文模型判拉丁文是分布外输入。
-		// 接上英文模型之后应改为按语言路由，而不是把这道闸一直开着。
-		c.Trigger = detect.RequireScript(0.5)
+		// 不设语言闸：服务端已按文字系统路由，中文段走中文模型、
+		// 拉丁段走英文模型。此时再设闸，会把拉丁文整段挡在门外——
+		// 而那正是刚刚接上模型的那一类。
+		//
+		// No script gate: the server now routes by script. A gate here would
+		// block Latin text entirely — the very class that just got a model.
 		c.OnStats = func(s detect.CascadeStats) {
 			stats.ModelCalls += s.ModelCalls
 			stats.ModelSkipped += s.ModelSkipped
@@ -225,10 +228,30 @@ func TestFullStackDoesNotRegressStructured(t *testing.T) {
 		t.Logf("  未精确命中：%v", missed)
 	}
 	if len(extra) > 0 {
-		t.Logf("  多报：%v", extra)
+		// 多报与漏检不是一回事，代价方向相反：
+		//   漏检 = 该脱敏的没脱 = 泄露，不可接受
+		//   多报 = 不该脱的脱了 = 效用损失，可接受但要看得见
+		//
+		// 这里的多报全部来自第三层对非英语拉丁文的判定（德语 Steuer、
+		// 西班牙语 registrado），以及一个语料没标注但确实是机构的
+		// WhatsApp。它们是按文字系统路由的固有代价：拉丁文≠英文，
+		// 而德语、西班牙语送进英文模型同样是分布外。
+		//
+		// 真正的解法是按语言而非按文字系统路由——契约里的 language 字段
+		// 支持这件事，缺的是一个语言识别器和对应语种的模型。
+		//
+		// Over-redaction and under-redaction are not the same failure:
+		// a miss is a leak, an extra is a utility loss. These extras come from
+		// the third layer judging non-English Latin text (German Steuer,
+		// Spanish registrado), which is the inherent cost of routing by script:
+		// Latin is not English. Routing by actual language is what the
+		// contract's language field is for; what is missing is a language
+		// identifier and models for those languages.
+		t.Logf("  多报（过度脱敏，非泄露）：%v", extra)
 	}
 	if hit < total {
-		t.Errorf("加了第二、三层之后结构化标识出现漏检——前两层的结论不该被后面的层改动")
+		t.Errorf("加了第二、三层之后结构化标识出现漏检——" +
+			"前两层的结论不该被后面的层改动。漏检是泄露，与多报不同")
 	}
 }
 

@@ -32,6 +32,15 @@ import (
 func AddressChain() *Chain {
 	return &Chain{
 		Type: detect.TypeAddress,
+		// 地址链此前没有形态规则，于是 ST、registrado 这类拉丁缩写与外语词
+		// 被判成地址后一路通过。人名链与机构链都有，唯独地址链漏了——
+		// 三条链的形态约束本该一致，因为误判来自同一个源头（模型），
+		// 只是落在了不同的类型上。
+		//
+		// The address chain had no shape rules, so ST and registrado passed
+		// through as addresses. The name and organization chains had them; the
+		// gap was in the third, though the misjudgements come from one source.
+		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape(), versionShape()},
 		Extension: &ExtensionRule{
 			Suffixes: []string{
 				"省", "市", "区", "县", "镇", "乡", "村", "旗", "盟", "州",
@@ -103,7 +112,7 @@ func AddressChain() *Chain {
 func PersonChain() *Chain {
 	return &Chain{
 		Type:   detect.TypeName,
-		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape()},
+		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape(), versionShape()},
 		Cues: []Cue{
 			{
 				Name: "代码语法",
@@ -180,7 +189,7 @@ func PersonChain() *Chain {
 func OrgChain() *Chain {
 	return &Chain{
 		Type:   detect.TypeOrg,
-		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape()},
+		Shapes: []ShapeRule{codeShape(), latinAbbreviationShape(), versionShape()},
 		Cues: []Cue{
 			{
 				Name:        "机构后缀",
@@ -279,6 +288,24 @@ func latinAbbreviationShape() ShapeRule {
 			// 全大写（ST、SSE）或全小写（deps）的短串
 			return upper == letters || lower == letters
 		},
+	}
+}
+
+// versionShape 否决含点分数字串的实体。
+//
+// 实测：英文模型把「kernel 5.15.0.91」整段判成人名。人名里不会出现
+// 5.15.0.91 这样的点分数字——这是版本号、IP 或序列号的形态。
+//
+// 与「IPv4 与四段式版本号字面相同」那个问题方向相反：那里是要把版本号
+// 从 IP 里分出去，这里是把它从人名里分出去。同一个形态，两处都要挡。
+//
+// Measured: the English model labels "kernel 5.15.0.91" as a person name. A
+// dotted numeric run is a version, an address or a serial — not part of a name.
+func versionShape() ShapeRule {
+	dotted := regexp.MustCompile(`[0-9]+\.[0-9]+\.[0-9]+`)
+	return ShapeRule{
+		Name:   "点分数字",
+		Reject: func(v string) bool { return dotted.MatchString(v) },
 	}
 }
 

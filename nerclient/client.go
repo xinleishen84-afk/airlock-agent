@@ -58,6 +58,14 @@ type Options struct {
 	// Types 限定要识别的实体类型。留空表示全部。
 	Types []detect.EntityType
 
+	// Language 是默认语言。留空表示由服务端用它配置的默认值。
+	//
+	// 级联会按文字系统逐次覆盖它。这里的值只在直接调用 Detect 时生效。
+	//
+	// The cascade overrides this per call by script; this value applies only to
+	// a direct Detect call.
+	Language string
+
 	// MaxTextBytes 限制单次送入的文本大小。
 	//
 	// 模型的耗时随输入长度增长，而 gRPC 默认的消息上限是 4MB。
@@ -98,6 +106,9 @@ func New(ctx context.Context, opts Options) (*Client, error) {
 	}
 	if opts.MaxTextBytes <= 0 {
 		opts.MaxTextBytes = 1 << 20
+	}
+	if opts.Language == "" {
+		opts.Language = "auto"
 	}
 
 	if info, err := os.Stat(opts.SocketPath); err != nil {
@@ -180,9 +191,21 @@ func (c *Client) Detect(text string) ([]detect.Entity, error) {
 	return c.DetectContext(context.Background(), text)
 }
 
-// DetectContext runs one analysis.
-// 执行一次识别。
+// DetectLanguage implements detect.LanguageAwareDetector.
+func (c *Client) DetectLanguage(text, language string) ([]detect.Entity, error) {
+	return c.DetectContextLanguage(context.Background(), text, language)
+}
+
+// DetectContext runs one analysis using the client's configured language.
+// 用客户端配置的语言执行一次识别。
 func (c *Client) DetectContext(ctx context.Context, text string) ([]detect.Entity, error) {
+	return c.DetectContextLanguage(ctx, text, c.opts.Language)
+}
+
+// DetectContextLanguage runs one analysis in a specific language.
+// 以指定语言执行一次识别。
+func (c *Client) DetectContextLanguage(ctx context.Context, text, language string) (
+	[]detect.Entity, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, nil
 	}
@@ -199,7 +222,7 @@ func (c *Client) DetectContext(ctx context.Context, text string) ([]detect.Entit
 	defer cancel()
 
 	resp, err := c.stub.Analyze(callCtx, &piiv1.AnalyzeRequest{
-		Text: text, Language: "zh", EntityTypes: types,
+		Text: text, Language: c.opts.Language, EntityTypes: types,
 	})
 	if err != nil {
 		if c.opts.FailOpen {
@@ -220,7 +243,7 @@ func (c *Client) DetectContext(ctx context.Context, text string) ([]detect.Entit
 func (c *Client) raw(ctx context.Context, text string) (*piiv1.AnalyzeResponse, error) {
 	callCtx, cancel := context.WithTimeout(ctx, c.opts.Timeout)
 	defer cancel()
-	return c.stub.Analyze(callCtx, &piiv1.AnalyzeRequest{Text: text, Language: "zh"})
+	return c.stub.Analyze(callCtx, &piiv1.AnalyzeRequest{Text: text, Language: c.opts.Language})
 }
 
 // convert maps character offsets to byte offsets and verifies each one.

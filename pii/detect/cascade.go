@@ -133,6 +133,17 @@ type CascadeStats struct {
 	// ModelSkipped 是因为没有触发特征而跳过模型的次数。
 	ModelSkipped int
 
+	// PerLanguage 是按语言统计的模型调用次数。
+	//
+	// 路由是否按预期工作，只能从这里看出来。一个把所有文本都路由到 zh 的
+	// 部署与一个正确路由的部署，在检出结果上很难区分——直到有人拿英文
+	// 文档来测。
+	//
+	// Whether routing works can only be seen here. A deployment routing
+	// everything to zh is hard to distinguish from one routing correctly,
+	// until someone tries an English document.
+	PerLanguage map[string]int
+
 	// MaskedRunes 是被前两层覆盖掉的字符数（仅 MaskSettled 时非零）。
 	MaskedRunes int
 
@@ -201,6 +212,29 @@ type Cascade struct {
 
 	// OnStats 接收每次运行的分层统计。
 	OnStats func(CascadeStats)
+
+	// Language 固定第三层使用的语言。留空表示按文字系统自动路由。
+	//
+	// 调用方知道真实语言时应当填它——HTTP 的 Accept-Language、文档元数据、
+	// 租户配置都比字符集识别可靠。自动路由分得出「汉字还是拉丁」，
+	// 分不出「英语还是法语」。
+	//
+	// Set when the caller knows the real language: Accept-Language, document
+	// metadata and tenant configuration are all more reliable than script
+	// detection, which separates Han from Latin but not English from French.
+	Language string
+
+	// UnknownScriptPolicy 决定文字系统识别不出来时怎么办。
+	//
+	// 默认送进模型并用默认语言。跳过意味着这段文本的姓名、地址、机构
+	// 完全不检测——而识别不出文字系统的文本往往是短句或混排，
+	// 恰恰不是可以放心跳过的东西。
+	//
+	// Defaults to sending it with the default language. Skipping means names,
+	// addresses and organizations in that text are not scanned at all, and text
+	// whose script cannot be determined is usually short or mixed — not the
+	// kind of thing to skip confidently.
+	SkipUnknownScript bool
 }
 
 // NewCascade builds a cascade.
@@ -241,7 +275,10 @@ func (c *Cascade) Detect(text string) ([]Entity, error) {
 // DetectContext runs the funnel.
 // 运行漏斗。
 func (c *Cascade) DetectContext(ctx context.Context, text string) ([]Entity, error) {
-	stats := CascadeStats{PerStage: map[CascadeStage]int{}}
+	stats := CascadeStats{
+		PerStage:    map[CascadeStage]int{},
+		PerLanguage: map[string]int{},
+	}
 	defer func() {
 		if c.OnStats != nil {
 			c.OnStats(stats)
@@ -288,8 +325,28 @@ func (c *Cascade) DetectContext(ctx context.Context, text string) ([]Entity, err
 		return ResolveOverlaps(fast), nil
 	}
 
+	language := c.Language
+	if language == "" {
+		switch script := ScriptOf(modelInput, 0.5); script {
+		case ScriptUnknown:
+			if c.SkipUnknownScript {
+				stats.ModelSkipped++
+				return ResolveOverlaps(fast), nil
+			}
+			language = "" // 交给服务端的默认语言 / let the server default
+		default:
+			language = string(script)
+		}
+	}
+
 	stats.ModelCalls++
-	slow, err := c.detectWithModel(ctx, modelInput)
+	label := language
+	if label == "" {
+		label = "default"
+	}
+	stats.PerLanguage[label]++
+
+	slow, err := c.detectWithModel(ctx, modelInput, language)
 	if err != nil {
 		return nil, err
 	}
@@ -327,9 +384,20 @@ func (c *Cascade) DetectContext(ctx context.Context, text string) ([]Entity, err
 	return ResolveOverlaps(append(fast, kept...)), nil
 }
 
-// detectWithModel calls the third layer, honouring a context if it supports one.
-// 调用第三层；若它支持 context 则传入。
-func (c *Cascade) detectWithModel(ctx context.Context, text string) ([]Entity, error) {
+// detectWithModel calls the third layer, passing context and language when the
+// model supports them.
+// 调用第三层；模型支持时传入 context 与语言。
+func (c *Cascade) detectWithModel(ctx context.Context, text, language string) ([]Entity, error) {
+	type contextualLanguage interface {
+		DetectContextLanguage(context.Context, string, string) ([]Entity, error)
+	}
+	if cd, ok := c.Model.(contextualLanguage); ok {
+		return cd.DetectContextLanguage(ctx, text, language)
+	}
+	if la, ok := c.Model.(LanguageAwareDetector); ok {
+		return la.DetectLanguage(text, language)
+	}
+
 	type contextual interface {
 		DetectContext(context.Context, string) ([]Entity, error)
 	}
@@ -455,6 +523,22 @@ func overlapsAny(e Entity, settled []Entity) bool {
 // RequireScript builds a trigger that only wakes the model for text whose
 // script matches what the model was trained on.
 // 构造一个触发判据：只有文字系统与模型训练语料相符时才唤醒模型。
+//
+// # 什么时候该用它，什么时候不该
+// # When to use this, and when not to
+//
+// 它是**只挂了单一语言模型**时的降级手段：与其拿中文模型去判拉丁文并收获
+// 一堆分布外噪音，不如干脆不问。
+//
+// 服务端一旦按语言路由（多个模型各管一片），就必须撤掉这道闸——它会把
+// 拉丁文整段挡在门外，而那正是刚刚接上模型的那一类。实测：接上
+// en_core_web_sm 之后，「请联系 Margaret Okonkwo 确认收货」的汉字占比是
+// 32%，这道闸会把它整段拦下。
+//
+// A fallback for a single-language deployment: better not to ask than to ask
+// the wrong model. Once the server routes by language, this gate must be
+// removed — it blocks exactly the class that just gained a model. Measured,
+// 请联系 Margaret Okonkwo 确认收货 is 32% Han and the gate rejects it whole.
 //
 // # 为什么这不是过拟合
 // # Why this is not overfitting

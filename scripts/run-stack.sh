@@ -28,7 +28,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "启动 Python NER sidecar…"
-"$PY" -m pii.service.ner_server --socket "$SOCKET" &
+"$PY" -m pii.service.ner_server --socket "$SOCKET" \
+  --models "zh=zh_core_web_md,en=en_core_web_sm" &
 NER_PID=$!
 
 # 等就绪。模型加载要几秒，此时直接连会拿到连接错误——
