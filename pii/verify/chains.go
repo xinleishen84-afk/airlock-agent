@@ -66,6 +66,14 @@ func AddressChain() *Chain {
 		},
 		Cues: []Cue{
 			{
+				Name: "代码语法",
+				Words: []string{
+					"func ", "def ", "return ", "var ", "import ", "package ",
+					"=>", "->", "::", "();", ");", "){", "int ", "bool ",
+				},
+				Requirement: MustNot, Direction: Either, Window: 64,
+			},
+			{
 				Name:        "地址动词",
 				Words:       []string{"住在", "位于", "寄往", "地址", "收货", "送到", "邮寄", "所在"},
 				Requirement: Should, Direction: Before, Weight: 0.6, Window: 32,
@@ -254,7 +262,16 @@ func codeShape() ShapeRule {
 // lower case, usually two tokens. An all-caps or all-lower short token is an
 // abbreviation or an identifier.
 func latinAbbreviationShape() ShapeRule {
-	const maxAbbrev = 5
+	// 门槛取 8 而不是 5。
+	//
+	// 实测 uint64（6 字符）逃过了 5 的门槛。而拉丁人名极少是单段的——
+	// Smith、Johnson 这类单段名靠上下文线索（Mr./Dr.）撑住，
+	// 而含空格的多段名本来就被本规则放过。
+	//
+	// Eight rather than five: uint64 (six characters) slipped past five.
+	// Single-token Latin names are rare and are carried by context cues;
+	// multi-token names are exempted by the space check above.
+	const maxAbbrev = 8
 	return ShapeRule{
 		Name: "拉丁缩写",
 		Reject: func(v string) bool {
