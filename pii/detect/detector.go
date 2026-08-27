@@ -377,7 +377,30 @@ func NewCompositeDetector(detectors []Detector, minConfidence float64) *Composit
 }
 
 // Name 返回检测器标识。
-func (d *CompositeDetector) Name() string { return "composite" }
+func (d *CompositeDetector) Name() string {
+	if d.deferOverlaps {
+		return "composite(deferred)"
+	}
+	return "composite"
+}
+
+// DefersOverlapResolution reports that this detector's output may overlap.
+// 报告本检测器的输出可能存在重叠。
+//
+// 延后消解的检测器产出的是**候选**，直接拿去脱敏是不安全的：重叠区间之外的
+// PII 会原样出境。实测在随机文本上，约四分之一的样本会出现重叠候选。
+//
+// 用一个方法而不是靠名字字符串匹配：名字是给人看的，会被改；
+// 而下游据以判断「这批结果安不安全」的东西不该随一次改名而失效。
+//
+// A deferred detector emits candidates, and redacting them directly is unsafe:
+// PII outside the overlapping region leaves verbatim. Measured on random text,
+// roughly a quarter of samples produce overlapping candidates.
+//
+// A method rather than a name-string match: the name is for humans and will be
+// changed, and what downstream uses to decide "is this output safe" should not
+// break on a rename.
+func (d *CompositeDetector) DefersOverlapResolution() bool { return d.deferOverlaps }
 
 // Missing returns the uncovered NER-dependent types, for startup health checks.
 // 返回未被覆盖的 NER 依赖类型，供启动期健康检查使用。

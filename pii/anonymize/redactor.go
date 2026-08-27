@@ -212,7 +212,53 @@ func (r *Redactor) RedactTo(ctx context.Context, text string, scope StrategyScop
 	stratCounts := make(map[string]int)
 	for _, e := range ordered {
 		if e.Start < cursor {
-			continue // should not happen after overlap resolution; defensive / 防御性跳过
+			// 重叠实体一律阻断，绝不跳过。
+			//
+			// 曾经这里是 continue，注释写着「重叠消解之后不该发生，防御性跳过」。
+			// 它确实不该发生，但一旦发生，后果是**半截 PII 原样出境**：
+			// 实测「客户张伟的手机是 13812345678」在两个重叠实体下产出
+			// 「客户ANONYMIZED_ADDRESS_0345678」——手机号的尾巴留在了原文里，
+			// 而 TypeCounts 显示 {ADDRESS:1}，没有任何迹象表明跳过了什么。
+			//
+			// 「不该发生」不是不处理的理由。上游的重叠消解有 bug、
+			// 或调用方传了一个不做消解的自定义检测器，都会到这里，
+			// 而静默跳过让这两种情况都表现为「脱敏成功了」。
+			//
+			// This used to be a continue, commented "should not happen after
+			// overlap resolution". It should not — but when it does, half a PII
+			// value leaves verbatim: measured, two overlapping entities turned
+			// 客户张伟的手机是 13812345678 into 客户ANONYMIZED_ADDRESS_0345678,
+			// with the phone number's tail intact and TypeCounts reading
+			// {ADDRESS:1}, showing nothing was skipped.
+			//
+			// "Should not happen" is not a reason to leave it unhandled: a bug
+			// in overlap resolution and a caller-supplied detector that does no
+			// resolution both land here, and a silent skip makes both look like
+			// a successful redaction.
+			// 报错里必须同时有「是谁」与「怎么修」。
+			//
+			// 上一版只留了「怎么修」，把检测器名字删掉了——而收到这条报错的人
+			// 第一个要问的就是「哪个检测器」。是测试把它抓回来的。
+			//
+			// Both "which" and "how to fix": an earlier version kept only the
+			// fix and dropped the detector name, which is the first thing
+			// anyone receiving this error needs.
+			fix := fmt.Sprintf("检测器 %q 未做重叠消解", e.Detector)
+			if d, ok := r.detector.(interface{ DefersOverlapResolution() bool }); ok &&
+				d.DefersOverlapResolution() {
+				// 这是最常见的成因，值得单独说清楚修法。
+				// The most common cause; worth naming the fix precisely.
+				fix = fmt.Sprintf("检测器 %q 来自刻意延后重叠消解的装配"+
+					"（NewCompositeDetectorDeferred），", e.Detector) +
+					"它产出的是候选不是判决——必须先过证据链验证器" +
+					"（verify.EvidenceValidator.ValidateAll）再送来脱敏。" +
+					"sidecar 用 Options.Evidence 接它"
+			}
+			return RedactResult{}, fmt.Errorf(
+				"%w: 检测结果存在重叠区间——实体 %s [%d,%d) 与前一个实体重叠"+
+					"（前一个结束于 %d）。继续处理会让重叠部分之外的 PII 原样出境，"+
+					"因此阻断。%s / overlapping spans",
+				ErrRedactionFailed, e.Type, e.Start, e.End, cursor, fix)
 		}
 		strategy := flow.Strategy(e.Type)
 		replacement, err := strategy.Apply(ctx, scope, e)

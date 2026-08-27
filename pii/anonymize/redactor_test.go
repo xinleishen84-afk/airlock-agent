@@ -1,6 +1,7 @@
 package anonymize
 
 import (
+	"errors"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"strings"
@@ -274,3 +275,57 @@ type testErr struct{}
 
 // Error 实现 error。/ Error implements error.
 func (*testErr) Error() string { return "检测器不可用 / detector unavailable" }
+
+// 重叠实体必须阻断，绝不静默跳过。
+// Overlapping spans must block, never be silently skipped.
+//
+// 这条用例来自一次真实探测：构造两个重叠实体喂进 Redact，
+// 「客户张伟的手机是 13812345678」产出了「客户ANONYMIZED_ADDRESS_0345678」
+// ——手机号的尾巴原样留在了输出里，而 TypeCounts 显示 {ADDRESS:1}，
+// 没有任何迹象表明跳过了什么。
+//
+// 上游的重叠消解有 bug、或调用方传了一个不做消解的自定义检测器，
+// 都会到这里。静默跳过让这两种情况都表现为「脱敏成功了」。
+//
+// From a real probe: two overlapping entities turned the sentence into output
+// with the phone number's tail intact, while TypeCounts showed nothing was
+// skipped. A bug upstream and a caller-supplied detector without resolution
+// both land here, and a silent skip makes both look successful.
+func TestOverlappingSpansBlockRatherThanLeak(t *testing.T) {
+	const text = "客户张伟的手机是 13812345678"
+	nameStart := strings.Index(text, "张伟")
+	phoneStart := strings.Index(text, "13812345678")
+
+	overlapping := []detect.Entity{
+		{Type: detect.TypeAddress, Value: text[nameStart : phoneStart+5],
+			Start: nameStart, End: phoneStart + 5, Confidence: 0.9, Detector: "unresolved"},
+		{Type: detect.TypePhone, Value: "13812345678",
+			Start: phoneStart, End: phoneStart + len("13812345678"),
+			Confidence: 1.0, Detector: "unresolved"},
+	}
+
+	r := NewRedactorWith(overlapDetector{overlapping}, true)
+	_, err := r.RedactTo(t.Context(), text, sessScope(newSessionVault("s", time.Hour)),
+		Flow{Name: "t", Default: NewMask(), Restores: true})
+
+	if err == nil {
+		t.Fatal("重叠实体应阻断——继续处理会让重叠部分之外的 PII 原样出境")
+	}
+	if !errors.Is(err, ErrRedactionFailed) {
+		t.Errorf("应归入脱敏失败：%v", err)
+	}
+	for _, want := range []string{"重叠", "unresolved"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("报错应含 %q 以便定位是哪个检测器：%v", want, err)
+		}
+	}
+	t.Logf("按预期阻断：%v", err)
+}
+
+type overlapDetector struct{ ents []detect.Entity }
+
+func (o overlapDetector) Name() string                      { return "unresolved" }
+func (o overlapDetector) CoveredTypes() []detect.EntityType { return nil }
+func (o overlapDetector) Detect(string) ([]detect.Entity, error) {
+	return o.ents, nil
+}
