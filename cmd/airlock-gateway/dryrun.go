@@ -178,14 +178,25 @@ func RunDryRun(opts DryRunOptions) *Report {
 	detector, err := buildDetector(cfg)
 	if err != nil {
 		rep.add("PII 检测器装配", StatusFail, "%v", err)
-	} else if comp, ok := detector.(*detect.CompositeDetector); ok {
+	} else if comp, ok := detector.(detect.GapReporter); ok {
 		if missing := comp.Missing(); len(missing) > 0 {
 			// 不阻断启动，但必须让运维知道自己漏了什么
 			rep.add("PII 检测器装配", StatusWarn,
 				"存在覆盖缺口 %v——这几类实体将完全裸奔，请配置名册或接入 NER", missing)
 		} else {
-			rep.add("PII 检测器装配", StatusPass, "覆盖类型 %d 种，无缺口", len(comp.CoveredTypes()))
+			rep.add("PII 检测器装配", StatusPass, "覆盖类型 %d 种，无缺口", len(detector.CoveredTypes()))
 		}
+	} else {
+		// 断言失败时如果什么都不加，这一项会从报告里整条消失——
+		// 运维看到的是「没有这项检查」而不是「这项检查失败了」，
+		// 而这正是覆盖缺口告警此前被包装层吞掉的方式。宁可吵，不可静默。
+		//
+		// Adding nothing here would delete the whole item from the report:
+		// operators would see "no such check" rather than "check failed" —
+		// exactly how a wrapper silently swallowed this warning before.
+		rep.add("PII 检测器装配", StatusWarn,
+			"检测器 %q 未实现 detect.GapReporter，无法判断覆盖缺口——"+
+				"若它是包装层，请让它透传 Missing/CoveredTypes", detector.Name())
 	}
 
 	// --- 5. AST 脱敏路径自检 ---

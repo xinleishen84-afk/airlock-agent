@@ -402,6 +402,32 @@ func (d *CompositeDetector) Name() string {
 // break on a rename.
 func (d *CompositeDetector) DefersOverlapResolution() bool { return d.deferOverlaps }
 
+// GapReporter reports which NER-dependent entity types nothing covers.
+// 报告哪些依赖 NER 的实体类型无人覆盖。
+//
+// # 为什么是接口而不是具体类型
+// # Why an interface rather than a concrete type
+//
+// 覆盖缺口告警是这套系统里最要紧的一条运维信号：它说的是「姓名、地址、
+// 机构名这几类完全裸奔」。而它此前靠 detector.(*CompositeDetector) 取，
+// 一旦有人在检测器外面包一层（证据链就是这么包的），断言失败，
+// 告警**静默消失**——不报错、日志里也不再出现，看起来像「没有缺口」。
+//
+// 实测发生过：证据链包上之后，sidecar 的 /stats coverage_gaps 与启动告警
+// 一直是空的，而缺口一直在。
+//
+// The coverage-gap warning is the most consequential operational signal here:
+// it says names, addresses and organizations are fully exposed. It used to be
+// read via a concrete-type assertion, which any wrapper breaks — and the
+// evidence chain is a wrapper. The assertion then fails and the warning
+// silently disappears, looking exactly like "no gaps".
+//
+// Measured: after the chain was wrapped, the sidecar's coverage_gaps and its
+// startup warning were empty while the gaps were still there.
+type GapReporter interface {
+	Missing() []EntityType
+}
+
 // Missing returns the uncovered NER-dependent types, for startup health checks.
 // 返回未被覆盖的 NER 依赖类型，供启动期健康检查使用。
 func (d *CompositeDetector) Missing() []EntityType { return d.missing }

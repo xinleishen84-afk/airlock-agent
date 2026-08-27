@@ -224,7 +224,7 @@ func buildDetector(logger *slog.Logger) (detect.Detector, *verify.EvidenceValida
 		"单姓识别", *singleSurnames,
 		"实测覆盖率", "语料 90.5%（结构化 37/37，非结构化 1/5）")
 
-	if comp, ok := detector.(*detect.CompositeDetector); ok {
+	if comp, ok := detector.(detect.GapReporter); ok {
 		if missing := comp.Missing(); len(missing) > 0 {
 			logger.Warn("Core 模式检测不到这几类——它们没有字面特征，正则找不到",
 				"类型", missing,

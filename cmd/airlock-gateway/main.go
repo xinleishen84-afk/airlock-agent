@@ -291,7 +291,7 @@ func buildHandler(
 		logger.Info("外部 NER 已接入", "endpoint", cfg.PII.NER.Endpoint,
 			"fail_open", cfg.PII.NER.FailOpen)
 	}
-	if comp, ok := detector.(*detect.CompositeDetector); ok {
+	if comp, ok := detector.(detect.GapReporter); ok {
 		if missing := comp.Missing(); len(missing) > 0 {
 			// 正则检测不出人名——这是最危险的静默配置，必须显式告警
 			logger.Warn("PII 检测存在覆盖缺口，这几类实体将完全裸奔",

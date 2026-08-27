@@ -13,6 +13,7 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/internal/routing"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
+	"github.com/xinleishen84-afk/airlock-agent/pii/verify"
 )
 
 // identityTask 是任务类型的别名，避免 buildPolicy 里出现冗长的包路径。
@@ -121,7 +122,28 @@ func buildDetector(c *Config) (detect.Detector, error) {
 		detectors = append(detectors, ner)
 	}
 
-	return detect.NewCompositeDetector(detectors, 0), nil
+	// 证据链包在检测器外面。
+	//
+	// 网关接了远程 NER，而 NER 返回的是概率性判定：源代码里的 retry(n 会被
+	// 判成人名、地址会被截断在「北京市」、机构名会丢掉字号。不验证就把它们
+	// 原样送进脱敏管线。
+	//
+	// 这一处是主动找 bug 时发现的：证据链最初只在 sidecar 里包上，
+	// 网关这条独立的脱敏路径漏掉了。三条路径共用 verify.WrapDetector，
+	// 每多一份实现就多一处会漏掉的地方。
+	//
+	// The gateway consumes a remote NER whose output is probabilistic: retry(n
+	// in source code becomes a person name, an address truncates at its
+	// leading city, an organization loses its distinctive head. Without
+	// verification those go straight into redaction.
+	//
+	// Found during a bug hunt: the chain was wrapped only in the sidecar, and
+	// this independent path was missed. All three now share WrapDetector.
+	validator, err := verify.NewDefaultEvidenceValidator()
+	if err != nil {
+		return nil, fmt.Errorf("构造证据链: %w", err)
+	}
+	return verify.WrapDetector(detect.NewCompositeDetector(detectors, 0), validator), nil
 }
 
 // toLimits 把限流配置转成限流器参数。

@@ -166,7 +166,7 @@ func New(opts Options) (*Server, error) {
 	// 证据链包在检测器外面，使验证发生在所有脱敏路径的共同上游。
 	// Wrapped around the detector so verification is upstream of every path.
 	if opts.Evidence != nil {
-		opts.Detector = verifyingDetector{inner: opts.Detector, validator: opts.Evidence}
+		opts.Detector = verify.WrapDetector(opts.Detector, opts.Evidence)
 	}
 
 	if opts.TenantResolver == nil {
@@ -649,7 +649,7 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	if s.opts.Matrix != nil {
 		resp.RedactionMatrix = s.opts.Matrix.Describe()
 	}
-	if comp, ok := s.opts.Detector.(*detect.CompositeDetector); ok {
+	if comp, ok := s.opts.Detector.(detect.GapReporter); ok {
 		for _, t := range comp.Missing() {
 			resp.CoverageGaps = append(resp.CoverageGaps, string(t))
 		}

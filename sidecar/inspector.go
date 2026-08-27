@@ -284,7 +284,7 @@ func (s *Server) detectionView() DetectionView {
 	}
 	sort.Strings(view.CoveredTypes)
 
-	if comp, ok := s.opts.Detector.(*detect.CompositeDetector); ok {
+	if comp, ok := s.opts.Detector.(detect.GapReporter); ok {
 		for _, t := range comp.Missing() {
 			view.CoverageGaps = append(view.CoverageGaps, string(t))
 		}
