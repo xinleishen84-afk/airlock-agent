@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -41,34 +39,21 @@ import (
 // unit tests were green because each assembles its own copy. Only running the
 // real binary and probing it against its own claims finds them.
 
-// binaryUnderTest 构建并启动一个二进制，返回它的地址。
-func binaryUnderTest(t *testing.T, pkg string, args ...string) string {
+// binaryUnderTest 构建并启动一个命令，返回它的监听地址。
+//
+// 按名字取命令而不是按路径：路径写死会随改名烂掉，而名字不存在时
+// CommandNamed 会立刻报错并列出仓库里现有的全部命令。
+//
+// Looked up by name rather than path: a hardcoded path rots on rename, while
+// an unknown name fails immediately with the available set.
+func binaryUnderTest(t *testing.T, name string, args ...string) string {
 	t.Helper()
 
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	bin := filepath.Join(t.TempDir(), "agent")
-
-	// nerclient 是独立模块，构建目录不同
-	dir := root
-	if strings.HasPrefix(pkg, "./cmd/airlock-agent-advanced") {
-		dir = filepath.Join(root, "nerclient")
-	}
-
-	build := exec.Command("go", "build", "-o", bin, pkg)
-	build.Dir = dir
-	build.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("构建 %s 失败：%v\n%s", pkg, err, out)
-	}
-
+	bin := CommandNamed(t, name).Build(t)
 	port := freePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	full := append([]string{"--addr", addr}, args...)
 
-	cmd := exec.Command(bin, full...)
+	cmd := exec.Command(bin, append([]string{"--addr", addr}, args...)...)
 	var logs bytes.Buffer
 	cmd.Stderr = &logs
 	cmd.Stdout = &logs
@@ -130,7 +115,7 @@ func redactVia(t *testing.T, addr, tenant, text string) redactResult {
 // Core 二进制声称覆盖复姓 —— 拨测它是否真的覆盖。
 // The Core binary claims compound-surname coverage; probe whether it does.
 func TestCoreBinaryCoversWhatItClaims(t *testing.T) {
-	addr := binaryUnderTest(t, "./cmd/airlock-agent",
+	addr := binaryUnderTest(t, "airlock-agent",
 		"--jurisdictions", "GEN,CN", "--single-tenant", "acme")
 
 	cases := []struct{ name, text, want string }{
@@ -157,7 +142,7 @@ func TestCoreBinaryCoversWhatItClaims(t *testing.T) {
 // 复姓识别产出的是候选不是判决。把它加进 Core 而不同时加证据链，
 // 是把召回换成了误报。这条用例同时钉住两件事：复姓在、证据链也在。
 func TestCoreBinaryHasEvidenceChain(t *testing.T) {
-	addr := binaryUnderTest(t, "./cmd/airlock-agent",
+	addr := binaryUnderTest(t, "airlock-agent",
 		"--jurisdictions", "GEN,CN", "--single-tenant", "acme",
 		"--single-surnames") // 故意开启单姓，把误报压力拉满
 
@@ -183,14 +168,7 @@ func TestCoreBinaryHasEvidenceChain(t *testing.T) {
 // 「运行在 Core 模式 覆盖=…静态名册与复姓」这句话曾经是假的：
 // 复姓识别器根本没被装配。日志说了什么，就必须能被拨测验证。
 func TestCoreStartupClaimIsProbeable(t *testing.T) {
-	root, _ := filepath.Abs("../..")
-	bin := filepath.Join(t.TempDir(), "agent")
-	build := exec.Command("go", "build", "-o", bin, "./cmd/airlock-agent")
-	build.Dir = root
-	build.Env = append(os.Environ(), "GOFLAGS=-mod=mod")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("构建失败：%v\n%s", err, out)
-	}
+	bin := CommandNamed(t, "airlock-agent").Build(t)
 
 	port := freePort(t)
 	cmd := exec.Command(bin, "--addr", fmt.Sprintf("127.0.0.1:%d", port),

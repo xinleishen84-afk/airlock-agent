@@ -200,13 +200,16 @@ type Gateway struct {
 // 每次测试都真实编译一遍：编译失败本身就是需要在集成阶段暴露的问题。
 func buildGateway(t *testing.T) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "gateway")
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/airlock-gateway")
-	cmd.Dir = "../.."
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("编译网关失败: %v\n%s", err, out)
-	}
-	return bin
+	// 路径由文件系统推导，不写死。
+	//
+	// 这里曾经写死 "./cmd/gateway"，而包在改名后已不叫那个名字——  // dangling-ok: 历史
+	// 该测试自改名起就一直编译失败，且没人发现。
+	// 现在按名字取：名字不存在会立刻报错并列出仓库里现有的全部命令。
+	//
+	// Derived, not written down. This used to hardcode a path that a rename
+	// invalidated; the test had been failing to compile ever since, unnoticed.
+	// Looking a command up by name now fails loudly with the available set.
+	return CommandNamed(t, "airlock-gateway").Build(t)
 }
 
 // DryRun 以自检模式运行网关，返回退出码与输出。

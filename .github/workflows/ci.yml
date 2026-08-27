@@ -176,6 +176,21 @@ jobs:
       # 单独跑一遍确保它不会因为 Docker 缺失被连带跳过
       # 以下两组不需要 Docker（子进程 + 本地混沌上游即可），
       # 单独跑一遍确保它们不会因为 Docker 缺失被连带跳过
+      # 拓扑防腐：仓库里每一处写死的包路径都必须解析得到真实存在的包，
+      # 每一个 cmd/ 下的命令都必须被至少一处引用，每一个模块都必须能构建。
+      #
+      # 放在最前，因为它最快（几秒）且它失败时后面的用例大概率也会失败，
+      # 只是失败信息没这么直接——「exit status 1」不会告诉你是哪个路径烂了。
+      - name: 拓扑防腐（无需 Docker）
+        working-directory: test/integration
+        run: go test ./... -count=1 -run 'TestNoDangling|TestEveryCommand|TestEveryModule' -v
+
+      # 二进制的能力自陈必须与实际行为一致。
+      # 单元测试各自装配自己的那一份，因此「装配漏了」它们全都发现不了。
+      - name: 二进制能力拨测（无需 Docker）
+        working-directory: test/integration
+        run: go test ./... -count=1 -run 'TestCoreBinary|TestCoreStartup' -v
+
       - name: 五项能力验收（无需 Docker）
         working-directory: test/integration
         run: go test ./... -count=1 -timeout 5m -run 'TestAcceptance' -v
