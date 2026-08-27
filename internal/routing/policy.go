@@ -230,6 +230,9 @@ func NewPolicy(targets []*Target, rules []*Rule, defaultTier Tier,
 	if fallbackChain == nil {
 		fallbackChain = map[Tier]Tier{Tier1Premium: Tier2Standard}
 	}
+	if err := validateFallbackChain(fallbackChain); err != nil {
+		return nil, err
+	}
 	if budgets == nil {
 		budgets = map[Tier]*Budget{}
 	}
@@ -386,4 +389,54 @@ func stableSortRules(rules []*Rule) {
 			rules[j], rules[j-1] = rules[j-1], rules[j]
 		}
 	}
+}
+
+// validateFallbackChain 拒绝成环的降级链。
+// Rejects a cyclic degradation chain.
+//
+// # 这是配置合理性检查，不是防挂死
+// # This is a config-sanity check, not a hang guard
+//
+// 降级链有两处遍历，proxy.collectFrom 与 Policy 的预算降级，两处都用
+// visited 集合防了环，成环时的实际行为是「走遍各档后停」，不会死循环。
+//
+// 拦在这里的理由是别的：成环几乎必然是运维漏写了链尾。而它的症状是安静的
+// ——请求不报错，只是降级走到了不该走的档位上，从日志上看和正常降级
+// 一模一样。构造期拒绝，让这种配置在启动时就说话。
+//
+// 同时这也让两处 visited 保护从「必需」降级为「冗余」：将来谁写第三处
+// 遍历，忘了加保护也不会挂，因为成环的链根本进不来。
+//
+// Both walk sites — proxy.collectFrom and the budget downgrade — already guard
+// with a visited set, so a cycle terminates rather than spinning. The reason to
+// reject it here is different: a cycle almost always means an operator omitted
+// the chain's terminal tier, and the symptom is quiet — requests still succeed,
+// they just degrade onto a tier they should never reach, indistinguishable in
+// the logs from a normal downgrade. Failing at construction makes it speak up.
+//
+// It also demotes those two visited guards from load-bearing to redundant: a
+// future third walk site that forgets one still cannot hang, because a cyclic
+// chain never gets built.
+func validateFallbackChain(chain map[Tier]Tier) error {
+	for start := range chain {
+		visited := map[Tier]bool{start: true}
+		tier := start
+		for {
+			next, ok := chain[tier]
+			if !ok {
+				break
+			}
+			if visited[next] {
+				return fmt.Errorf(
+					"降级链成环（%s 出发经 %s 回到已访问的梯队）——"+
+						"降级会绕回起点，请求最终落在不该走的档位上，"+
+						"而日志里看不出与正常降级的区别。"+
+						"请让每条降级链有明确的链尾 / cyclic fallback chain",
+					start.Label(), tier.Label())
+			}
+			visited[next] = true
+			tier = next
+		}
+	}
+	return nil
 }
