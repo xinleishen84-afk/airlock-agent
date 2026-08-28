@@ -74,6 +74,29 @@ pii:
   # jurisdiction owns (email, card numbers, IBAN, API keys).
   # 可用 / available: GEN CN US IT DE ES
   jurisdictions: [GEN, CN]
+  # 会话一致性声明：必填，没有默认值。
+  # 占位符（PHONE_0、PHONE_1……）是按本副本见过的文本顺序分配的递增序号，
+  # 因此两个副本对同一会话会给出不同的编号。实测：副本 A 把 13800138000
+  # 编成 PHONE_0，副本 B 把 13900139000 也编成 PHONE_0——上游回一句引用
+  # PHONE_0 的话，两个副本复原出不同的真实号码，用户会拿到别人的数据，
+  # 且不报任何错。客户端每轮重发完整历史时看不出来；长会话一裁剪历史就复现，
+  # 也就是说会话越长越容易出事。
+  #
+  # single-replica   只跑一个副本
+  # session-affinity 入口按 session id 做一致性哈希，同一会话恒落同一副本
+  #                  （nginx: hash $http_x_session_id consistent；
+  #                   Istio: consistentHash.httpHeaderName: x-session-id）
+  #
+  # Required, no default. Placeholders are per-replica ordinals, so two replicas
+  # number the same session differently and a response citing PHONE_0 restores
+  # to a different real value on each — silently handing one user another's
+  # data. Hidden when clients resend full history; reappears as soon as a long
+  # session trims it.
+  # 示例取安全的那一边。要改成 session-affinity，入口必须真的按 session id
+  # 做一致性哈希——ClusterIP 的轮询和 sessionAffinity: ClientIP 都不算数。
+  # The example takes the safe side. Switching to session-affinity requires the
+  # ingress to actually hash on the session id.
+  session_consistency: single-replica
   # 租户自定义规则目录：工号、资产编号、合同号这类只有你自己知道格式的标识。
   # 每条规则必须自带 samples，加载期跑通才会被接受。
   # Tenant rule directory for identifiers only you define. Every rule ships

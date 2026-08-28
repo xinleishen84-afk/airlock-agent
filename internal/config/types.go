@@ -104,6 +104,14 @@ type PIIConfig struct {
 	// else.
 	Jurisdictions []JurisdictionCode `yaml:"jurisdictions"`
 
+	// SessionConsistency 声明本部署如何保证同一会话的占位符跨轮一致。
+	// 必填且没有默认值——两个取值对应两种截然不同的部署形态，
+	// 猜错的那一种会静默地把别人的数据交给用户。见 SessionConsistencyMode。
+	//
+	// Required with no default: the two values describe materially different
+	// deployments, and guessing wrong silently hands one user another's data.
+	SessionConsistency SessionConsistencyMode `yaml:"session_consistency"`
+
 	// TenantRulesDir 是租户自定义 YAML 规则目录（工号、资产编号、合同号等
 	// 只有租户自己知道格式的标识）。留空表示不加载。
 	//

@@ -13,7 +13,29 @@ metadata:
   name: airlock-agent
   labels: {app: airlock-agent, mode: core}
 spec:
-  replicas: 3
+  # 出货默认单副本，与下方 --session-consistency=single-replica 对应。
+  #
+  # 扩容不是改一个数字：占位符（PHONE_0、PHONE_1……）是按本副本见过的文本
+  # 顺序分配的递增序号，两个副本对同一会话会给出不同的编号。实测同一会话下
+  # 副本 A 把 13800138000 编成 PHONE_0、副本 B 把 13900139000 也编成 PHONE_0，
+  # 上游回一句引用 PHONE_0 的话，两边复原出不同的真实号码——用户拿到别人的
+  # 数据，且不报错。客户端每轮重发完整历史时看不出来，长会话一裁剪历史就复现。
+  #
+  # 要跑多副本，三件事必须同时做，缺一不可：
+  #   1. replicas 调大
+  #   2. --session-consistency 改为 session-affinity
+  #   3. 入口按 session id 做一致性哈希——ClusterIP Service 是轮询的，
+  #      sessionAffinity: ClientIP 也不够（会话与客户端 IP 不是一回事，
+  #      IP 变了就换 Pod）。需要在 Ingress 或网格上按请求头哈希：
+  #        nginx: nginx.ingress.kubernetes.io/upstream-hash-by: "$http_x_session_id"
+  #        Istio: DestinationRule.trafficPolicy.loadBalancer.consistentHash
+  #                 .httpHeaderName: x-session-id
+  #
+  # Scaling out is not a one-number change. Placeholders are replica-local
+  # ordinals, so two replicas number the same session differently and a response
+  # citing PHONE_0 restores to a different real value on each — one user
+  # receiving another's data, silently. All three steps above are required.
+  replicas: 1
   selector:
     matchLabels: {app: airlock-agent, mode: core}
   template:
@@ -29,6 +51,11 @@ spec:
           args:
             - --addr=:8888
             - --jurisdictions=GEN,CN
+            # 会话一致性：必填，且必须与上方 replicas 及入口的哈希策略一致。
+            # 详见 spec.replicas 上方的说明。
+            # Required, and must match spec.replicas and the ingress hashing
+            # policy. See the note above spec.replicas.
+            - --session-consistency=single-replica
             - --tenant-header=X-Tenant-Id
             - --name-roster=/rosters/names.txt
           ports:

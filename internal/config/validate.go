@@ -277,6 +277,17 @@ func (c *Config) validatePII(add func(string, string, ...any)) {
 		add("pii.ner.types", "配置了识别类型但未设置 endpoint，NER 不会启用")
 	}
 
+	// 会话一致性必须显式声明。缺省不能选任何一边：
+	// 猜「单副本」会让多副本部署静默串号，猜「有亲和」会让单副本部署
+	// 背上一个并不存在的承诺。两种猜法都比报错更糟。
+	if c.PII.SessionConsistency == "" {
+		add("pii.session_consistency",
+			"必填——占位符是副本本地的递增序号，多副本部署下同一会话的"+
+				"同一个占位符会在不同副本上指向不同的真实值，用户会拿到"+
+				"别人的数据且不报错。请声明 %s 之一",
+			strings.Join(SessionConsistencyNames(), " 或 "))
+	}
+
 	// 未选司法管辖区 = 一条识别器都不装 = 扫描全过、报告干净。
 	// 这必须是启动期硬错误，不能是警告。
 	// No jurisdiction selected means no recognizers at all: everything scans

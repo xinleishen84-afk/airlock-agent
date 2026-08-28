@@ -20,6 +20,13 @@ metadata:
   name: airlock-analyzer
   labels: {app: airlock-analyzer}
 spec:
+  # 分析器是无状态的：只做 NER 推理，不持有会话保险库，也不分配占位符。
+  # 因此这里可以自由横向扩展，不受 core.yaml 里那条会话亲和约束的限制
+  # ——那条约束只适用于持有保险库的网关/边车。
+  #
+  # The analyzer is stateless: it runs NER inference and holds no session vault,
+  # so it scales freely. The session-affinity constraint in core.yaml applies
+  # only to the components that own a vault.
   replicas: 2
   selector:
     matchLabels: {app: airlock-analyzer}

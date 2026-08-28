@@ -20,7 +20,11 @@ metadata:
   name: airlock-agent-advanced
   labels: {app: airlock-agent, mode: advanced-sidecar}
 spec:
-  replicas: 2
+  # 同 deploy/core.yaml 里 spec.replicas 上方的说明：占位符是副本本地的
+  # 递增序号，扩容前必须同时改 --session-consistency 并在入口按 session id
+  # 做一致性哈希，否则同一会话的同一个占位符会在不同副本上指向不同的真实值。
+  # See the note above spec.replicas in deploy/core.yaml.
+  replicas: 1
   selector:
     matchLabels: {app: airlock-agent, mode: advanced-sidecar}
   template:
@@ -35,6 +39,9 @@ spec:
           args:
             - --addr=:8888
             - --jurisdictions=GEN,CN
+            # 会话一致性：必填。详见 deploy/core.yaml 中 spec.replicas 的说明。
+            # Required. See the note above spec.replicas in deploy/core.yaml.
+            - --session-consistency=single-replica
             - --tenant-header=X-Tenant-Id
             - --ner-socket=/var/run/airlock/ner.sock
             - --ner-timeout=500ms

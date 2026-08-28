@@ -42,6 +42,7 @@ rate_limit:
   window: 1m
 pii:
   jurisdictions: [GEN, CN]
+  session_consistency: single-replica
   fail_closed: true
   name_roster: ["张伟"]
   org_roster: ["星辰科技"]

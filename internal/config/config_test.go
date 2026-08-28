@@ -33,6 +33,7 @@ rate_limit:
 pii:
   fail_closed: true
   jurisdictions: [GEN, CN]
+  session_consistency: single-replica
   name_roster: ["张伟"]
 gpu:
   kv_elevated: 0.75
@@ -459,4 +460,39 @@ func TestUnknownJurisdictionBlocksStartup(t *testing.T) {
 		t.Fatalf("报错应点名 GB，实际：%v", err)
 	}
 	t.Logf("按预期拒绝：%v", err)
+}
+
+// TestMissingSessionConsistencyRejected 校验会话一致性声明必填。
+// Verifies the session-consistency declaration is required.
+//
+// 缺省不能选任何一边：猜「单副本」会让多副本部署静默串号，猜「有亲和」
+// 会让单副本部署背上一个并不存在的承诺。这条约束此前只写在 README 里，
+// 而出货的 deploy/core.yaml 是 replicas: 3——没人执行的注记不是控制措施。
+//
+// Neither value is safe as a default: assuming single-replica lets a
+// multi-replica deployment silently cross-number sessions, and assuming
+// affinity records a guarantee nobody made. The constraint used to live only in
+// the README while the shipped manifest set replicas: 3.
+func TestMissingSessionConsistencyRejected(t *testing.T) {
+	y := strings.Replace(baseYAML, "  session_consistency: single-replica\n", "", 1)
+	if y == baseYAML {
+		t.Fatal("测试夹具里没有 session_consistency，前提不成立")
+	}
+	if _, err := load(t, y); err == nil {
+		t.Fatal("未声明会话一致性应阻断启动")
+	} else if !strings.Contains(err.Error(), "pii.session_consistency") {
+		t.Fatalf("报错应指向 pii.session_consistency，实际：%v", err)
+	}
+}
+
+// TestSessionConsistencyRejectsUnknownValue 校验拼错的取值不会被当成默认。
+func TestSessionConsistencyRejectsUnknownValue(t *testing.T) {
+	y := strings.Replace(baseYAML,
+		"  session_consistency: single-replica",
+		"  session_consistency: sticky", 1)
+	if _, err := load(t, y); err == nil {
+		t.Fatal("拼错的取值应被拒绝")
+	} else if !strings.Contains(err.Error(), "sticky") {
+		t.Fatalf("报错应回显拼错的取值，实际：%v", err)
+	}
 }

@@ -158,6 +158,8 @@ spec:
                       type: array
                       items:
                         type: string
+                    session_consistency:
+                      type: string
                     tenant_rules_dir:
                       type: string
                   additionalProperties: false

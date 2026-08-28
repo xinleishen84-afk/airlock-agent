@@ -201,3 +201,72 @@ func (t *TierNumber) UnmarshalYAML(node *yaml.Node) error {
 	*t = TierNumber(raw)
 	return nil
 }
+
+// SessionConsistencyMode 声明会话保险库在本部署里如何保持跨轮一致。
+// Declares how the session vault stays consistent across turns here.
+//
+// # 为什么这是必填项而不是有默认值的开关
+// # Why this is required rather than a defaulted toggle
+//
+// 保险库把「真实值 -> 占位符」的映射存在进程内存里，占位符是按类型递增的
+// 序号（PHONE_0、PHONE_1……）。序号由该副本见过的文本顺序决定，因此两个
+// 副本对同一会话会给出不同的编号。
+//
+// 实测：同一会话下，副本 A 把 13800138000 编成 PHONE_0，副本 B 把
+// 13900139000 也编成 PHONE_0。上游回一句引用 PHONE_0 的话，A 复原成
+// 13800138000，B 复原成 13900139000——用户会拿到别人的号码。全程不报错。
+//
+// 客户端每轮重发完整历史时不会出事：分配顺序由文本确定，两个副本算出
+// 一样的编号。但长会话普遍会裁剪或摘要历史，一旦裁掉早先的轮次，顺序
+// 就变了。也就是说：**会话越长越容易出事**，而短会话测不出来。
+//
+// 这条约束此前只写在 README 里，而出货的 deploy/core.yaml 是 replicas: 3。
+// 一条没人执行的注记不是控制措施，所以把它变成必须显式声明的配置：
+// 运维要么承诺入口做了按会话的一致性哈希，要么承认自己是单副本。
+//
+// The vault holds the value→placeholder map in process memory, and placeholders
+// are per-type ordinals whose numbering depends on the order that replica
+// happened to see. Measured: in one session replica A numbered 13800138000 as
+// PHONE_0 while replica B numbered 13900139000 as PHONE_0; a response citing
+// PHONE_0 restores to a different real number on each — the user receives
+// someone else's data, silently.
+//
+// Resending full history each turn hides this, because ordering is then derived
+// from the text. Long sessions trim or summarize history, which changes the
+// ordering — so the failure grows more likely the longer a conversation runs,
+// and short tests never see it.
+//
+// This constraint lived only in the README while the shipped manifest set
+// replicas: 3. An unenforced note is not a control, so the invariant is now a
+// required declaration: either the ingress guarantees per-session affinity, or
+// the operator states this is a single replica.
+type SessionConsistencyMode string
+
+const (
+	// SessionSingleReplica：只跑一个副本，保险库天然唯一。
+	SessionSingleReplica SessionConsistencyMode = "single-replica"
+	// SessionAffinity：入口按 session id 做一致性哈希，同一会话恒落同一副本。
+	SessionAffinity SessionConsistencyMode = "session-affinity"
+)
+
+// SessionConsistencyNames 返回全部合法取值。
+func SessionConsistencyNames() []string {
+	return []string{string(SessionSingleReplica), string(SessionAffinity)}
+}
+
+// UnmarshalYAML 解析并校验会话一致性声明。
+func (m *SessionConsistencyMode) UnmarshalYAML(node *yaml.Node) error {
+	var raw string
+	if err := node.Decode(&raw); err != nil {
+		return fmt.Errorf("第 %d 行：会话一致性声明必须是字符串", node.Line)
+	}
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	for _, known := range SessionConsistencyNames() {
+		if known == normalized {
+			*m = SessionConsistencyMode(normalized)
+			return nil
+		}
+	}
+	return fmt.Errorf("第 %d 行：未知的会话一致性声明 %q。合法取值：%s",
+		node.Line, raw, strings.Join(SessionConsistencyNames(), " / "))
+}
