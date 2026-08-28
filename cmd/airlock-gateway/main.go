@@ -394,6 +394,9 @@ func mux(h *proxy.Handler, state *lifecycle.State, tracker *lifecycle.Tracker) h
 		fmt.Fprintf(w, "gateway_client_abort_total %d\n", s.ClientAbort.Load())
 		fmt.Fprintf(w, "gateway_pii_leak_blocked_total %d\n", s.LeakBlocked.Load())
 		fmt.Fprintf(w, "gateway_ttft_avg_ms %d\n", s.AvgTTFT().Milliseconds())
+		// 工具调用轮单独一条：与上面那条混在一起会让 TTFT 变成双峰均值
+		fmt.Fprintf(w, "gateway_toolcall_ttft_avg_ms %d\n",
+			s.AvgToolCallTTFT().Milliseconds())
 		fmt.Fprintf(w, "gateway_gpu_shed_total %d\n", s.GPUShed.Load())
 		fmt.Fprintf(w, "gateway_prefix_pinned_total %d\n", s.PrefixPinned.Load())
 		fmt.Fprintf(w, "gateway_gomaxprocs %d\n", runtime.GOMAXPROCS(0))

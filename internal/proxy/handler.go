@@ -67,17 +67,33 @@ type Stats struct {
 	// 停机轨迹验证需要精确归因：只有这个计数在 SIGTERM 后上涨，
 	// 才能证明「拒绝新入站」这一步真的发生了。
 	ShutdownRejected atomic.Int64
-	TTFTNanosSum     atomic.Int64
-	TTFTCount        atomic.Int64
+	// TTFT 只统计「用户看到第一个字」的延迟。工具调用轮单独计，
+	// 两者混在一个均值里会得到一个双峰分布的中点——既不描述对话，
+	// 也不描述工具调用，还不能用来定容量。
+	TTFTNanosSum atomic.Int64
+	TTFTCount    atomic.Int64
+	// ToolCallTTFT 是到第一个工具调用帧的延迟。它不是「用户感知延迟」，
+	// 而是 agent 编排的一环，性质与前者不同，因此分开而不是丢弃。
+	ToolCallTTFTNanosSum atomic.Int64
+	ToolCallTTFTCount    atomic.Int64
 }
 
-// AvgTTFT 返回平均首 token 延迟。
+// AvgTTFT 返回平均首 token 延迟（只含用户可见正文）。
 func (s *Stats) AvgTTFT() time.Duration {
 	n := s.TTFTCount.Load()
 	if n == 0 {
 		return 0
 	}
 	return time.Duration(s.TTFTNanosSum.Load() / n)
+}
+
+// AvgToolCallTTFT 返回到第一个工具调用帧的平均延迟。
+func (s *Stats) AvgToolCallTTFT() time.Duration {
+	n := s.ToolCallTTFTCount.Load()
+	if n == 0 {
+		return 0
+	}
+	return time.Duration(s.ToolCallTTFTNanosSum.Load() / n)
 }
 
 // Handler 是全链路 SSE 流式代理处理器。
@@ -411,6 +427,9 @@ func (h *Handler) stream(
 		restorer = document.NewStreamRestorer(h.deps.Redactor, scope)
 	}
 
+	// firstFrameAt 记录首个数据帧的时刻，用作形状不可识别时的兜底。
+	// 见下方 recordTTFT 的说明：宁可略微不精确，不可让指标静默消失。
+	var firstFrameAt time.Time
 	firstToken := true
 	h.stats.Streamed.Add(1)
 
@@ -428,6 +447,11 @@ func (h *Handler) stream(
 
 		if event.IsDone() {
 			if restorer != nil {
+				// 上游没吐 finish_reason 就结束时，屏障里仍压着工具调用。
+				// 必须发出去——吞掉会让客户端永远等一个不会到来的调用。
+				if frame := restorer.FlushToolCalls(ctx); frame != nil {
+					_ = WriteEvent(w, &Event{Data: frame})
+				}
 				// 吐出滞留缓冲里的最后一截。包成合法的增量帧发出——
 				// 里面可能压着占位符的后半截，丢掉就是丢内容。
 				tail, flushErr := restorer.Flush(ctx)
@@ -449,24 +473,46 @@ func (h *Handler) stream(
 					}
 				}
 			}
+			recordFallbackTTFT(&h.stats, firstToken, firstFrameAt, start, log)
+			firstToken = false
 			_ = WriteDone(w)
 			_ = rc.Flush()
 			break
 		}
 
-		// 首个数据帧 = TTFT。这是流式架构最核心的指标。
+		// 首个**有内容**的数据帧 = TTFT。
+		//
+		// 打点在收到帧时，早于复原与屏障缓冲，因此屏障的延迟 Flush
+		// 不会污染这个数字——它量的是上游到网关，不是网关到客户端。
+		//
+		// 但帧的类别必须分开：工具调用帧里没有用户能看到的东西，
+		// 与正文帧混进同一个均值会得到双峰分布的中点。
 		if firstToken {
-			firstToken = false
-			ttft := time.Since(start)
-			h.stats.TTFTNanosSum.Add(ttft.Nanoseconds())
-			h.stats.TTFTCount.Add(1)
-			log.Debug("首 token 抵达", "ttft_ms", ttft.Milliseconds())
+			if firstFrameAt.IsZero() {
+				firstFrameAt = time.Now()
+			}
+			switch document.ClassifyFrame(event.Data) {
+			case document.FrameText:
+				firstToken = false
+				ttft := time.Since(start)
+				h.stats.TTFTNanosSum.Add(ttft.Nanoseconds())
+				h.stats.TTFTCount.Add(1)
+				log.Debug("首 token 抵达", "ttft_ms", ttft.Milliseconds())
+			case document.FrameToolCall:
+				firstToken = false
+				d := time.Since(start)
+				h.stats.ToolCallTTFTNanosSum.Add(d.Nanoseconds())
+				h.stats.ToolCallTTFTCount.Add(1)
+				log.Debug("首个工具调用帧抵达", "delay_ms", d.Milliseconds())
+			}
+			// FrameOther（role 声明、usage 帧等）不计——它不是 token，
+			// 继续看下一帧。全程都识别不出来时由下方兜底补记。
 		}
 
 		// 从 chunk 中抽取用量（上游通常在末帧带 usage）
 		accumulateUsage(&usage, event.Data)
 
-		out := event
+		outs := []*Event{event}
 		if restorer != nil {
 			// 入站复原走结构化 AST：解析 JSON -> 在结构上替换 -> 重新序列化。
 			// 绝不在原始 JSON 文本上做字符串替换——真实值含引号或换行时
@@ -475,13 +521,27 @@ func (h *Handler) stream(
 			// 占位符可能横跨两个 chunk，滞留缓冲会处理，因此本帧的
 			// content 可能变成空串——那是正常的，不是丢帧，
 			// 且必须照常发出（帧里可能还带着 finish_reason 等其他字段）。
-			out = &Event{Event: event.Event, ID: event.ID, Data: restorer.Frame(ctx, event.Data)}
+			//
+			// 可能返回多帧：工具调用屏障在放行时补发一个装着完整入参的帧。
+			// 补发帧不带原帧的 event/id——它是本网关合成的，
+			// 不是上游那一帧的一部分。
+			frames := restorer.Frame(ctx, event.Data)
+			outs = outs[:0]
+			for i, f := range frames {
+				if i == 0 {
+					outs = append(outs, &Event{Event: event.Event, ID: event.ID, Data: f})
+					continue
+				}
+				outs = append(outs, &Event{Data: f})
+			}
 		}
 
-		if err := WriteEvent(w, out); err != nil {
-			// 写失败几乎总是客户端断连
-			h.stats.ClientAbort.Add(1)
-			return usage, err
+		for _, out := range outs {
+			if err := WriteEvent(w, out); err != nil {
+				// 写失败几乎总是客户端断连
+				h.stats.ClientAbort.Add(1)
+				return usage, err
+			}
 		}
 		// **每帧必须 Flush**。少了这一句，token 会积在 net/http 的写缓冲里
 		// 攒够 4KB 才发出——流式就退化成了批式。
@@ -489,6 +549,8 @@ func (h *Handler) stream(
 			return usage, err
 		}
 	}
+
+	recordFallbackTTFT(&h.stats, firstToken, firstFrameAt, start, log)
 
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
 		return usage, err
@@ -750,4 +812,39 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// recordFallbackTTFT 在帧形状无法识别时补记 TTFT。
+// Records TTFT as a fallback when no frame shape could be classified.
+//
+// # 为什么必须有这条兜底
+// # Why this fallback is mandatory
+//
+// TTFT 的归类依赖于认得出 choices[].delta 这个形状。上游换个协议
+// （Anthropic 的 content_block_delta、某个自研网关的变体），分类器一律
+// 返回 FrameOther，两个计数器都不涨——指标从 /metrics 上静默归零，
+// 看起来像「没有流量」而不是「认不出形状」。
+//
+// 实测：一条 {"delta":"a"} 的桩流就足以让 TTFT 记录数变成 0。
+//
+// 因此形状认不出时退回「首个数据帧的时刻」，也就是本函数替换掉的那个
+// 旧口径。精度略降，但指标不会消失。
+//
+// Classification depends on recognizing the choices[].delta shape. Against a
+// different upstream protocol every frame classifies as FrameOther, neither
+// counter moves, and the metric silently reads zero on /metrics — looking like
+// "no traffic" rather than "unrecognized shape". Measured: a stub stream of
+// {"delta":"a"} was enough to drop the TTFT count to zero. Falling back to the
+// first data frame's timestamp — the old definition — loses precision but never
+// loses the metric.
+func recordFallbackTTFT(stats *Stats, pending bool, firstFrameAt, start time.Time,
+	log *slog.Logger) {
+	if !pending || firstFrameAt.IsZero() {
+		return
+	}
+	ttft := firstFrameAt.Sub(start)
+	stats.TTFTNanosSum.Add(ttft.Nanoseconds())
+	stats.TTFTCount.Add(1)
+	log.Debug("帧形状未能识别，TTFT 按首个数据帧计",
+		"ttft_ms", ttft.Milliseconds())
 }

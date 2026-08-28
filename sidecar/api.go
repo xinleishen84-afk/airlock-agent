@@ -97,7 +97,22 @@ type RestoreRequest struct {
 // 是复原结果。
 type RestoreResponse struct {
 	Payload map[string]any `json:"payload,omitempty"`
-	Text    string         `json:"text,omitempty"`
+	// ReleasedToolCalls 是工具调用屏障放行时补出的那一帧。
+	//
+	// 工具入参不逐帧复原——分片攒齐后才按结构还原一次，否则会在半截
+	// JSON 文本上做替换（真值含引号即产出非法 JSON）。因此一个入参分片
+	// 请求可能返回两份载荷：本帧（入参已被抹空）与放行帧。
+	// 调用方必须把它也发给下游，否则工具永远等不到参数。
+	//
+	// The frame emitted when the tool-call barrier releases. Tool arguments are
+	// not restored per frame: fragments are assembled and restored once
+	// structurally, because substituting inside half a JSON document produces
+	// invalid JSON as soon as a real value contains a quote. One fragment
+	// request can therefore return two payloads — this frame (arguments
+	// blanked) and the release frame. Callers must forward both, or the tool
+	// never receives its arguments.
+	ReleasedToolCalls map[string]any `json:"released_tool_calls,omitempty"`
+	Text              string         `json:"text,omitempty"`
 	// Restored 是成功还原的占位符数量
 	Restored int `json:"restored"`
 	// Phantom 是模型凭空捏造、无法还原的占位符。

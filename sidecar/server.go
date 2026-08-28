@@ -499,10 +499,18 @@ func (s *Server) handleStreamRestore(w http.ResponseWriter, r *http.Request,
 			s.fail(w, http.StatusBadRequest, "序列化分片失败", false)
 			return
 		}
-		out := restorer.Frame(r.Context(), raw)
-		var doc map[string]any
-		if json.Unmarshal(out, &doc) == nil {
-			resp.Payload = doc
+		frames := restorer.Frame(r.Context(), raw)
+		for i, f := range frames {
+			var doc map[string]any
+			if json.Unmarshal(f, &doc) != nil {
+				continue
+			}
+			if i == 0 {
+				resp.Payload = doc
+				continue
+			}
+			// 屏障放行帧：调用方必须一并转发给下游
+			resp.ReleasedToolCalls = doc
 		}
 	} else {
 		// 纯文本分片：Frame 期望 JSON，此处退回逐段复原

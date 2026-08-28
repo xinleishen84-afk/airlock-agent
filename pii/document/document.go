@@ -450,11 +450,18 @@ var responseRules = []pathRule{
 		kind: kindText,
 		desc: "流式增量思考过程",
 	},
-	{
-		path: seg("choices", "[*]", "delta", "tool_calls", "[*]", "function", "arguments"),
-		kind: kindText,
-		desc: "流式工具入参片段——是不完整的 JSON 分片，按纯文本处理",
-	},
+	// 流式工具入参不在此表中——它由 StreamRestorer 的工具调用屏障独占处理。
+	//
+	// 曾经在这里，kind 是 kindText，即在半截 JSON 文本上做替换。实测真值
+	// 含引号时直接产出 {"who":"李"小"娜"} 这种非法 JSON，下游工具解析器
+	// 罢工。本文件另一处注释写着「绝不在原始 JSON 文本上做字符串替换」，
+	// 这条规则恰恰在做那件事。攒齐整段再按结构复原，这一整类问题不复存在。
+	//
+	// Streaming tool arguments are absent here by design — the tool-call
+	// barrier in StreamRestorer owns them. This rule used kindText, i.e. text
+	// substitution on half a JSON document; a real value containing a quote
+	// produced invalid JSON and broke the downstream tool's parser. Buffering
+	// the whole argument and restoring it structurally removes the class.
 	{
 		path: seg("choices", "[*]", "message", "content"),
 		kind: kindText,
@@ -516,30 +523,47 @@ type StreamRestorer struct {
 	scope    anonymize.StrategyScope
 	buffers  map[string]*anonymize.StreamUnredactor
 	phantom  []string
+
+	// 工具调用屏障：入参分片按 choice:index 攒着，放行时一次性复原
+	toolArgs  map[string]*strings.Builder
+	toolShape map[string]map[string]any // 保留 index/id/name 以便回填
+	toolOrder []string                  // 放行顺序＝首次出现顺序
 }
 
 // NewStreamRestorer creates a restorer for one stream.
 // 为一条流创建复原器。
 func NewStreamRestorer(r *anonymize.Redactor, scope anonymize.StrategyScope) *StreamRestorer {
 	return &StreamRestorer{
-		redactor: r,
-		scope:    scope,
-		buffers:  make(map[string]*anonymize.StreamUnredactor, 2),
+		redactor:  r,
+		scope:     scope,
+		buffers:   make(map[string]*anonymize.StreamUnredactor, 2),
+		toolArgs:  map[string]*strings.Builder{},
+		toolShape: map[string]map[string]any{},
 	}
 }
 
-// Frame restores one SSE data frame and returns the new frame content.
-// 复原一个 SSE 数据帧，返回新的帧内容。
+// Frame restores one SSE data frame and returns the frames to emit, in order.
+// 复原一个 SSE 数据帧，返回应当依次发出的帧。
+//
+// 返回切片而非单帧：工具调用屏障会在放行时补发一个装着完整入参的帧。
+// 绝大多数情况下返回恰好一帧。
+//
+// Returns a slice rather than one frame because the tool-call barrier emits an
+// extra frame carrying the assembled arguments when it releases. The common
+// case is exactly one frame.
 //
 // A frame that does not parse as JSON is returned verbatim: upstream may emit
 // non-JSON heartbeats or error text, and doing nothing is safer than guessing.
 // 帧无法解析为 JSON 时原样返回：上游可能吐出非 JSON 的心跳或错误文本，
 // 此时不做任何替换比猜测更安全。
-func (s *StreamRestorer) Frame(ctx context.Context, data []byte) []byte {
+func (s *StreamRestorer) Frame(ctx context.Context, data []byte) [][]byte {
 	var doc map[string]any
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return data
+		return [][]byte{data}
 	}
+
+	// 工具调用先被屏障截走：入参分片只入缓冲，不参与逐帧复原。
+	released := s.absorbToolCalls(doc)
 
 	// 用结构路径区分不同的文本流。
 	//
@@ -549,27 +573,9 @@ func (s *StreamRestorer) Frame(ctx context.Context, data []byte) []byte {
 	// delta.tool_calls[0].function.arguments，两者都是帧内第 0 个字段，
 	// 于是共用同一个滞留缓冲。
 	//
-	// 实测后果：正文压住的占位符前缀被拼到工具入参前面，整段入参被判为
-	// 疑似占位符继续滞留，下游工具收到空参数；而入参 JSON 最终随 Flush
-	// 作为正文增量帧吐给了用户。三处都不报错。
-	//
-	// 结构路径同时解决并行工具调用：数组下标在路径里，
-	// tool_calls.0 与 tool_calls.1 天然落到两个缓冲上。
-	//
 	// This was keyed by ordinal position within the frame, on the premise that
 	// the same position across frames is the same text stream. That premise
-	// fails for agent traffic: frames carry different field subsets, so
-	// delta.content and delta.tool_calls[0].function.arguments are each the
-	// frame's first restorable field and shared one buffer.
-	//
-	// Measured: the body's held-back placeholder prefix was prepended to the
-	// tool arguments, the whole argument was then held as a suspected
-	// placeholder so the tool received empty arguments, and the argument JSON
-	// was finally emitted to the user as a content delta on Flush. None of the
-	// three raised an error.
-	//
-	// Structural paths also separate parallel tool calls: the array index is
-	// part of the path, so tool_calls.0 and tool_calls.1 get their own buffers.
+	// fails for agent traffic: frames carry different field subsets.
 	err := RestoreDocument(doc, func(key, text string) (string, error) {
 		buf, ok := s.buffers[key]
 		if !ok {
@@ -579,15 +585,213 @@ func (s *StreamRestorer) Frame(ctx context.Context, data []byte) []byte {
 		return buf.Feed(ctx, text)
 	})
 	if err != nil {
-		return data
+		return [][]byte{data}
 	}
 
 	out, err := MarshalPreserving(doc)
 	if err != nil {
 		// 序列化失败时退回原帧，绝不产出半截 JSON
-		return data
+		return [][]byte{data}
+	}
+
+	frames := [][]byte{out}
+	if extra := s.renderReleased(ctx, released); extra != nil {
+		frames = append(frames, extra)
+	}
+	return frames
+}
+
+// absorbToolCalls 把本帧里的工具入参分片吸进屏障缓冲，并从帧中抹去。
+// Absorbs this frame's tool-argument fragments into the barrier and blanks them.
+//
+// # 为什么工具入参不能逐帧复原
+// # Why tool arguments cannot be restored frame by frame
+//
+// 工具入参是给机器的结构化载荷，不是给人看的文本——逐帧吐出去没有任何
+// 延迟收益，却要在半截 JSON 上做文本替换。实测三类故障，全部静默：
+//
+//   - 真值含引号时产出 {"who":"李"小"娜"}，下游工具解析器罢工
+//   - 占位符跨帧劈开时两半落进不同缓冲，工具收到字面量 "ME_0"
+//   - 流末尾残留被当作 delta.content 发给用户，同时工具收到截断的 JSON
+//
+// 攒齐整段再按结构复原一次，这三类同时消失：替换发生在解析后的值上，
+// 占位符不可能被劈开，也不存在需要另找地方吐的残留。
+//
+// Tool arguments are a machine payload, not text a human reads — streaming them
+// buys no latency and forces text substitution on half a JSON document. Three
+// measured failure modes, all silent: a real value containing a quote produced
+// invalid JSON; a placeholder split across frames landed in two buffers and the
+// tool received the literal "ME_0"; end-of-stream residue was emitted to the
+// user as content while the tool got truncated JSON. Assembling first and
+// restoring once removes all three.
+func (s *StreamRestorer) absorbToolCalls(doc map[string]any) []string {
+	choices, ok := doc["choices"].([]any)
+	if !ok {
+		return nil
+	}
+	var release []string
+	for ci, c := range choices {
+		choice, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		choiceID := elementID(choice, ci)
+		delta, _ := choice["delta"].(map[string]any)
+		if delta != nil {
+			if calls, ok := delta["tool_calls"].([]any); ok {
+				for pos, raw := range calls {
+					call, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					fn, ok := call["function"].(map[string]any)
+					if !ok {
+						continue
+					}
+					frag, ok := fn["arguments"].(string)
+					if !ok {
+						continue
+					}
+					key := choiceID + ":" + elementID(call, pos)
+					if s.toolArgs == nil {
+						s.toolArgs = map[string]*strings.Builder{}
+					}
+					b, ok := s.toolArgs[key]
+					if !ok {
+						b = &strings.Builder{}
+						s.toolArgs[key] = b
+						s.toolOrder = append(s.toolOrder, key)
+						s.toolShape[key] = call
+					}
+					b.WriteString(frag)
+					// 分片从本帧抹去：屏障放行前不向下游吐任何入参
+					fn["arguments"] = ""
+				}
+			}
+		}
+		// finish_reason 出现即为屏障放行点——该 choice 的工具调用已完整
+		if fr, exists := choice["finish_reason"]; exists && fr != nil {
+			for _, key := range s.toolOrder {
+				if strings.HasPrefix(key, choiceID+":") {
+					release = append(release, key)
+				}
+			}
+		}
+	}
+	return release
+}
+
+// renderReleased 把放行的工具调用还原成一个完整的增量帧。
+// Renders released tool calls as one complete delta frame.
+//
+// 客户端按 index 拼接 arguments，因此「一次性给出完整字符串」与
+// 「分多次给出」在协议上等价——屏障不改变客户端看到的最终结果，
+// 只改变它何时看到，以及看到的是不是合法 JSON。
+//
+// Clients concatenate arguments by index, so delivering the whole string at
+// once is protocol-equivalent to delivering it in pieces. The barrier changes
+// when the client sees it and whether it is valid JSON, not what it assembles.
+func (s *StreamRestorer) renderReleased(ctx context.Context, keys []string) []byte {
+	if len(keys) == 0 {
+		return nil
+	}
+	byChoice := map[string][]any{}
+	for _, key := range keys {
+		b, ok := s.toolArgs[key]
+		if !ok {
+			continue
+		}
+		delete(s.toolArgs, key)
+		choiceID, _, _ := strings.Cut(key, ":")
+		restored := s.restoreArgs(ctx, b.String())
+
+		shape := s.toolShape[key]
+		call := map[string]any{
+			"function": map[string]any{"arguments": restored},
+		}
+		// 回填 index / id / name：客户端靠它们把分片归位
+		for _, f := range []string{"index", "id", "type"} {
+			if v, ok := shape[f]; ok {
+				call[f] = v
+			}
+		}
+		if fn, ok := shape["function"].(map[string]any); ok {
+			if n, ok := fn["name"]; ok {
+				call["function"].(map[string]any)["name"] = n
+			}
+		}
+		byChoice[choiceID] = append(byChoice[choiceID], call)
+	}
+	if len(byChoice) == 0 {
+		return nil
+	}
+	var choices []any
+	for choiceID, calls := range byChoice {
+		c := map[string]any{"delta": map[string]any{"tool_calls": calls}}
+		if n, err := strconv.Atoi(choiceID); err == nil {
+			c["index"] = n
+		}
+		choices = append(choices, c)
+	}
+	out, err := MarshalPreserving(map[string]any{"choices": choices})
+	if err != nil {
+		return nil
 	}
 	return out
+}
+
+// restoreArgs 对完整的工具入参做结构化复原。
+// Restores a complete tool-argument payload structurally.
+//
+// 走 transformJSONString：解析后只替换值，键名（工具 schema 定义的参数名）
+// 原样保留，真值里的引号与换行由重新序列化负责转义。
+//
+// 解析失败时退回文本复原：模型偶尔生成非法 JSON，此时它已经是坏的，
+// 至少要保证占位符被换成真值，而不是把占位符原样交给工具。
+//
+// Parse failure falls back to text restoration: the model occasionally emits
+// invalid JSON, and at that point the payload is already broken — better to at
+// least resolve the placeholders than hand them to the tool verbatim.
+func (s *StreamRestorer) restoreArgs(ctx context.Context, raw string) string {
+	plain := func(_, text string) (string, error) {
+		res, err := s.redactor.Unredact(ctx, text, s.scope)
+		if err != nil {
+			return "", err
+		}
+		s.phantom = append(s.phantom, res.Phantom...)
+		return res.Text, nil
+	}
+	v, err := transformJSONString(raw, "", plain)
+	if err != nil {
+		return raw
+	}
+	if out, ok := v.(string); ok {
+		return out
+	}
+	return raw
+}
+
+// FlushToolCalls 放行流结束时仍未放行的工具调用。
+// Releases tool calls still held when the stream ends.
+//
+// 上游可能没吐 finish_reason 就结束（截断、连接断开）。此时缓冲里压着的
+// 是完整或半截的入参——半截的入参本身已经坏了，但仍要发出去，
+// 因为吞掉它会让客户端永远等一个不会到来的工具调用。
+//
+// Upstream may end without a finish_reason (truncation, disconnect). Whatever
+// is buffered must still be emitted: swallowing it leaves the client waiting
+// forever for a tool call that never arrives.
+func (s *StreamRestorer) FlushToolCalls(ctx context.Context) []byte {
+	if len(s.toolArgs) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(s.toolArgs))
+	for _, k := range s.toolOrder {
+		if _, ok := s.toolArgs[k]; ok {
+			keys = append(keys, k)
+		}
+	}
+	return s.renderReleased(ctx, keys)
 }
 
 // Flush emits whatever remains in each buffer at end of stream.
@@ -696,4 +900,67 @@ func elementID(item any, pos int) string {
 		return strconv.Itoa(int(n))
 	}
 	return strconv.Itoa(pos)
+}
+
+// FrameClass 是一个 SSE 数据帧携带的内容类别。
+// The kind of payload an SSE data frame carries.
+type FrameClass uint8
+
+const (
+	// FrameOther：既无正文也无工具调用（角色声明、usage、纯 finish_reason 等）
+	FrameOther FrameClass = iota
+	// FrameText：携带用户可见正文
+	FrameText
+	// FrameToolCall：只携带工具调用，用户看不到任何东西
+	FrameToolCall
+)
+
+// ClassifyFrame 判断一个 SSE 数据帧携带的是正文还是工具调用。
+// Classifies whether an SSE frame carries body text or a tool call.
+//
+// # 为什么这个区分值得单独算一次 JSON 解析
+// # Why this distinction is worth one extra JSON parse
+//
+// TTFT 的含义是「用户多久看到第一个字」。工具调用帧里没有任何用户能看到
+// 的东西——它是发给机器的载荷，客户端要等整个调用拼完才能动作。把两者
+// 混进同一个平均值，指标会变成双峰分布：纯对话与工具调用轮的延迟性质
+// 不同，均值落在两峰之间，既不描述任何一类，也无法用来定容量。
+//
+// 解析成本可以忽略：分类只在流的开头做，一旦定性就不再解析。
+//
+// TTFT means "how long until the user sees the first character". A tool-call
+// frame contains nothing a user sees — it is a machine payload the client
+// cannot act on until the whole call is assembled. Averaging both yields a
+// bimodal metric whose mean describes neither population.
+//
+// The parse is negligible: classification runs only at the head of a stream and
+// stops once the stream is characterized.
+func ClassifyFrame(data []byte) FrameClass {
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return FrameOther
+	}
+	choices, ok := doc["choices"].([]any)
+	if !ok {
+		return FrameOther
+	}
+	for _, c := range choices {
+		choice, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		delta, ok := choice["delta"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, f := range []string{"content", "reasoning_content", "text"} {
+			if v, ok := delta[f].(string); ok && v != "" {
+				return FrameText
+			}
+		}
+		if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
+			return FrameToolCall
+		}
+	}
+	return FrameOther
 }

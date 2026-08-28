@@ -73,7 +73,11 @@ func TestStreamRestoreHandlesSplitPlaceholder(t *testing.T) {
 
 	var assembled strings.Builder
 	for _, f := range frames {
-		out := restorer.Frame(t.Context(), []byte(f))
+		fs := restorer.Frame(t.Context(), []byte(f))
+		if len(fs) != 1 {
+			t.Fatalf("期望一帧，实得 %d", len(fs))
+		}
+		out := fs[0]
 		var probe map[string]any
 		if err := json.Unmarshal(out, &probe); err != nil {
 			t.Fatalf("输出帧非法 JSON: %s (%v)", out, err)
