@@ -75,7 +75,19 @@ var (
 	singleSurname = flag.Bool("single-surnames", false,
 		"启用单姓识别。实测在对抗性语料上召回零增益、误报十四处，因此默认关闭")
 
-	sessionTTL  = flag.Duration("session-ttl", time.Hour, "脱敏映射存活时长")
+	sessionTTL = flag.Duration("session-ttl", time.Hour, "脱敏映射存活时长")
+
+	// Advanced 与 Core 持有同一种会话保险库，因此受同一条约束。
+	// 校验实现在 sidecar 包里共用一份——分散在各个 main 里就会漂移成
+	// 「有的进程管、有的不管」，本行缺失时部署清单传的这个 flag 会让
+	// Advanced Pod 以「flag provided but not defined」崩溃循环。
+	//
+	// Advanced holds the same vault as Core and is under the same constraint.
+	// The check is shared in the sidecar package; duplicating it per main is
+	// what let this binary drift into not having the flag at all while the
+	// manifest already passed it.
+	sessionConsistency = flag.String("session-consistency", "",
+		sidecar.SessionConsistencyFlagUsage)
 	maxSessions = flag.Int("max-sessions", 100_000, "活跃会话上限")
 	logLevel    = flag.String("log-level", "info", "日志级别")
 )
@@ -174,6 +186,12 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	logger.Info("证据链已装配", "覆盖类型", validator.Types())
+
+	if err := sidecar.ValidateSessionConsistency(*sessionConsistency); err != nil {
+		logger.Error("会话一致性声明缺失或非法", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("会话一致性声明", "mode", *sessionConsistency)
 
 	resolver, err := buildTenantResolver()
 	if err != nil {
