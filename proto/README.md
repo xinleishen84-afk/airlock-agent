@@ -14,13 +14,13 @@ protoc -I proto \
   --go-grpc_out=. --go-grpc_opt=module=github.com/xinleishen84-afk/airlock-agent \
   proto/pii/v1/ner.proto
 
-# Python（在仓库上一级目录执行）
+# Python（在仓库根目录执行）
 python -m grpc_tools.protoc \
-  -I airlock-agent/proto \
-  --python_out=pii/service/genproto \
-  --grpc_python_out=pii/service/genproto \
-  --pyi_out=pii/service/genproto \
-  airlock-agent/proto/pii/v1/ner.proto
+  -I proto \
+  --python_out=analyzer/pii/service/genproto \
+  --grpc_python_out=analyzer/pii/service/genproto \
+  --pyi_out=analyzer/pii/service/genproto \
+  proto/pii/v1/ner.proto
 ```
 
 生成的 Python 桩用的是绝对 import（`from pii.v1 import ner_pb2`），

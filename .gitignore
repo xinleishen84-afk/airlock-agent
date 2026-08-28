@@ -20,3 +20,9 @@ coverage.html
 .idea/
 .vscode/
 *.swp
+
+# Python 分析器
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/

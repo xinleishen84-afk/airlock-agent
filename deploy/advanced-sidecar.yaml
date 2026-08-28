@@ -60,6 +60,7 @@ spec:
             periodSeconds: 5
 
         - name: analyzer
+          # 构建：docker build -t airlock-analyzer -f analyzer/Dockerfile analyzer/
           image: ghcr.io/xinleishen84-afk/airlock-analyzer:latest
           args:
             - --socket=/var/run/airlock/ner.sock

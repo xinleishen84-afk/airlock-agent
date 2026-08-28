@@ -602,6 +602,8 @@ sidecar/             HTTP 服务实现 + 租户解析 + 管理面快照
 eval/                量化评测框架（语料、打分、延迟、吞吐、还原准确率）
 cmd/airlock-agent/   sidecar 二进制 ← 主要交付物
 otelprocessor/       OTel Collector 处理器（独立模块）
+analyzer/            PII 分析器（Python）：spaCy NER，gRPC over UDS。
+                     镜像构建上下文就是这一个目录，Core 模式完全不需要它。
 test/integration/    集成测试（独立模块，testcontainers）
 
 cmd/airlock-gateway/ 演示用参考网关。不与 Envoy/APISIX 竞争，

@@ -38,6 +38,10 @@ spec:
         runAsNonRoot: true
       containers:
         - name: analyzer
+          # 构建：docker build -t airlock-analyzer -f analyzer/Dockerfile analyzer/
+          # 构建上下文刻意只是 analyzer/：镜像里不该混进与推理无关的 Go 代码。
+          # Build context is analyzer/ alone: the image should not carry Go code
+          # that has nothing to do with inference.
           image: ghcr.io/xinleishen84-afk/airlock-analyzer:latest
           args:
             - --listen=0.0.0.0:9090

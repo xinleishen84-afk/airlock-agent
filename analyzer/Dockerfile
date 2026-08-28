@@ -1,0 +1,64 @@
+# PII 分析器（Python）—— 把重型依赖封在镜像里，对 Go 网关彻底屏蔽。
+#
+# The Python analyzer: heavy dependencies sealed inside the image, invisible to
+# the Go gateway.
+#
+# 这个镜像存在的理由是把「依赖炸开」的痛苦挪个位置：spaCy、gRPC 与几百 MB
+# 的模型都在这里，而网关那边仍然是一个 11MB、只有一个外部依赖的二进制。
+# 痛苦没有消失，只是从「每个用网关的人」转移到了「运维这一个镜像的人」。
+#
+# The point is to relocate the dependency burden, not to remove it: spaCy, gRPC
+# and hundreds of megabytes of models live here, while the gateway stays an
+# 11MB binary with one dependency. Someone still carries the weight; it is now
+# whoever operates this one image.
+
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+# 依赖与模型分两层装：模型有几百 MB 且极少变，
+# 而依赖版本变动时不该把模型层一起作废。
+#
+# Dependencies and models in separate layers: the models are hundreds of
+# megabytes and rarely change, and a dependency bump should not invalidate them.
+RUN pip install --no-cache-dir --prefix=/install \
+        "spacy>=3.8.0" "grpcio>=1.60" "protobuf>=4.25"
+
+ARG MODELS="zh_core_web_md"
+RUN PYTHONPATH=/install/lib/python3.12/site-packages \
+    PATH=/install/bin:$PATH \
+    for m in ${MODELS}; do \
+        python -m spacy download "$m" --target /install/lib/python3.12/site-packages ; \
+    done
+
+FROM python:3.12-slim
+
+# 非 root 运行。这个进程返回的是「PII 在哪」，
+# 因此它拿到的权限越少越好。
+#
+# Runs as non-root: this process returns where the PII is, so it should hold as
+# little privilege as possible.
+RUN useradd --create-home --shell /usr/sbin/nologin analyzer
+
+COPY --from=builder /install /usr/local
+WORKDIR /app
+COPY --chown=analyzer:analyzer pii/ /app/pii/
+
+USER analyzer
+
+# UDS 与 TCP 两种形态都支持，由启动参数决定：
+#   同 Pod sidecar：--socket /var/run/airlock/ner.sock   （IPC ~110µs）
+#   独立 Service ：--listen 0.0.0.0:9090                 （可单独扩缩容）
+#
+# 默认走 TCP，因为独立部署是这个镜像的主要用途；同 Pod 部署时覆盖 command。
+ENV PYTHONUNBUFFERED=1
+EXPOSE 9090
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python -c "import grpc, sys; \
+from pii.service.genproto.pii.v1 import ner_pb2, ner_pb2_grpc; \
+ch = grpc.insecure_channel('127.0.0.1:9090'); \
+sys.exit(0 if ner_pb2_grpc.NERServiceStub(ch).Health(ner_pb2.HealthRequest(), timeout=4).ready else 1)"
+
+ENTRYPOINT ["python", "-m", "pii.service.ner_server"]
+CMD ["--listen", "0.0.0.0:9090", "--models", "zh=zh_core_web_md"]

@@ -1,0 +1,28 @@
+# PII 分析器的运行依赖。
+#
+# 这里**只列分析器自己需要的**，不含仓库外那套 LLM 客户端的依赖
+# （anthropic / python-dotenv 等）。两者的依赖面差一个数量级，混在一份
+# requirements 里会让「Core 模式零重依赖」这个卖点在安装环节就失效。
+#
+# Runtime dependencies of the analyzer only. Deliberately excludes the LLM
+# client stack that lives outside this repository: merging them would make the
+# "Core mode has no heavy dependencies" claim false at install time.
+
+spacy>=3.8.0      # NER 后端，仅 pii/detectors/providers/ 下 import
+grpcio>=1.60      # gRPC 服务端（Unix domain socket）
+protobuf>=4.25    # 契约见 ../proto/pii/v1/ner.proto
+
+# 模型不是 pip 依赖，需单独下载：
+#   python -m spacy download zh_core_web_md    # 74MB，中文
+#   python -m spacy download en_core_web_lg    # 400MB，拉丁文
+#   python -m spacy download zh_core_web_sm    # 13MB，更小的中文模型，实测召回率低 14 个百分点
+#
+# 两个语种都要装：服务端按文字系统切段路由，拿中文模型判拉丁文是分布外
+# 输入——实测它会把 declined、deps、Codice 判成人名。
+#
+# Both languages are required: the server routes by writing system, and feeding
+# Latin text to the Chinese model is out-of-distribution — measured, it labels
+# "declined", "deps" and "Codice" as person names.
+
+# 开发依赖（生成 gRPC 桩代码时才需要）：
+#   pip install grpcio-tools>=1.60
