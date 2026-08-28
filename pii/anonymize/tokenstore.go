@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -67,8 +68,48 @@ func (k TokenKey) Validate() error {
 	if k.Namespace == "" {
 		return fmt.Errorf("令牌命名空间不能为空 / token namespace is required")
 	}
+	// 命名空间同样要限制字符集，理由与租户一致：它会被拼进存储层的键。
+	//
+	// CacheTokenStore 的键是 前缀+租户+":"+命名空间+":t:"+令牌。租户的
+	// 字符集禁止了冒号，命名空间此前只查非空——两个不同的
+	// (命名空间, 令牌) 因此可以拼出同一个键，读到对方的原值。
+	//
+	// 现网走不到：复原路径上的命名空间由 tokenRe 的 [a-z0-9_]+ 捕获组
+	// 限定，冒号进不来。但那是另一个文件里的正则顺手保住的，而这里正是
+	// 校验这个键的地方，pii/* 又是文档里声明可单独 import 的公开包——
+	// 任何直接调用 Issue/Resolve 的人都能把它重新打开。
+	// composite() 的注释已经写明「分隔符必须是字符集禁止的字节」，
+	// 这里只是让 tokenKey 也真正满足那个前提。
+	//
+	// The namespace is joined into storage keys, so it needs the same charset
+	// restriction as the tenant. CacheTokenStore keys are
+	// prefix+tenant+":"+namespace+":t:"+token; the tenant charset forbids the
+	// colon while the namespace was only checked for emptiness, so two distinct
+	// (namespace, token) pairs could render one key and read each other's
+	// values.
+	//
+	// Not reachable in production today: on the restore path the namespace comes
+	// from tokenRe's [a-z0-9_]+ capture group. But that is a regex in another
+	// file holding the invariant by accident, while this is the function that
+	// validates the key — and pii/* is documented as separately importable, so
+	// any direct caller of Issue/Resolve reopens it. composite() already states
+	// that the separator must be a byte the charset forbids; this makes
+	// tokenKey actually satisfy that premise.
+	if !namespacePattern.MatchString(k.Namespace) {
+		return fmt.Errorf(
+			"令牌命名空间 %q 非法：只允许小写字母、数字与下划线，最长 64——"+
+				"它会被拼进存储层的键，其他字符可能让两个命名空间碰撞到同一个键 / "+
+				"invalid token namespace %q", k.Namespace, k.Namespace)
+	}
 	return nil
 }
+
+// namespacePattern 限定命名空间字符集。与 tokenRe 的捕获组保持一致，
+// 否则合法签发的令牌会在复原时被自己的校验拒掉。
+//
+// Kept in step with tokenRe's capture group; a mismatch would make legitimately
+// issued tokens fail their own validation on the way back.
+var namespacePattern = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 
 // composite renders the key as a storage-level composite key.
 // 把键渲染成存储层的复合键。

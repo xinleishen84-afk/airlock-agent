@@ -356,6 +356,10 @@ func (r *Redactor) Unredact(ctx context.Context, text string, scope StrategyScop
 
 // tokenRe matches a tokenize-operator output.
 // 匹配令牌化算子的输出。
+// tokenNamespaceRe 单独暴露 tokenRe 的命名空间部分，供一致性测试比对。
+// Exposes tokenRe's namespace component so the charset can be cross-checked.
+var tokenNamespaceRe = regexp.MustCompile(`^[a-z0-9_]+$`)
+
 var tokenRe = regexp.MustCompile(`\[tok:([a-z0-9_]+):([0-9a-fA-F]{8,64})\]`)
 
 // completeTokenRe tells whether a token has fully appeared.

@@ -90,6 +90,25 @@ func (m *Matrix) Add(f Flow) error {
 			f.Name, f.Name)
 	}
 
+	// 空算子必须在任何使用它之前拒掉。
+	//
+	// 这段校验原本在下方的 clone 循环里，而 Restores 分支会先对每个
+	// ByType 算子调 Reversible()——配了空算子且声明复原响应时，
+	// Add 会以 nil 解引用崩掉，而它存在的全部意义就是把配置错误
+	// 变成一句能读懂的话。校验顺序本身也是行为。
+	//
+	// The nil check used to live in the clone loop below, while the Restores
+	// branch already called Reversible() on every ByType entry — so a nil
+	// strategy plus Restores crashed Add on a nil dereference, in the one
+	// function whose entire purpose is turning bad config into a readable
+	// message. Validation order is behaviour too.
+	for _, typ := range sortedTypes(f.ByType) {
+		if f.ByType[typ] == nil {
+			return fmt.Errorf("链路 %q 的类型 %s 配了空算子 / nil strategy for %s",
+				f.Name, typ, typ)
+		}
+	}
+
 	if f.Restores {
 		var bad []string
 		if !f.Default.Reversible() {
@@ -113,9 +132,6 @@ func (m *Matrix) Add(f Flow) error {
 	if len(f.ByType) > 0 {
 		clone.ByType = make(map[detect.EntityType]Strategy, len(f.ByType))
 		for k, v := range f.ByType {
-			if v == nil {
-				return fmt.Errorf("链路 %q 的类型 %s 配了空算子 / nil strategy for %s", f.Name, k, k)
-			}
 			clone.ByType[k] = v
 		}
 	}
