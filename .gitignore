@@ -1,6 +1,19 @@
 # 构建产物 / build artifacts
+#
+# 逐个列名的坏处已经兑现过一次：/airlock-agent 在列表里，/airlock-gateway
+# 不在，于是一个 12MB 的编译二进制被提交进了仓库并存活了很多次提交。
+# Go 二进制会内嵌构建路径——那份产物里带着构建机的家目录。
+# 现在按 cmd/ 下的目录名统配，新增命令不会再漏。
+#
+# Listing artifacts by name failed once already: /airlock-agent was listed and
+# /airlock-gateway was not, so a 12MB compiled binary was committed and survived
+# many commits. Go embeds the build path, so that artifact carried the build
+# machine's home directory. Now matched by pattern so a new command cannot slip.
 /airlock
 /airlock-agent
+/airlock-gateway
+/airlock-agent-advanced
+/airlock-analyzer
 *.exe
 *.test
 *.out
