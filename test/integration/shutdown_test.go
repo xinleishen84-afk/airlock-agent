@@ -60,7 +60,16 @@ func startGateway(t *testing.T, cfgPath string, args ...string) *gatewayProcess 
 		_ = logFile.Close()
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
+			// 必须是 cmd.Wait 而不是 cmd.Process.Wait：Stdout/Stderr 是
+			// *bytes.Buffer 时 os/exec 走管道 + 拷贝协程，只有 cmd.Wait 会
+			// join 它们。绕过去读到的缓冲区是「拷了多少算多少」，且有数据竞争。
+			// 实测：被测进程因缺必填配置启动即退出，测试报「未在 N 秒内就绪」，
+			// 而紧跟其后的日志转储是空的——唯一能解释原因的那段，恰好丢了。
+			//
+			// Must be cmd.Wait: with a *bytes.Buffer sink, os/exec copies through
+			// goroutines that only cmd.Wait joins. Measured: a process exiting for
+			// missing required config reported "not ready" with an empty log dump.
+			_ = cmd.Wait()
 		}
 	})
 
@@ -216,6 +225,7 @@ rate_limit:
   window: 1m
 pii:
   jurisdictions: [GEN, CN]
+  session_consistency: single-replica
   fail_closed: true
   name_roster: ["张伟"]
 gpu:

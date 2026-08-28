@@ -191,6 +191,17 @@ jobs:
         working-directory: test/integration
         run: go test ./... -count=1 -run 'TestCoreBinary|TestCoreStartup' -v
 
+      # 部署清单与二进制的对齐。清单是 YAML，flag 定义在 Go 里，两者之间
+      # 没有任何编译期或测试期的连线——曾经出过一次：清单传了
+      # --session-consistency 而 Advanced 二进制没定义它，Pod 以
+      # "flag provided but not defined" 崩溃循环，而全部测试都是绿的。
+      #
+      # 同一组还核对清单引用的镜像在仓库里确实有东西能构建：分析器镜像
+      # 曾被清单引用了很久，而它的代码与 Dockerfile 都在仓库外。
+      - name: 部署清单对齐（无需 Docker）
+        working-directory: test/integration
+        run: go test ./... -count=1 -run 'TestManifest' -v
+
       - name: 五项能力验收（无需 Docker）
         working-directory: test/integration
         run: go test ./... -count=1 -timeout 5m -run 'TestAcceptance' -v
@@ -207,3 +218,64 @@ jobs:
         env:
           REQUIRE_INTEGRATION: "1"
         run: go test ./... -count=1 -timeout 15m -v
+
+  # PII 分析器（Python）。装模型要几分钟，因此与 Go 侧并行而不是串在后面。
+  #
+  # 这个 job 之前不存在，因为分析器的代码整个不在版本控制里——
+  # 契约 proto/pii/v1/ner.proto 在仓库内，实现在仓库外，
+  # 于是「两边遵守同一份契约」只有一边能被 CI 验证。
+  analyzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: analyzer/requirements.txt
+
+      - name: 安装依赖
+        working-directory: analyzer
+        run: pip install -r requirements.txt
+
+      # 不装模型也要能跑：分析器的依赖是可选的，测试在模型缺失时跳过而非
+      # 失败。先跑一遍无模型的，确认这条降级路径本身没坏——它是 Core 模式
+      # 用户实际会走的那条。
+      - name: 无模型时的降级路径
+        working-directory: analyzer
+        run: python -m unittest discover tests -v
+
+      - name: 下载中文模型
+        run: python -m spacy download zh_core_web_md
+
+      - name: 有模型时的完整测试
+        working-directory: analyzer
+        run: python -m unittest discover tests -v
+
+      # 真正拉起服务，确认它能在 UDS 上就绪并把 socket 建成 0600。
+      # 权限不是可选项：TCP 模式下这道文件权限闸门会静默消失。
+      - name: 服务可启动且 socket 权限正确
+        working-directory: analyzer
+        run: |
+          rm -f /tmp/airlock-ner.sock
+          python -m pii.service.ner_server --socket /tmp/airlock-ner.sock \
+              --models zh=zh_core_web_md &
+          for i in $(seq 1 60); do
+            [ -S /tmp/airlock-ner.sock ] && break
+            sleep 2
+          done
+          if [ ! -S /tmp/airlock-ner.sock ]; then
+            echo "NER 服务未在 120 秒内就绪"; exit 1
+          fi
+          perm=$(stat -c '%a' /tmp/airlock-ner.sock)
+          if [ "$perm" != "600" ]; then
+            echo "socket 权限为 $perm，应为 600——任何本地进程都能连上它，"
+            echo "而它两端传的是明文 PII"
+            exit 1
+          fi
+          echo "NER 服务就绪，socket 权限 $perm"
+
+      # 镜像必须真的能构建。清单引用它，README 让人 docker build 它，
+      # 而在它进版本控制之前，这两句话都无人验证过。
+      - name: 分析器镜像可构建
+        run: docker build -t airlock-analyzer:ci -f analyzer/Dockerfile analyzer/

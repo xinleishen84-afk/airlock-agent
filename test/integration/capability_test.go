@@ -62,7 +62,24 @@ func binaryUnderTest(t *testing.T, name string, args ...string) string {
 	}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		// 必须是 cmd.Wait 而不是 cmd.Process.Wait。
+		//
+		// Stdout/Stderr 被赋成 *bytes.Buffer（而非 *os.File）时，os/exec 会
+		// 建管道并起协程往缓冲区拷；只有 cmd.Wait 会 join 那些协程。
+		// 用 cmd.Process.Wait 绕过它们，缓冲区里读到的是「拷了多少算多少」，
+		// 而且是数据竞争。
+		//
+		// 实测后果：二进制因缺少必填 flag 启动即退出，测试报「未在 30s 内
+		// 就绪」，紧跟着的「被测二进制日志：」后面**什么都没有**——
+		// 唯一能说明原因的那行字，恰好在最需要它的时候丢了。
+		//
+		// Must be cmd.Wait, not cmd.Process.Wait: with Stdout/Stderr set to a
+		// *bytes.Buffer, os/exec pipes through copier goroutines that only
+		// cmd.Wait joins. Bypassing them reads whatever happened to be copied,
+		// racily. Measured: a binary exiting immediately for a missing required
+		// flag reported "not ready in 30s" followed by an empty log dump — the
+		// one line that explained it, lost exactly when it was needed.
+		_ = cmd.Wait()
 		if t.Failed() {
 			t.Logf("被测二进制日志：\n%s", logs.String())
 		}
@@ -116,7 +133,8 @@ func redactVia(t *testing.T, addr, tenant, text string) redactResult {
 // The Core binary claims compound-surname coverage; probe whether it does.
 func TestCoreBinaryCoversWhatItClaims(t *testing.T) {
 	addr := binaryUnderTest(t, "airlock-agent",
-		"--jurisdictions", "GEN,CN", "--single-tenant", "acme")
+		"--jurisdictions", "GEN,CN", "--single-tenant", "acme",
+		"--session-consistency", "single-replica")
 
 	cases := []struct{ name, text, want string }{
 		{"校验位", "身份证 11010519491231002X", "11010519491231002X"},
@@ -144,6 +162,7 @@ func TestCoreBinaryCoversWhatItClaims(t *testing.T) {
 func TestCoreBinaryHasEvidenceChain(t *testing.T) {
 	addr := binaryUnderTest(t, "airlock-agent",
 		"--jurisdictions", "GEN,CN", "--single-tenant", "acme",
+		"--session-consistency", "single-replica",
 		"--single-surnames") // 故意开启单姓，把误报压力拉满
 
 	// 这些是「像人名但不是」的中文，证据链应当把它们挡下
@@ -172,7 +191,8 @@ func TestCoreStartupClaimIsProbeable(t *testing.T) {
 
 	port := freePort(t)
 	cmd := exec.Command(bin, "--addr", fmt.Sprintf("127.0.0.1:%d", port),
-		"--jurisdictions", "GEN,CN", "--single-tenant", "acme")
+		"--jurisdictions", "GEN,CN", "--single-tenant", "acme",
+		"--session-consistency", "single-replica")
 	var logs bytes.Buffer
 	cmd.Stderr = &logs
 	if err := cmd.Start(); err != nil {
@@ -180,7 +200,16 @@ func TestCoreStartupClaimIsProbeable(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 	_ = cmd.Process.Kill()
-	_, _ = cmd.Process.Wait()
+	// 必须是 cmd.Wait 而不是 cmd.Process.Wait：Stdout/Stderr 是
+	// *bytes.Buffer 时 os/exec 走管道 + 拷贝协程，只有 cmd.Wait 会
+	// join 它们。绕过去读到的缓冲区是「拷了多少算多少」，且有数据竞争。
+	// 实测：被测进程因缺必填配置启动即退出，测试报「未在 N 秒内就绪」，
+	// 而紧跟其后的日志转储是空的——唯一能解释原因的那段，恰好丢了。
+	//
+	// Must be cmd.Wait: with a *bytes.Buffer sink, os/exec copies through
+	// goroutines that only cmd.Wait joins. Measured: a process exiting for
+	// missing required config reported "not ready" with an empty log dump.
+	_ = cmd.Wait()
 
 	out := logs.String()
 	for _, claim := range []string{"Core 模式", "复姓", "证据链已装配"} {
