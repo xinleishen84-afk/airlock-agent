@@ -23,31 +23,45 @@ func writeConfig(t *testing.T, upstreamURL, nerURL string, mutate func(map[strin
 		t.Fatal(err)
 	}
 
+	// 时长一律写成字符串。
+	//
+	// 这份夹具是 JSON（YAML 是 JSON 的超集，所以能直接喂给配置解析器），
+	// 而 config.Duration 的解码器只认 "300ms" / "1h" 这种人写的形式——
+	// 它刻意不接受裸整数，因为 300000000 这种数字既可能是纳秒也可能是
+	// 毫秒，猜错三个数量级而不报错。写 int64(time.Hour) 会序列化成
+	// 3600000000000，解析期直接失败。
+	//
+	// Durations must be strings: this fixture is JSON fed to the config
+	// parser, and config.Duration deliberately rejects bare integers because
+	// 300000000 could be nanoseconds or milliseconds — a three-orders-of-
+	// magnitude guess that would not error.
 	cfg := map[string]any{
 		"secrets_mount_path": secretDir,
-		"session_ttl":        int64(time.Hour),
+		"session_ttl":        "1h",
 		"targets": []any{map[string]any{
 			"name": "upstream", "tier": 2, "base_url": upstreamURL,
 			"model": "fake", "weight": 100, "self_hosted": false,
 			"credential_key": "vendor-api-key",
 		}},
 		"rate_limit": map[string]any{
-			"tokens_per_window": 10_000_000, "window": int64(time.Minute),
+			"tokens_per_window": 10_000_000, "window": "1m",
 		},
 		"pii": map[string]any{
-			"fail_closed": true,
-			"name_roster": []any{"张伟"},
-			"org_roster":  []any{"星辰科技"},
+			"fail_closed":         true,
+			"jurisdictions":       []any{"GEN", "CN"},
+			"session_consistency": "single-replica",
+			"name_roster":         []any{"张伟"},
+			"org_roster":          []any{"星辰科技"},
 		},
 		"gpu": map[string]any{
 			"kv_elevated": 0.75, "kv_critical": 0.90,
 			"prefix_affinity": true, "affinity_load_factor": 1.25,
-			"probe_interval": int64(300 * time.Millisecond),
+			"probe_interval": "300ms",
 		},
 	}
 	if nerURL != "" {
 		cfg["pii"].(map[string]any)["ner"] = map[string]any{
-			"endpoint": nerURL, "timeout": int64(time.Second),
+			"endpoint": nerURL, "timeout": "1s",
 		}
 	}
 	if mutate != nil {

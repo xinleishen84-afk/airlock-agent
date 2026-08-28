@@ -25,10 +25,24 @@ RUN pip install --no-cache-dir --prefix=/install \
         "spacy>=3.8.0" "grpcio>=1.60" "protobuf>=4.25"
 
 ARG MODELS="zh_core_web_md"
-RUN PYTHONPATH=/install/lib/python3.12/site-packages \
-    PATH=/install/bin:$PATH \
+# 变量必须 export 而不能作为前缀。
+#
+# `VAR=x for ...; do` 在 POSIX sh 里不合法：环境变量前缀只能加在**简单命令**
+# 前面，加在 for/while/if 这类复合命令前，sh 会把 `for` 当成命令名，
+# 于是在 `do` 处报 "Syntax error: do unexpected"。
+#
+# 这一行写下来就提交了，从没被构建过——直到 CI 第一次真正 docker build
+# 才暴露。清单引用着这个镜像，README 让人构建它，而两者都无人验证。
+#
+# Assignments must be exported, not prefixed: `VAR=x for ...; do` is invalid in
+# POSIX sh, where an assignment prefix applies only to a simple command. sh
+# parses `for` as the command name and fails at `do`. This line was committed
+# without ever being built — the manifests referenced the image and the README
+# told people to build it, and nothing verified either.
+RUN export PYTHONPATH=/install/lib/python3.12/site-packages \
+        PATH=/install/bin:$PATH; \
     for m in ${MODELS}; do \
-        python -m spacy download "$m" --target /install/lib/python3.12/site-packages ; \
+        python -m spacy download "$m" --target /install/lib/python3.12/site-packages; \
     done
 
 FROM python:3.12-slim

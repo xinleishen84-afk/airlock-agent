@@ -105,6 +105,7 @@ func TestIdentifierStraddlingChunkBoundary(t *testing.T) {
 // 并行分块的实际收益。
 // The measured gain from parallel chunking.
 func TestParallelScanGain(t *testing.T) {
+	skipPerfUnderRace(t)
 	sc, reg := scannerAndRegistry(t)
 
 	for _, c := range []struct{ name, text string }{

@@ -67,6 +67,25 @@ func TestLatencyPercentiles(t *testing.T) {
 }
 
 func latencyRun(t *testing.T, d detect.Detector) {
+	// 竞态检测下不量延迟，只跑最小的一档确认代码路径无竞态。
+	//
+	// -race 会给每次内存访问插桩，实测拖慢 5~20 倍。在这种构建下测出来的
+	// P99 量的是竞态检测器，不是这个系统——把它当性能数据看会得出完全
+	// 错误的容量结论。而 CI 恰恰是带 -race 跑的：384KB 那一档在共享
+	// runner 上跑了 300 秒仍未结束，撞上超时，整个 eval 包被判失败。
+	//
+	// 不是简单跳过：竞态检测本身要覆盖到这条路径，所以仍跑 2KB 那一档，
+	// 只是不再宣称它的耗时有意义。
+	//
+	// Latency is not measured under the race detector, which instruments every
+	// memory access and slows things 5-20x; a P99 from such a build describes
+	// the detector, not the system, and reading it as capacity data is simply
+	// wrong. CI runs with -race, where the 384KB case ran past the 300s timeout
+	// and failed the whole package.
+	//
+	// Not skipped outright: the race detector still needs to cover this path,
+	// so the smallest case still runs — its timing just is not claimed to mean
+	// anything.
 	r := anonymize.NewRedactorWith(d, true)
 	scope := anonymize.StrategyScope{
 		Tenant: "acme",
@@ -83,6 +102,10 @@ func latencyRun(t *testing.T, d detect.Detector) {
 	}
 
 	for _, size := range sizes {
+		if raceEnabled && size.bytes > 2<<10 {
+			t.Logf("跳过 %s：竞态检测下的耗时不代表真实延迟", size.name)
+			continue
+		}
 		text := buildPrompt(size.bytes)
 		latencyFor(t, r, scope, size.name+"（PII 密集）", text)
 	}
@@ -90,6 +113,10 @@ func latencyRun(t *testing.T, d detect.Detector) {
 	// 几处标识，而不是每 130 字节一处。密集形态量的是上界，不是常态。
 	// Sparse is what a real prompt looks like; the dense shape measures an
 	// upper bound, not the common case.
+	if raceEnabled {
+		t.Log("跳过 128k token 稀疏形态：竞态检测下的耗时不代表真实延迟")
+		return
+	}
 	latencyFor(t, r, scope, "128k token（PII 稀疏）", sparseWithPII(384<<10))
 }
 
@@ -155,6 +182,7 @@ func scanningDetector(t testing.TB) detect.Detector {
 // is what one machine sustains. Reporting the second as the first is the most
 // common way a performance page misleads.
 func TestThroughput(t *testing.T) {
+	skipPerfUnderRace(t)
 	d := rosterDetector(t)
 	text := buildPrompt(384 << 10)
 	size := float64(len(text))
@@ -203,6 +231,7 @@ func verdictAt(got, want float64) string {
 // 分层扫描：快速层单独的吞吐量。
 // The fast tier's throughput on its own.
 func TestFastTierThroughput(t *testing.T) {
+	skipPerfUnderRace(t)
 	reg := regexOnly(t)
 	text := buildPrompt(384 << 10)
 	size := float64(len(text))
@@ -248,6 +277,7 @@ var _ = fmt.Sprintf
 // 报一个「达标/未达标」的判断没有用；有用的是那条线的位置。
 // A verdict is not useful; the location of the line is.
 func TestLatencyCrossover(t *testing.T) {
+	skipPerfUnderRace(t)
 	d := scanningDetector(t)
 	r := anonymize.NewRedactorWith(d, true)
 	scope := anonymize.StrategyScope{Tenant: "acme", Vault: evalVault(t)}
@@ -293,9 +323,24 @@ func TestLatencyCrossover(t *testing.T) {
 func TestLatencyUnderConcurrency(t *testing.T) {
 	d := scanningDetector(t)
 	r := anonymize.NewRedactorWith(d, true)
-	text := sparseWithPII(32 << 10)
 
-	for _, concurrency := range []int{1, 4, 16, 64} {
+	// 这一条**不**跳过竞态检测：它是包里唯一真正并发跑脱敏的用例，
+	// 正是竞态检测该覆盖的地方。跳过它等于把并发路径从 -race 里摘出去。
+	// 只缩小规模，让插桩后的耗时仍在预算内——此时它验的是「无竞态」，
+	// 不是「多快」，日志里的数字在这种构建下不作数。
+	//
+	// Deliberately not skipped under -race: this is the only case that actually
+	// runs redaction concurrently, which is precisely what the detector is for.
+	// Skipping it would remove the concurrent path from race coverage. Only the
+	// size shrinks; under instrumentation it verifies "no race", not "how fast".
+	text := sparseWithPII(32 << 10)
+	levels := []int{1, 4, 16, 64}
+	if raceEnabled {
+		text = sparseWithPII(4 << 10)
+		levels = []int{1, 16}
+	}
+
+	for _, concurrency := range levels {
 		var wg sync.WaitGroup
 		samples := make([][]time.Duration, concurrency)
 		const perWorker = 30

@@ -104,6 +104,7 @@ func TestCoreModeCoverage(t *testing.T) {
 // Core 模式的吞吐量与内存 —— 单二进制、无跨进程调用的实际数字。
 // Core mode's throughput and memory: the numbers for one binary, no IPC.
 func TestCoreModeThroughputAndMemory(t *testing.T) {
+	skipPerfUnderRace(t)
 	d := coreDetector(t, map[detect.EntityType][]string{
 		detect.TypeName: {"张伟", "李娜"},
 	})

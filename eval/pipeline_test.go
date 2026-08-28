@@ -180,6 +180,7 @@ func TestSurnameFalsePositiveCost(t *testing.T) {
 // 名册的规模不该影响延迟 —— 这是换掉正则大并集的理由。
 // Roster size must not affect latency.
 func TestRosterScaleImpactOnPipeline(t *testing.T) {
+	skipPerfUnderRace(t)
 	text := buildPrompt(32 << 10)
 
 	for _, size := range []int{0, 1000, 50000} {
@@ -211,6 +212,7 @@ func TestRosterScaleImpactOnPipeline(t *testing.T) {
 // 证据链加在热路径上要花多少时间。
 // What the evidence chain costs on the hot path.
 func TestEvidenceChainOverhead(t *testing.T) {
+	skipPerfUnderRace(t)
 	text := buildPrompt(32 << 10)
 
 	for _, cfg := range []pipelineConfig{
