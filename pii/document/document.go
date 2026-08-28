@@ -90,6 +90,14 @@ const (
 	// 必须先解析，只净化其中的**值**——它的键是 schema 定义的参数名，
 	// 属于协议骨架，脱敏后模型与本地工具就对不上了。
 	kindJSONString
+	// kindJSONObject：值是一个已解析的 JSON 对象或数组（Anthropic 的
+	// tool_use.input 就是这个形态，不是 JSON 字符串）。递归净化其中的值，
+	// 键名同样属于协议骨架，不碰。
+	//
+	// kindJSONObject: the value is an already-parsed JSON object or array —
+	// Anthropic's tool_use.input has this shape rather than a JSON string.
+	// Values are sanitized recursively; keys are protocol skeleton and are not.
+	kindJSONObject
 )
 
 // pathRule is one targeted-sanitization rule.
@@ -135,6 +143,74 @@ var sanitizeRules = []pathRule{
 		path: seg("messages", "[*]", "tool_calls", "[*]", "function", "arguments"),
 		kind: kindJSONString,
 		desc: "模型生成的工具入参（JSON 字符串），只净化值不碰键",
+	},
+	// --- 以下六条补的是「声称支持、实际漏过」的载荷形态 ---
+	// --- The six shapes below were claimed as supported yet passed through ---
+	//
+	// 这张表原有七条，覆盖 OpenAI Chat Completions 的主干形态。但表里同时
+	// 有 system 与 tools[*].description 两条标着「Anthropic 风格」，也就是
+	// Anthropic 形态是声称支持的——而它的两种内容块（tool_use / tool_result）
+	// 一条都不在表里。实测：整段工具返回结果原样发给了模型。
+	//
+	// 严格白名单对**污染**是安全的（没列到的字段物理上不会被访问），对
+	// **泄露**却是失效开放的：没列到的字段同样不会被脱敏，而且不报错。
+	// 两种失效方向相反，容易只记住前一种。
+	//
+	// The original seven rules covered OpenAI Chat Completions. Two of them are
+	// labelled "Anthropic style", so that shape is claimed — yet neither of its
+	// content blocks appeared here, and a whole tool result reached the model
+	// verbatim. A strict allowlist is safe against corruption (unlisted fields
+	// are never touched) but fails open for leakage (unlisted fields are never
+	// redacted, silently). The two failure directions are opposite and it is
+	// easy to remember only the first.
+	{
+		path: seg("messages", "[*]", "content", "[*]", "content"),
+		kind: kindText,
+		desc: "Anthropic tool_result 内容块（字符串形态）——" +
+			"这是工具的**输出**，在 agent 循环里就是数据库查出来的整行记录",
+	},
+	{
+		path: seg("messages", "[*]", "content", "[*]", "content", "[*]", "text"),
+		kind: kindText,
+		desc: "Anthropic tool_result 内容块（内容块数组形态）",
+	},
+	{
+		path: seg("messages", "[*]", "content", "[*]", "input"),
+		kind: kindJSONObject,
+		desc: "Anthropic tool_use 入参对象——是已解析的对象而非 JSON 字符串",
+	},
+	{
+		path: seg("messages", "[*]", "function_call", "arguments"),
+		kind: kindJSONString,
+		desc: "OpenAI 旧版 function_call 入参——已废弃但老客户端仍在发",
+	},
+	{
+		path: seg("input", "[*]", "content", "[*]", "text"),
+		kind: kindText,
+		desc: "OpenAI Responses API 的输入内容块（input_text / output_text）",
+	},
+	{
+		path: seg("prompt"),
+		kind: kindText,
+		desc: "旧版 completions 端点的顶层 prompt",
+	},
+	{
+		path: seg("system", "[*]", "text"),
+		kind: kindText,
+		desc: "Anthropic 系统提示词（内容块数组形态）——" +
+			"同一个 system 键既可以是字符串也可以是块数组，两条规则各管一种",
+	},
+	{
+		path: seg("input"),
+		kind: kindText,
+		desc: "embeddings 端点的顶层 input（字符串形态）——" +
+			"要嵌入的往往正是客户记录原文",
+	},
+	{
+		path: seg("input", "[*]"),
+		kind: kindText,
+		desc: "embeddings 端点的顶层 input（字符串数组形态）；" +
+			"若数组元素是 token id 整数则本规则不适用，自动跳过",
 	},
 	{
 		path: seg("tools", "[*]", "function", "description"),
@@ -313,6 +389,14 @@ func walkDeep(node any, key string, rest []segment, kind valueKind, transform te
 // applyTransform sanitizes according to the value kind.
 // 按值类型执行净化。
 func applyTransform(value any, key string, kind valueKind, transform textTransform) (any, error) {
+	// kindJSONObject 的值本来就不是字符串，要在字符串断言之前处理
+	if kind == kindJSONObject {
+		switch value.(type) {
+		case map[string]any, []any:
+			return transformJSONValue(value, key, transform)
+		}
+		return value, nil
+	}
 	s, ok := value.(string)
 	if !ok {
 		return value, nil // type mismatch: rule does not apply / 类型不符，规则不适用
@@ -487,6 +571,35 @@ var responseRules = []pathRule{
 		kind: kindText,
 		desc: "流式增量正文（Anthropic 风格）",
 	},
+	{
+		path: seg("content_block", "text"),
+		kind: kindText,
+		desc: "Anthropic content_block_start 里预置的首段正文",
+	},
+	{
+		path: seg("content", "[*]", "input"),
+		kind: kindJSONObject,
+		desc: "Anthropic 非流式 tool_use 入参对象（已完整，可直接结构化复原）",
+	},
+	{
+		path: seg("output", "[*]", "content", "[*]", "text"),
+		kind: kindText,
+		desc: "OpenAI Responses API 的输出内容块（output_text）",
+	},
+	{
+		path: seg("choices", "[*]", "message", "function_call", "arguments"),
+		kind: kindJSONString,
+		desc: "OpenAI 旧版非流式 function_call 入参",
+	},
+	// Anthropic 的流式工具入参（delta.partial_json）刻意不在此表中：
+	// 它和 OpenAI 的 delta.tool_calls[].function.arguments 一样是不完整的
+	// JSON 分片，当普通规则处理就等于在半截 JSON 文本上做替换——真值含引号
+	// 时直接产出非法 JSON。它由 StreamRestorer 的工具调用屏障处理。
+	//
+	// Anthropic's streaming tool arguments (delta.partial_json) are absent here
+	// on purpose: like OpenAI's, they are incomplete JSON fragments, and a plain
+	// rule would substitute inside half a document. The tool-call barrier owns
+	// them.
 }
 
 // RestoreDocument applies targeted restoration to a parsed response document.
@@ -528,6 +641,8 @@ type StreamRestorer struct {
 	toolArgs  map[string]*strings.Builder
 	toolShape map[string]map[string]any // 保留 index/id/name 以便回填
 	toolOrder []string                  // 放行顺序＝首次出现顺序
+	// pendingFrames 存放已渲染但尚未取走的补发帧（Anthropic 形态各自成帧）
+	pendingFrames [][]byte
 }
 
 // NewStreamRestorer creates a restorer for one stream.
@@ -545,12 +660,15 @@ func NewStreamRestorer(r *anonymize.Redactor, scope anonymize.StrategyScope) *St
 // Frame restores one SSE data frame and returns the frames to emit, in order.
 // 复原一个 SSE 数据帧，返回应当依次发出的帧。
 //
-// 返回切片而非单帧：工具调用屏障会在放行时补发一个装着完整入参的帧。
-// 绝大多数情况下返回恰好一帧。
+// 返回切片而非单帧：工具调用屏障放行时会补发装着完整入参的帧。绝大多数
+// 情况下返回恰好一帧。**当前帧永远是切片的最后一个**——补发帧在语义上
+// 属于终止帧之前，因此排在它前面。调用方若要把原帧的 SSE event/id 带上，
+// 应当认最后一个而不是第一个。
 //
-// Returns a slice rather than one frame because the tool-call barrier emits an
-// extra frame carrying the assembled arguments when it releases. The common
-// case is exactly one frame.
+// Returns a slice because the barrier emits extra frames on release. The
+// current frame is always the LAST element — released frames belong before the
+// terminator that triggered them. Callers propagating the original SSE
+// event/id must attach it to the last frame, not the first.
 //
 // A frame that does not parse as JSON is returned verbatim: upstream may emit
 // non-JSON heartbeats or error text, and doing nothing is safer than guessing.
@@ -564,6 +682,7 @@ func (s *StreamRestorer) Frame(ctx context.Context, data []byte) [][]byte {
 
 	// 工具调用先被屏障截走：入参分片只入缓冲，不参与逐帧复原。
 	released := s.absorbToolCalls(doc)
+	released = append(released, s.absorbAnthropicToolCalls(doc)...)
 
 	// 用结构路径区分不同的文本流。
 	//
@@ -594,11 +713,29 @@ func (s *StreamRestorer) Frame(ctx context.Context, data []byte) [][]byte {
 		return [][]byte{data}
 	}
 
-	frames := [][]byte{out}
-	if extra := s.renderReleased(ctx, released); extra != nil {
+	// 放行帧必须排在**当前帧之前**。
+	//
+	// 触发放行的那一帧正是终止帧（OpenAI 的 finish_reason、Anthropic 的
+	// content_block_stop）。客户端看到终止信号就会把工具调用定型并派发，
+	// 若参数帧排在它后面，派发时手里还是空参数，而那一帧要么被忽略、
+	// 要么被当成协议错误。屏障攒下来的内容在语义上属于终止之前，
+	// 发出的顺序也必须如此。
+	//
+	// The frame that triggers release is the terminator itself. A client
+	// finalizes and dispatches the tool call on seeing it, so an arguments
+	// frame arriving afterwards is either ignored or treated as a protocol
+	// error. What the barrier held belongs before the terminator semantically,
+	// and must be emitted there too.
+	var frames [][]byte
+	for {
+		extra := s.renderReleased(ctx, released)
+		if extra == nil {
+			break
+		}
 		frames = append(frames, extra)
+		released = nil // 后续轮次只取 pendingFrames 里的剩余帧
 	}
-	return frames
+	return append(frames, out)
 }
 
 // absorbToolCalls 把本帧里的工具入参分片吸进屏障缓冲，并从帧中抹去。
@@ -681,6 +818,72 @@ func (s *StreamRestorer) absorbToolCalls(doc map[string]any) []string {
 	return release
 }
 
+// absorbAnthropicToolCalls 处理 Anthropic 形态的流式工具入参。
+// Handles Anthropic-shaped streaming tool arguments.
+//
+// # 形状不同，问题完全相同
+// # A different shape, the identical problem
+//
+// Anthropic 把工具入参切成 delta.partial_json 分片，用事件顶层的 index 标识
+// 是第几个内容块，以 content_block_stop 收尾：
+//
+//	{"type":"content_block_start","index":1,"content_block":{"type":"tool_use",...}}
+//	{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta",
+//	 "partial_json":"{\"who\":"}}
+//	{"type":"content_block_stop","index":1}
+//
+// 名字和层级都与 OpenAI 不同，但它同样是「不完整的 JSON 分片」。若当作普通
+// 文本逐帧复原，真值含引号时照样产出非法 JSON——也就是刚在 OpenAI 那条路
+// 上修掉的那个 bug 会原封不动地在这条路上重现一次。因此走同一道屏障。
+//
+// Anthropic splits tool arguments into delta.partial_json fragments, keyed by
+// the event's top-level index and terminated by content_block_stop. The names
+// and nesting differ from OpenAI's, but these are the same incomplete JSON
+// fragments: restoring them per frame reproduces, verbatim, the invalid-JSON
+// bug just fixed on the OpenAI path. Hence the same barrier.
+func (s *StreamRestorer) absorbAnthropicToolCalls(doc map[string]any) []string {
+	idx, hasIdx := doc["index"].(float64)
+	if !hasIdx {
+		return nil
+	}
+	key := "anthropic:" + strconv.Itoa(int(idx))
+
+	switch doc["type"] {
+	case "content_block_start":
+		// 记住 tool_use 块的骨架，放行时回填 id / name
+		if cb, ok := doc["content_block"].(map[string]any); ok && cb["type"] == "tool_use" {
+			s.toolShape[key] = cb
+		}
+		return nil
+
+	case "content_block_delta":
+		delta, ok := doc["delta"].(map[string]any)
+		if !ok || delta["type"] != "input_json_delta" {
+			return nil
+		}
+		frag, ok := delta["partial_json"].(string)
+		if !ok {
+			return nil
+		}
+		b, ok := s.toolArgs[key]
+		if !ok {
+			b = &strings.Builder{}
+			s.toolArgs[key] = b
+			s.toolOrder = append(s.toolOrder, key)
+		}
+		b.WriteString(frag)
+		// 分片从本帧抹去：屏障放行前不向下游吐任何入参
+		delta["partial_json"] = ""
+		return nil
+
+	case "content_block_stop":
+		if _, ok := s.toolArgs[key]; ok {
+			return []string{key}
+		}
+	}
+	return nil
+}
+
 // renderReleased 把放行的工具调用还原成一个完整的增量帧。
 // Renders released tool calls as one complete delta frame.
 //
@@ -702,8 +905,26 @@ func (s *StreamRestorer) renderReleased(ctx context.Context, keys []string) []by
 			continue
 		}
 		delete(s.toolArgs, key)
-		choiceID, _, _ := strings.Cut(key, ":")
+		choiceID, rest, _ := strings.Cut(key, ":")
 		restored := s.restoreArgs(ctx, b.String())
+
+		// Anthropic 形态单独成帧：它的线上结构与 OpenAI 的 choices/delta
+		// 完全不同，硬塞进同一个信封客户端会认不出来。
+		if choiceID == "anthropic" {
+			idx, _ := strconv.Atoi(rest)
+			frame := map[string]any{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]any{
+					"type":         "input_json_delta",
+					"partial_json": restored,
+				},
+			}
+			if out, err := MarshalPreserving(frame); err == nil {
+				s.pendingFrames = append(s.pendingFrames, out)
+			}
+			continue
+		}
 
 		shape := s.toolShape[key]
 		call := map[string]any{
@@ -723,6 +944,11 @@ func (s *StreamRestorer) renderReleased(ctx context.Context, keys []string) []by
 		byChoice[choiceID] = append(byChoice[choiceID], call)
 	}
 	if len(byChoice) == 0 {
+		if len(s.pendingFrames) > 0 {
+			out := s.pendingFrames[0]
+			s.pendingFrames = s.pendingFrames[1:]
+			return out
+		}
 		return nil
 	}
 	var choices []any

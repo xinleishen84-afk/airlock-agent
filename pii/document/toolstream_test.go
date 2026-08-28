@@ -103,9 +103,11 @@ func TestToolArgsWithheldUntilBarrierReleases(t *testing.T) {
 		[]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,`+
 			`"function":{"arguments":"\"}"}}]},"finish_reason":"tool_calls"}]}`))
 	if len(frames) != 2 {
-		t.Fatalf("期望原帧＋放行帧共 2 帧，实得 %d", len(frames))
+		t.Fatalf("期望放行帧＋原帧共 2 帧，实得 %d", len(frames))
 	}
-	args := frameArgs(t, frames[1], 0)
+	// 放行帧排在终止帧之前：客户端看到 finish_reason 就会把工具调用定型
+	// 并派发，参数晚到等于没到
+	args := frameArgs(t, frames[0], 0)
 
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
@@ -117,7 +119,7 @@ func TestToolArgsWithheldUntilBarrierReleases(t *testing.T) {
 
 	// 放行帧必须带回 index/id/name，客户端靠它们把调用归位
 	var probe map[string]any
-	_ = json.Unmarshal(frames[1], &probe)
+	_ = json.Unmarshal(frames[0], &probe)
 	call := dig(t, probe, "choices", 0, "delta", "tool_calls", 0)
 	cm, _ := call.(map[string]any)
 	if cm["id"] != "call_1" {
@@ -163,8 +165,8 @@ func TestParallelToolCallsKeepSeparateBuffers(t *testing.T) {
 	}
 
 	var probe map[string]any
-	if err := json.Unmarshal(frames[1], &probe); err != nil {
-		t.Fatalf("放行帧非法 JSON: %s", frames[1])
+	if err := json.Unmarshal(frames[0], &probe); err != nil {
+		t.Fatalf("放行帧非法 JSON: %s", frames[0])
 	}
 	calls, _ := dig(t, probe, "choices", 0, "delta", "tool_calls").([]any)
 	if len(calls) != 2 {

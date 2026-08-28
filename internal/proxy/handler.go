@@ -522,13 +522,15 @@ func (h *Handler) stream(
 			// content 可能变成空串——那是正常的，不是丢帧，
 			// 且必须照常发出（帧里可能还带着 finish_reason 等其他字段）。
 			//
-			// 可能返回多帧：工具调用屏障在放行时补发一个装着完整入参的帧。
-			// 补发帧不带原帧的 event/id——它是本网关合成的，
-			// 不是上游那一帧的一部分。
+			// 可能返回多帧：工具调用屏障在放行时补发装着完整入参的帧。
+			// 原帧是**最后一个**——补发帧属于终止帧之前，客户端看到
+			// finish_reason / content_block_stop 就会把工具调用定型派发，
+			// 参数必须先到。原帧的 event/id 因此跟着最后一个走；
+			// 补发帧不带 id，它是本网关合成的，不是上游那一帧的一部分。
 			frames := restorer.Frame(ctx, event.Data)
 			outs = outs[:0]
 			for i, f := range frames {
-				if i == 0 {
+				if i == len(frames)-1 {
 					outs = append(outs, &Event{Event: event.Event, ID: event.ID, Data: f})
 					continue
 				}

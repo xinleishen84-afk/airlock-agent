@@ -505,11 +505,12 @@ func (s *Server) handleStreamRestore(w http.ResponseWriter, r *http.Request,
 			if json.Unmarshal(f, &doc) != nil {
 				continue
 			}
-			if i == 0 {
+			// 本帧是最后一个；排在它前面的是屏障放行帧，
+			// 调用方必须**先**转发放行帧再转发本帧
+			if i == len(frames)-1 {
 				resp.Payload = doc
 				continue
 			}
-			// 屏障放行帧：调用方必须一并转发给下游
 			resp.ReleasedToolCalls = doc
 		}
 	} else {

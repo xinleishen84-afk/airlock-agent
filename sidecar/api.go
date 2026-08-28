@@ -102,7 +102,9 @@ type RestoreResponse struct {
 	// 工具入参不逐帧复原——分片攒齐后才按结构还原一次，否则会在半截
 	// JSON 文本上做替换（真值含引号即产出非法 JSON）。因此一个入参分片
 	// 请求可能返回两份载荷：本帧（入参已被抹空）与放行帧。
-	// 调用方必须把它也发给下游，否则工具永远等不到参数。
+	// 调用方必须把它**先于** payload 发给下游：payload 那一帧带着终止信号
+	// （finish_reason / content_block_stop），客户端看到它就会把工具调用定型
+	// 并派发，参数晚到就等于没到。
 	//
 	// The frame emitted when the tool-call barrier releases. Tool arguments are
 	// not restored per frame: fragments are assembled and restored once
