@@ -49,8 +49,13 @@ store, and that store **is** persistent — it is a PII database.</sub>
 **做得到**
 
 - 结构化标识（身份证、银行卡、统一社会信用代码、IBAN、税号、护照、车牌、API 密钥……）
-- 协议安全的定向脱敏：不会打烂 OpenAI 请求体的工具调用约束
+- 协议安全的定向脱敏：不会打烂 OpenAI 请求体的工具调用约束。
+  覆盖 17 种请求形态与 10 种响应形态（OpenAI Chat Completions / Responses /
+  旧版 function_call / embeddings、Anthropic Messages 的 `tool_use` 与
+  `tool_result` 内容块），逐一列在语料里可核对
 - 双向复原：含 SSE 流式帧被切开的情形
+- **Agent 流量特有的那部分**：流式工具调用入参走屏障同步，攒齐后按结构化 JSON
+  复原一次，而不是在半截 JSON 上做文本替换；并行工具调用按协议 `index` 分流
 - 多租户隔离、GDPR 第 17 条精准擦除、不带原文的安全审计
 
 **做不到**
@@ -80,10 +85,11 @@ store, and that store **is** persistent — it is a PII database.</sub>
 
 | | |
 |---|---|
-| 测试 | 429 个测试函数 / 13,672 行测试代码 / 覆盖率 73.7% / `-race` 全绿 |
-| 依赖 | 主模块 1 个外部依赖（yaml） |
-| 已实测 | 检测准确率、延迟分位、吞吐、还原准确率（见下节） |
-| **未实测** | Testcontainers 用例（开发机无 Docker）、OTel 处理器未用 `ocb` 构建进真实 Collector、生产规模压测 |
+| 测试 | Go 539 个测试函数 / 18,839 行测试代码 / 主模块覆盖率 74.5% / `-race` 全绿；Python 21 个 |
+| 依赖 | 主模块 1 个外部依赖（yaml）；分析器 3 个（spacy / grpcio / protobuf） |
+| 已实测 | 检测准确率、延迟分位、吞吐、还原准确率（见下节）；两个二进制与网关均已真实启动并端到端拨测 |
+| **未实测** | Testcontainers 用例（开发机无 Docker）、OTel 处理器未用 `ocb` 构建进真实 Collector、生产规模压测、K8s 集群 |
+| **CI 从未跑过** | 仓库此前从未 push，六个 job 的 workflow 一次都没有真正执行过。首次运行大概率会暴露只在 Linux 干净环境下才出现的问题 |
 | **零外部验证** | 没有任何人在生产里跑过它 |
 
 ---
@@ -97,7 +103,7 @@ store, and that store **is** persistent — it is a PII database.</sub>
 |---|---|---|
 | 二进制 | `airlock-agent` · **11MB** | `airlock-agent-advanced` · 18MB |
 | 外部依赖 | **1 个**(yaml) | 8 个(gRPC + protobuf) |
-| 额外进程 | 无 | Python 分析器 sidecar |
+| 额外进程 | 无 | Python 分析器 sidecar（`analyzer/`，同仓库） |
 | 额外内存 | **0** | 622MB(中英双模型) |
 | 吞吐 | **254.8k QPS**(10 核) | 受模型限制,~400 req/s/副本 |
 | 单请求 | **3.9µs** | 2.5ms(含一次跨进程调用) |
@@ -106,11 +112,16 @@ store, and that store **is** persistent — it is a PII database.</sub>
 ```bash
 # Core:零额外依赖,单进程
 airlock-agent --jurisdictions GEN,CN --tenant-header X-Tenant-Id \
+              --session-consistency single-replica \
               --name-roster ./names.txt
 
 # Advanced:只有需要非结构化实体时才配
 airlock-agent-advanced --jurisdictions GEN,CN --tenant-header X-Tenant-Id \
+                       --session-consistency single-replica \
                        --ner-socket /var/run/airlock/ner.sock
+
+# --session-consistency 必填，没有默认值：占位符是副本本地的递增序号，
+# 猜错的那一边会让用户拿到别人的数据。详见「成熟度」一节。
 ```
 
 ### Core 覆盖什么、不覆盖什么(实测,逐条)
@@ -257,7 +268,52 @@ tools[*].function.parameters.**.description    ← 只取 description，enum/typ
 于是被切开的 `[tok:email:9df3a0c1]` 前半截直接发给了终端用户。
 注入回归验证过现在拦得住。
 
-### 3. 租户在键里，不在 WHERE 子句里
+### 3. 工具调用参数不能逐帧复原
+
+Agent 流量与聊天流量在这一点上分道扬镳。工具入参是**给机器的结构化载荷**，
+不是给人看的文本——逐帧吐出去没有任何延迟收益，却要在半截 JSON 上做替换：
+
+```
+帧 1: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"who\":\"ANONYMIZED_NA"}}]}}
+帧 2: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ME_0\"}"}}]}, "finish_reason":"tool_calls"}
+```
+
+这条路径上实测过三类故障，**三类都不报错**：
+
+| 症状 | 后果 |
+|---|---|
+| 真值含引号 → `{"who":"李"小"娜"}` | 非法 JSON，下游工具解析器罢工 |
+| 占位符跨帧劈开，两半落进不同缓冲 | 工具收到字面量 `ME_0` |
+| 流末尾残留被当作 `delta.content` 发出 | 用户看到本该发给工具的 JSON，工具收到截断的入参 |
+
+改法是**屏障同步**：分片攒着并从帧里抹空，`finish_reason`（Anthropic 是
+`content_block_stop`）到达时放行，按结构化 JSON 复原**一次**——替换发生在
+解析后的值上，占位符不可能被劈开，也不存在需要另找地方吐的残留。
+
+两个细节是踩出来的：
+
+- **放行帧必须排在终止帧之前。** 客户端看到终止信号就把工具调用定型并派发，
+  参数晚到等于没到。
+- **并行工具调用按协议 `index` 分流，不能按数组位置。** 每个 delta 只携带
+  发生变化的那个 index，「第 1 个调用」在某帧里可能是数组第 0 个元素。
+
+### 4. 白名单对污染安全，对泄露失效开放
+
+严格白名单的设计初衷是防污染：没列到的字段物理上不会被访问，协议骨架不可能
+被脱敏结果破坏。但同一个机制在另一个方向上是**静默失效开放**的——没列到的
+字段同样不会被脱敏，不报错、不告警，看起来和「这段文本里没有 PII」一模一样。
+
+这个坑兑现过：请求侧原有七条规则覆盖 OpenAI Chat Completions，而表里有两条
+标着「Anthropic 风格」——那个形态是声称支持的，它的 `tool_use` / `tool_result`
+内容块却一条都不在表里。`tool_result.content` 是**工具的输出**，在 agent 循环里
+就是数据库查出来的整行客户记录，原样发给了模型。
+
+因此防回归用的是**语料而不是逐条路径的单测**：逐条单测只能证明「已列出的路径
+有效」，永远证明不了「该列的都列了」。现在 17 种请求形态、10 种响应形态各一行
+列在 `pii/document/payload_corpus_test.go` 里，新增一种支持就加一行；另有一条
+测试钉住脱敏不破坏协议骨架（`id`、工具名、参数键必须原样保留）。
+
+### 5. 租户在键里，不在 WHERE 子句里
 
 每一个可逆构造都是一次查表：进去占位符或令牌，出来真实值。
 **键里没有租户的查表，在构造上就是一个越权漏洞。**
@@ -276,7 +332,7 @@ PRIMARY KEY (tenant_id, namespace, token)   // SQL 驱动：复合主键，不�
 
 过滤会在某一个调用点被忘掉，键不会。
 
-### 4. 网关脱敏了模型看到的东西，管不到飞往 Datadog 的那份副本
+### 6. 网关脱敏了模型看到的东西，管不到飞往 Datadog 的那份副本
 
 同一段提示词还躺在 span 属性里。而遥测里的那份**更糟**：模型厂商有合同、
 有留存策略，而可观测性后端对每一个有看板账号的人可读、留存一年。
@@ -305,6 +361,7 @@ go build -o airlock ./cmd/airlock-agent
   --addr :8888 \
   --jurisdictions GEN,CN \
   --tenant-header X-Tenant-Id \
+  --session-consistency single-replica \
   --name-roster ./names.txt \
   --ner http://ner-service:8000/v1/detect   # 不配 --ner 时，姓名类召回率为 0
 ```
@@ -371,6 +428,35 @@ out, err := redactor.RedactTo(ctx, "联系张伟，手机 13812345678", scope, f
 // 入站
 back, err := redactor.Unredact(ctx, modelReply, scope)
 ```
+
+---
+
+### 唤醒 Advanced：起 Python 分析器
+
+分析器在 `analyzer/`，与 Go 侧同仓库。它不是可选的第三方服务——契约
+（`proto/pii/v1/ner.proto`）与两边的实现都在这里，可以一起审阅。
+
+```bash
+pip install -r analyzer/requirements.txt
+python -m spacy download zh_core_web_md   # 74MB
+python -m spacy download en_core_web_lg   # 400MB，处理拉丁文必装
+
+cd analyzer && python -m pii.service.ner_server \
+    --socket /tmp/airlock-ner.sock \
+    --models zh=zh_core_web_md,en=en_core_web_lg
+
+# Go 侧接上它
+go build -o airlock-advanced ./nerclient/cmd/airlock-agent-advanced
+./airlock-advanced --jurisdictions GEN,CN --single-tenant acme \
+    --session-consistency single-replica --ner-socket /tmp/airlock-ner.sock
+```
+
+socket 路径要短：`sockaddr_un` 上限 103 字节，是操作系统的限制不是本程序的。
+UDS 而非本地 TCP 的理由：文件权限就是访问控制（socket 建为 `0600`），
+而 TCP 上任何本地进程都能连——那条链路两端传的是明文 PII。
+
+两个语种的模型都要装。服务端按文字系统切段路由，拿中文模型判拉丁文是
+分布外输入——实测它会把 `declined`、`deps`、`Codice` 判成人名。
 
 ---
 
@@ -581,6 +667,30 @@ LLM 推理的真实约束是 **KV 缓存显存**，不是请求数。一个 10 �
 
 **fail-closed 返回 200 + `blocked: true`，不返回 5xx。** 这不是服务故障而是安全
 策略生效。返回 5xx 会让网关按「上游故障」重试或降级——而降级的方向往往是放行。
+
+**注释描述的行为可能根本不存在。** `StreamRestorer` 的文档写着「每条自然语言
+路径各自维护一个滞留缓冲，共用一个缓冲会让它们互相污染」——而实现按「帧内
+第几个可复原字段」做键，正好把它们合成了一个。纯聊天流式每帧只有
+`delta.content`、永远是第 0 个，所以这个键工作了很久；agent 流式各帧字段集合
+是变的，正文与工具入参因此共用缓冲。**一致的注释与不一致的实现，测试都是绿的。**
+
+**校验的顺序本身也是行为。** `Matrix.Add` 把空算子的 nil 检查写在末尾的克隆
+循环里，而前面的 `Restores` 分支已经对每个算子调了 `Reversible()`——配了空算子
+且声明复原响应，`Add` 会以 nil 解引用崩掉，而这个函数存在的全部意义就是把
+配置错误变成一句能读懂的话。
+
+**把安全约束写在 `main` 里，它就会漂移成「有的进程管、有的不管」。**
+会话一致性做成必选声明时只改了 Core 的 `main`，同时把 `--session-consistency`
+写进了三份部署清单——Advanced 二进制持有同一种保险库、同样的暴露面，却没有
+这个 flag，清单直接让它以 `flag provided but not defined` 崩溃循环。全部测试
+都是绿的：清单是 YAML，flag 定义在 Go 里，两者之间没有任何编译期或测试期的
+连线。现在校验在两者共用的 `sidecar` 包里，且有一条测试拿 `--help` 的输出
+比对清单传的每个 flag。
+
+**`cmd.Process.Wait()` 会把被测进程的日志吞掉。** `Stdout`/`Stderr` 是
+`*bytes.Buffer` 时 `os/exec` 走管道加拷贝协程，只有 `cmd.Wait()` 会 join 它们。
+实测后果：被测二进制因缺必填配置启动即退出，测试报「未在 30s 内就绪」，
+紧跟其后的日志转储**是空的**——唯一能解释原因的那段，恰好在最需要它的时候丢了。
 
 **脱敏映射永不落盘。** `SessionVault` 从类型层面禁止序列化。它存的是
 「占位符 → 真实姓名/手机/身份证」，落盘就等于把脱敏组件变成 PII 数据库。
