@@ -9,6 +9,22 @@
 # /airlock-gateway was not, so a 12MB compiled binary was committed and survived
 # many commits. Go embeds the build path, so that artifact carried the build
 # machine's home directory. Now matched by pattern so a new command cannot slip.
+# scripts/build.sh 的输出目录。
+#
+# 不忽略它的后果不只是脏工作区：go build 的 -buildvcs 用 git status 判断
+# 仓库是否干净，未跟踪的 dist/ 会让它把 vcs.modified 标成 true。实测 CI 上
+# 干净检出构建出的 Advanced 二进制版本号带 +dirty，而 Core 没有——差别只是
+# 构建顺序：Core 先构建时 dist/ 还是空目录（git 不报告空目录），
+# 轮到 Advanced 时里面已经有文件了。
+#
+# 一个 release 产物自称 dirty，等于自己削弱了 provenance 里「来自这个提交」
+# 那句话，而原因只是它把自己的输出放在了仓库里。
+#
+# go build's -buildvcs uses git status, so an untracked dist/ marks the binary
+# vcs.modified=true. Measured on a clean CI checkout: Advanced carried +dirty
+# while Core did not — the only difference being build order. A release
+# artifact calling itself dirty undercuts its own provenance.
+/dist/
 /airlock
 /airlock-agent
 /airlock-gateway
