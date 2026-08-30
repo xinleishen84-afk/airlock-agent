@@ -94,6 +94,9 @@ cosign verify ghcr.io/xinleishen84-afk/airlock-analyzer:vX.Y.Z \
 git checkout vX.Y.Z
 ./scripts/build.sh
 shasum -a 256 -c dist/SHA256SUMS      # 与 Release 里的 SHA256SUMS 比对
+
+# SHA256SUMS 只覆盖二进制，不含 SBOM——SBOM 里有时间戳与 UUID，
+# 两次生成不可能字节相同。它们的完整性由各自的 .sig 保证。
 ```
 
 可复现依赖三件事，都写在 `scripts/build.sh` 里：`-trimpath`（去掉构建机的

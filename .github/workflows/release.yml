@@ -76,16 +76,43 @@ jobs:
           fi
           echo "两次构建字节相同"
 
-      # SBOM 覆盖的是 Go 模块依赖树。主模块只有一个外部依赖，
-      # 但 nerclient 有 8 个、otelprocessor 有 39 个——用二进制的人
-      # 需要知道自己实际引入了什么。
-      - name: 生成 SBOM（SPDX）
-        uses: anchore/sbom-action@v0
-        with:
-          path: .
-          format: spdx-json
-          artifact-name: airlock-agent-sbom.spdx.json
-          output-file: dist/airlock-agent-sbom.spdx.json
+      # SBOM 逐个二进制生成，不是整个仓库一份。
+      #
+      # 仓库级 SBOM 回答不了使用者真正的问题：「我装的这个二进制里有什么」。
+      # 三个产物的依赖面差得很远——Core 内嵌 1 个依赖，Advanced 8 个——
+      # 而一份 212 个包的仓库级清单把这个区别抹平了，还混进了 GitHub Actions。
+      #
+      # syft 读的是 Go 编译期嵌进二进制的 buildinfo，所以这份清单描述的是
+      # 产物本身，而不是构建目录里碰巧存在的东西。
+      #
+      # Per-binary rather than one for the repository: a repo-wide SBOM cannot
+      # answer "what is in the binary I installed". Syft reads the buildinfo Go
+      # embeds at compile time, so the list describes the artifact itself rather
+      # than whatever happened to sit in the build directory.
+      - name: 安装 syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: 逐个二进制生成 SBOM（SPDX）
+        run: |
+          set -e
+          for f in dist/airlock-*; do
+            case "$f" in *.json|*.sig|*.pem) continue;; esac
+            syft scan "file:${f}" -o spdx-json > "${f}.sbom.spdx.json"
+            n=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))['packages']))" "${f}.sbom.spdx.json")
+            echo "  $(basename "$f"): ${n} 个包"
+          done
+          # SHA256SUMS 刻意**不**包含 SBOM。
+          #
+          # SBOM 里有时间戳与 UUID，两次生成不可能字节相同。把它并进
+          # SHA256SUMS，会让 SECURITY.md 里那条「本地构建后 shasum -c 比对」
+          # 的指引失败——而那条指引正是可复现构建对使用者的全部意义。
+          # SBOM 的完整性由它自己的签名保证：下面的签名步骤逐个文件签，
+          # SBOM 也在其中。
+          #
+          # SBOMs carry timestamps and UUIDs and cannot be byte-identical across
+          # runs. Including them would break the "build locally and shasum -c"
+          # instruction, which is the entire point of reproducibility for a
+          # consumer. Their integrity comes from their own signature instead.
 
       - name: 安装 cosign
         uses: sigstore/cosign-installer@v3
