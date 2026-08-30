@@ -615,6 +615,44 @@ Event.SampleText 是一个未经论证的字符串字段。
 但不含密钥、盐、映射记录、名册条目或租户名单。**名册条目就是 PII**，
 回显它等于导出 PII。
 
+### GDPR 安全审计与管理面
+
+审计事件**只带计数、枚举与带密钥的会话指纹**。一个记下「脱敏了什么」的网关，
+是把 PII 搬了个地方而不是移除了它——事件里出现原文，审计本身就成了新的泄露渠道。
+
+```json
+{"schema":"airlock.audit.v1","event_id":"3b7f6e2bccd586b5",
+ "tenant":"acme","session_fingerprint":"92d60329fec0ded6",
+ "action":"redact","outcome":"ok","destination":"default",
+ "entities":{"EMAIL":1,"PHONE":1},"strategies":{"mask":2},
+ "recognizers":{"cn_mobile":1,"email":1},"duration_micros":55}
+```
+
+上面这条是实际跑出来的：请求里的 `session_id` 是 `zhangwei@acme.com`，
+轨迹里只有摘要。指纹必须带密钥，这不是可选项——会话标识常常就是用户邮箱，
+无密钥摘要能被穷举回原值。因此配了 `--audit-sink` 却没给 `--audit-key-file`
+时二进制拒绝启动，而不是降级成不发指纹或记原文。
+
+```bash
+--audit-sink stderr|/var/log/airlock/audit.jsonl|https://siem.internal/ingest
+--audit-key-file /var/run/secrets/audit-key    # 配了 sink 就必填
+```
+
+**不配 `--audit-sink` 是合法选择，但启动日志会明确说轨迹是关的。**
+这一整块能力此前在库里齐备、测试全绿，而两个二进制里一行都没接——
+`/v1/admin/inspect` 报 `sink="none"`、`emitted=0`，识别器清单与名册规模都是
+`null`，而这份 README 的能力清单里写着「不带原文的安全审计」。
+现在有集成用例真跑二进制拨测它，见「踩过的坑」。
+
+管理快照 `GET /v1/admin/inspect` 报告装配结果，不报告数据：
+
+- **名册只报条数，不报条目。** 姓名名册就是一份员工与客户姓名清单，
+  它不是「碰巧含有 PII 的配置」，它本身就是 PII，只不过以配置形式加载。
+- **识别器清单逐条列出名称与实体类型。** 「装了哪些国家包」与「这些包实际
+  产出哪些识别器」是两件事：包能注册、二进制能启动、请求能处理，而某个识别器
+  因为一个长度断言从来匹配不到任何东西——意大利 11 位增值税号撞上写死
+  12–19 位的 Luhn 校验，就是这么过去的。
+
 ### GPU 显存感知准入
 
 LLM 推理的真实约束是 **KV 缓存显存**，不是请求数。一个 10 万 token 的 prompt
@@ -667,6 +705,15 @@ LLM 推理的真实约束是 **KV 缓存显存**，不是请求数。一个 10 �
 
 **fail-closed 返回 200 + `blocked: true`，不返回 5xx。** 这不是服务故障而是安全
 策略生效。返回 5xx 会让网关按「上游故障」重试或降级——而降级的方向往往是放行。
+
+**库层测试再绿，也证明不了装配层接了它。** `pii/audit` 包齐备、测试全绿，
+`sidecar.Options` 有 `Auditor` / `Fingerprinter` / `RosterSizes` /
+`RecognizerCatalog` 四个字段——而两个二进制的 `main` 一个都没赋值。实测：
+`/v1/admin/inspect` 报 `sink="none"`、`emitted=0`，识别器清单与国家包都是
+`null`，而 README 声称「不带原文的安全审计」。同一个文件里 `Evidence` 字段的
+注释记着一模一样的事故（「验证器在测试里一直接着，在真实二进制里从来没接上」）
+——**同类错误在同一处犯了两次**，因为单元测试各自装配自己那一份，装配层漏了
+什么它们全都发现不了。补法是集成用例真跑二进制、对着它自陈的能力拨测。
 
 **注释描述的行为可能根本不存在。** `StreamRestorer` 的文档写着「每条自然语言
 路径各自维护一个滞留缓冲，共用一个缓冲会让它们互相污染」——而实现按「帧内

@@ -88,8 +88,13 @@ var (
 	// manifest already passed it.
 	sessionConsistency = flag.String("session-consistency", "",
 		sidecar.SessionConsistencyFlagUsage)
-	maxSessions = flag.Int("max-sessions", 100_000, "活跃会话上限")
-	logLevel    = flag.String("log-level", "info", "日志级别")
+
+	// 审计装配与 Core 共用 sidecar 包里的同一份实现，理由见那里的注释：
+	// 安全相关的装配在两个 main 里各写一份就会漂移。
+	auditSink    = flag.String("audit-sink", "", sidecar.AuditSinkFlagUsage)
+	auditKeyFile = flag.String("audit-key-file", "", sidecar.AuditKeyFlagUsage)
+	maxSessions  = flag.Int("max-sessions", 100_000, "活跃会话上限")
+	logLevel     = flag.String("log-level", "info", "日志级别")
 )
 
 func main() {
@@ -130,6 +135,13 @@ func run(logger *slog.Logger) error {
 	} else if len(orgs) > 0 {
 		roster[detect.TypeOrg] = orgs
 	}
+	// 只记条数，绝不记条目：姓名名册本身就是 PII，只是以配置形式加载。
+	// Sizes, never entries — a name roster is a list of people.
+	rosterSizes := map[string]int{}
+	for typ, entries := range roster {
+		rosterSizes[string(typ)] = len(entries)
+	}
+
 	if len(roster) > 0 {
 		gaz, err := detect.NewGazetteerDetector(roster, false, 2)
 		if err != nil {
@@ -199,15 +211,31 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("租户隔离已生效", "resolver", resolver.Name())
 
+	auditor, fingerprinter, err := sidecar.BuildAudit(*auditSink, *auditKeyFile, logger)
+	if err != nil {
+		return err
+	}
+	if auditor != nil {
+		defer func() { _ = auditor.Close() }()
+		logger.Info("GDPR 安全审计轨迹已接通", "sink", auditor.SinkName())
+	} else {
+		logger.Warn("未接审计轨迹——不会产生任何 GDPR 审计事件",
+			"补法", "--audit-sink=stderr|<文件>|<SIEM URL> 搭配 --audit-key-file")
+	}
+
 	srv, err := sidecar.New(sidecar.Options{
-		Detector:       cascade,
-		Evidence:       validator,
-		FailClosed:     true,
-		SessionTTL:     *sessionTTL,
-		MaxSessions:    *maxSessions,
-		TenantResolver: resolver,
-		Jurisdictions:  splitCSV(*jurisdictions),
-		Logger:         logger,
+		Detector:          cascade,
+		Evidence:          validator,
+		FailClosed:        true,
+		SessionTTL:        *sessionTTL,
+		MaxSessions:       *maxSessions,
+		TenantResolver:    resolver,
+		Auditor:           auditor,
+		Fingerprinter:     fingerprinter,
+		Jurisdictions:     splitCSV(*jurisdictions),
+		RosterSizes:       rosterSizes,
+		RecognizerCatalog: sidecar.CatalogFromJurisdictions(splitCSV(*jurisdictions)),
+		Logger:            logger,
 	})
 	if err != nil {
 		return err

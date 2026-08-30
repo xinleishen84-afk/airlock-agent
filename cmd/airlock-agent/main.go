@@ -55,6 +55,9 @@ var (
 		"启用单姓识别。实测在对抗性语料上召回零增益、误报十四处，因此默认关闭")
 	matrixFile = flag.String("redaction-matrix", "",
 		"脱敏策略矩阵配置。配置后请求必须带 destination 字段")
+	auditSink    = flag.String("audit-sink", "", sidecar.AuditSinkFlagUsage)
+	auditKeyFile = flag.String("audit-key-file", "", sidecar.AuditKeyFlagUsage)
+
 	hashKeyFile = flag.String("hash-key-file", "",
 		"HMAC 密钥文件（密钥卷挂载点）。矩阵里用到 hash 算子时必填。\n"+
 			"密钥绝不能写进配置文件——与策略文件同行的密钥会随它的每一份副本流传")
@@ -124,16 +127,38 @@ func main() {
 		fmt.Fprint(os.Stderr, matrix.Describe())
 	}
 
+	auditor, fingerprinter, err := sidecar.BuildAudit(*auditSink, *auditKeyFile, logger)
+	if err != nil {
+		logger.Error("构造审计轨迹失败", "err", err)
+		os.Exit(1)
+	}
+	if auditor != nil {
+		defer func() { _ = auditor.Close() }()
+		logger.Info("GDPR 安全审计轨迹已接通", "sink", auditor.SinkName())
+	} else {
+		// 不发审计事件是合法选择，但不能是「以为发了其实没发」。
+		// 这一整块能力此前在库里齐备、在二进制里一行都没接——
+		// /v1/admin/inspect 报 sink=none、emitted=0，而 README 声称
+		// 「不带原文的安全审计」。声称的能力静默缺席，只能靠说出来堵。
+		logger.Warn("未接审计轨迹——不会产生任何 GDPR 审计事件",
+			"补法", "--audit-sink=stderr|<文件>|<SIEM URL> 搭配 --audit-key-file")
+	}
+
 	srv, err := sidecar.New(sidecar.Options{
-		Detector:       detector,
-		Evidence:       evidence,
-		Matrix:         matrix,
-		TokenStore:     tokenStore,
-		TenantResolver: resolver,
-		FailClosed:     *failClosed,
-		SessionTTL:     *sessionTTL,
-		MaxSessions:    *maxSessions,
-		Logger:         logger,
+		Detector:          detector,
+		Evidence:          evidence,
+		Matrix:            matrix,
+		TokenStore:        tokenStore,
+		TenantResolver:    resolver,
+		Auditor:           auditor,
+		Fingerprinter:     fingerprinter,
+		Jurisdictions:     splitCSV(*jurisdictions),
+		RosterSizes:       rosterSizes,
+		RecognizerCatalog: sidecar.CatalogFromJurisdictions(splitCSV(*jurisdictions)),
+		FailClosed:        *failClosed,
+		SessionTTL:        *sessionTTL,
+		MaxSessions:       *maxSessions,
+		Logger:            logger,
 	})
 	if err != nil {
 		logger.Error("启动失败", "err", err)
@@ -201,6 +226,17 @@ func buildDetector(logger *slog.Logger) (detect.Detector, *verify.EvidenceValida
 		return nil, nil, err
 	} else if len(orgs) > 0 {
 		roster[detect.TypeOrg] = orgs
+	}
+
+	// 记下条数，不记条目。
+	//
+	// 姓名名册就是一份员工与客户姓名清单——它不是「碰巧含有 PII 的配置」，
+	// 它本身就是 PII，只不过以配置形式加载。管理快照因此只报规模。
+	//
+	// Sizes, never entries: a name roster is a list of people. The admin
+	// snapshot reports how many, never which.
+	for typ, entries := range roster {
+		rosterSizes[string(typ)] = len(entries)
 	}
 
 	var disabled []detect.EntityType
@@ -375,3 +411,6 @@ func buildTenantResolver() (sidecar.TenantResolver, error) {
 			"缺少租户隔离时，会话保险库只以调用方提供的 session_id 作键，" +
 			"任何拿到他人 session_id 的调用方都能取回对方的明文 PII")
 }
+
+// rosterSizes 记录各名册的条目数量，供管理快照展示。只记数量，绝不记条目。
+var rosterSizes = map[string]int{}
