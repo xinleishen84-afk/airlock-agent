@@ -277,16 +277,46 @@ func (c *Client) DetectContextLanguage(ctx context.Context, text, language strin
 	callCtx, cancel := context.WithTimeout(ctx, c.opts.Timeout)
 	defer cancel()
 
+	// 用的是**本次调用**的 language，不是客户端默认值。
+	//
+	// 这里曾经写 c.opts.Language，于是整条语言路由链在 wire 上作废：
+	// Cascade 按文字系统算出 zh / en 并逐段传下来，客户端却一律发自己的
+	// 默认值。症状是安静的——请求成功、实体也检出来了，只是拉丁文段落被
+	// 送进了中文模型（分布外输入，实测把 declined、deps、Codice 判成人名），
+	// 而 metrics 里的 language 标签显示的是路由算出来的那个，与 wire 上
+	// 实际发出去的对不上。
+	//
+	// 空字符串是有意义的取值：服务端把它当 auto，按文字系统切段各自路由。
+	// 因此不能在这里回退到默认值。
+	//
+	// This used the client's default, which discarded the whole language
+	// routing chain at the wire: Cascade computed zh/en per segment while every
+	// request carried the same default. The failure is silent — requests
+	// succeed and entities come back, but Latin text reaches the Chinese model
+	// (out-of-distribution; measured, it labels "declined" and "Codice" as
+	// person names), and the language label in metrics disagrees with what was
+	// actually sent. An empty value is meaningful: the server treats it as auto.
 	resp, err := c.stub.Analyze(callCtx, &piiv1.AnalyzeRequest{
-		Text: text, Language: c.opts.Language, EntityTypes: types,
+		Text: text, Language: language, EntityTypes: types,
 	})
 	if err != nil {
 		if c.opts.FailOpen {
-			// fail-open 是显式选择，必须留下痕迹供审计追责。
-			// A fail-open is an explicit choice and must leave a trace.
-			return nil, fmt.Errorf(
-				"%w（已按 fail-open 放行，姓名/地址/机构本次完全未检测）: %v",
-				ErrNERUnavailable, err)
+			// 标记成「可降级」，由级联层决定拿它做什么。
+			//
+			// 这里曾经只是换一句错误文案，调用链照样把 error 一路冒泡，
+			// 请求整条失败——配了 fail-open 的部署在 NER 挂掉时与
+			// fail-closed 表现完全一样，这个开关没有改变任何行为。
+			//
+			// 传输层不该替安全策略拿主意：它知道调用失败了、知道自己被配成
+			// fail-open，但不知道这次请求能不能少了模型结果还继续。因此只
+			// 标记，不决定；detect.ErrModelDegraded 的注释里写着完整理由。
+			//
+			// This used to only reword the error while the call chain
+			// propagated it, so the switch changed nothing: a fail-open
+			// deployment behaved exactly like a fail-closed one. Transport
+			// marks the class; the cascade decides.
+			return nil, fmt.Errorf("%w: %w: %v",
+				detect.ErrModelDegraded, ErrNERUnavailable, err)
 		}
 		return nil, fmt.Errorf("%w: %v", ErrNERUnavailable, err)
 	}

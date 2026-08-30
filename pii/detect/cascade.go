@@ -2,6 +2,7 @@ package detect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -132,6 +133,17 @@ type CascadeStats struct {
 
 	// ModelSkipped 是因为没有触发特征而跳过模型的次数。
 	ModelSkipped int
+
+	// ModelDegraded 是模型不可用、按 fail-open 降级为前两层的次数。
+	//
+	// 必须与 ModelSkipped 分开计：跳过是「这段文本不值得送模型」，
+	// 降级是「该送但送不了」。两者混在一起，一次 NER 长时间宕机会
+	// 表现为「触发率下降」，看起来像流量特征变了。
+	//
+	// Kept separate from ModelSkipped: skipping means the text did not warrant
+	// the model, degrading means it did and the model was unreachable. Merged,
+	// an outage looks like a shift in traffic composition.
+	ModelDegraded int
 
 	// PerLanguage 是按语言统计的模型调用次数。
 	//
@@ -348,6 +360,26 @@ func (c *Cascade) DetectContext(ctx context.Context, text string) ([]Entity, err
 
 	slow, err := c.detectWithModel(ctx, modelInput, language)
 	if err != nil {
+		// 传输层把「这次故障可以降级」标出来时，退回前两层的结果，
+		// 而不是让整条请求失败。
+		//
+		// 这里曾经无条件 return nil, err，于是 fail-open 这个开关只改了
+		// 错误文案：客户端返回的错误里写着「已按 fail-open 放行」，而调用
+		// 链把它一路冒泡上去，请求照样失败。配了 fail-open 的部署在 NER
+		// 挂掉时与 fail-closed 表现完全一样。
+		//
+		// 降级的代价是实打实的：姓名、地址、机构本次完全未检测。因此它
+		// 单独计数（ModelDegraded），不与 ModelSkipped 混在一起。
+		//
+		// The transport marks a failure as degradable; falling back to the
+		// first two layers is then the whole point of fail-open. This used to
+		// propagate unconditionally, so the switch changed the error text and
+		// nothing else — a fail-open deployment behaved exactly like a
+		// fail-closed one whenever NER was down.
+		if errors.Is(err, ErrModelDegraded) {
+			stats.ModelDegraded++
+			return ResolveOverlaps(fast), nil
+		}
 		return nil, err
 	}
 
