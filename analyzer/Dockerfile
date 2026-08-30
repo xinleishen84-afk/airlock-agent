@@ -47,8 +47,12 @@ COPY models.lock /tmp/models.lock
 # 也不出现在任何 SBOM 里。而模型**就是**检测器——换一个版本，姓名、地址、
 # 机构名的召回率会变，且没有任何东西会报错。
 #
-# 校验失败必须让构建失败，而不是回退到无校验下载：一个「验不过就照常装」
-# 的校验，比没有校验更糟，因为它让人以为验过了。
+# 校验交给 pip 的 --require-hashes，而不是手写「下载→算哈希→比对」。
+# 手写那版本可以工作，但它把一件 pip 已经做对的事又做了一遍：
+# 第一版就因为把 wheel 存成 zh_core_web_md.whl 而挂了——pip 要求文件名
+# 符合 PEP 427，版本与 tag 不能丢。用 --require-hashes 就没有这一步，
+# 而且它在安装**前**验证，设计上就是 fail-closed：任何一项缺哈希或对不上，
+# pip 直接拒绝，不存在「验不过还照装」的分支。
 #
 # Pinned URL plus sha256 rather than `spacy download`, which fetches whichever
 # version is currently compatible with no verification and no SBOM presence.
@@ -59,26 +63,18 @@ RUN export PYTHONPATH=/install/lib/python3.12/site-packages \
         PATH=/install/bin:$PATH; \
     set -eu; \
     version="$(grep '^SPACY_MODEL_VERSION=' /tmp/models.lock | cut -d= -f2)"; \
+    : > /tmp/models.txt; \
     for m in ${MODELS}; do \
-        expected="$(grep "^${m} " /tmp/models.lock | cut -d: -f2)"; \
+        expected="$(grep "^${m} " /tmp/models.lock | cut -d: -f2 || true)"; \
         if [ -z "${expected}" ]; then \
             echo "models.lock 里没有 ${m} 的校验和——拒绝装一个没锁的模型"; \
             exit 1; \
         fi; \
-        url="https://github.com/explosion/spacy-models/releases/download/${m}-${version}/${m}-${version}-py3-none-any.whl"; \
-        wheel="/tmp/${m}.whl"; \
-        echo "下载 ${m}-${version}"; \
-        python -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" "${url}" "${wheel}"; \
-        actual="$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "${wheel}")"; \
-        if [ "${actual}" != "${expected}" ]; then \
-            echo "${m} 校验和不符——构建中止"; \
-            echo "  期望 ${expected}"; \
-            echo "  实得 ${actual}"; \
-            exit 1; \
-        fi; \
-        pip install --no-cache-dir --no-deps --target /install/lib/python3.12/site-packages "${wheel}"; \
-        rm -f "${wheel}"; \
-    done
+        echo "https://github.com/explosion/spacy-models/releases/download/${m}-${version}/${m}-${version}-py3-none-any.whl --hash=sha256:${expected}" >> /tmp/models.txt; \
+    done; \
+    cat /tmp/models.txt; \
+    pip install --no-cache-dir --no-deps --require-hashes \
+        --target /install/lib/python3.12/site-packages -r /tmp/models.txt
 
 FROM python:3.12-slim
 
