@@ -1,0 +1,173 @@
+name: release
+
+# 只在打标签时跑。签名与 provenance 锚定的是「某个 tag 对应的那份源码」，
+# 每次 push 都签等于让签名失去指向性。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建与生成 SBOM，不签名不发布"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write      # 创建 Release 并上传产物
+  id-token: write      # Sigstore 无密钥签名要的 OIDC token
+  attestations: write  # SLSA provenance
+  packages: write      # 推送分析器镜像
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 发布前把 CI 再跑一遍。
+  #
+  # tag 通常指向一个已经绿过的提交，但「绿过」与「此刻仍然绿」是两件事：
+  # 依赖会漂移，runner 镜像会换。签一个没验过的产物，等于把信任建立在
+  # 「我记得它是好的」上面。
+  # ---------------------------------------------------------------------------
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - name: 四个模块逐个测
+        run: |
+          set -e
+          go test ./... -count=1 -timeout 10m
+          (cd nerclient && go test ./... -count=1 -timeout 10m)
+          (cd otelprocessor && go test ./... -count=1 -timeout 10m)
+          (cd test/integration && go vet ./...)
+
+  # ---------------------------------------------------------------------------
+  # 二进制：可复现构建 → SBOM → 签名 → provenance
+  # ---------------------------------------------------------------------------
+  binaries:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # scripts/build.sh 要 git describe 取版本号
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      # 构建参数在 scripts/build.sh 里，不在这个文件里。
+      # 三个入口、两个模块、CI、release、Dockerfile——参数各写一份的话，
+      # 漏掉一处 -trimpath 就会让那一处产出带上构建机的绝对路径。
+      - name: 可复现构建（四平台 × 三个二进制）
+        run: ./scripts/build.sh
+
+      # 同一份源码构建两次必须字节相同。这不是形式检查：可复现性是
+      # provenance 的前提——签名只证明「这个产物出自这条流水线」，
+      # 而可复现性让任何人能独立验证「这条流水线的输入确实是这份源码」。
+      - name: 复现性自检
+        run: |
+          cp dist/SHA256SUMS /tmp/first.txt
+          rm -rf dist
+          ./scripts/build.sh
+          if ! diff -q /tmp/first.txt dist/SHA256SUMS; then
+            echo "两次构建产物不一致——签名无法证明产物对应这份源码"
+            diff /tmp/first.txt dist/SHA256SUMS || true
+            exit 1
+          fi
+          echo "两次构建字节相同"
+
+      # SBOM 覆盖的是 Go 模块依赖树。主模块只有一个外部依赖，
+      # 但 nerclient 有 8 个、otelprocessor 有 39 个——用二进制的人
+      # 需要知道自己实际引入了什么。
+      - name: 生成 SBOM（SPDX）
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: airlock-agent-sbom.spdx.json
+          output-file: dist/airlock-agent-sbom.spdx.json
+
+      - name: 安装 cosign
+        uses: sigstore/cosign-installer@v3
+
+      # 无密钥签名：身份来自 GitHub 的 OIDC token，不需要长期私钥。
+      # 长期私钥要轮转、要存放、泄漏了要吊销——对一个还没有发布节奏的
+      # 项目来说，那套流程本身就是风险。
+      - name: 签名产物
+        if: ${{ !inputs.dry_run }}
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -e
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sig|*.pem) continue;; esac
+            cosign sign-blob --output-signature "$f.sig" \
+                             --output-certificate "$f.pem" "$f"
+          done
+          echo "已签名 $(ls dist/*.sig | wc -l) 个文件"
+
+      # SLSA provenance：证明这些产物由这个仓库的这条 workflow、
+      # 从这个提交构建而来。它回答的是签名回答不了的那半个问题——
+      # 签名说「有人签了它」，provenance 说「它是这么来的」。
+      - name: 生成 SLSA provenance
+        if: ${{ !inputs.dry_run }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*'
+
+      - name: 上传到 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - name: 归档产物（dry-run 时也能拿到）
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ---------------------------------------------------------------------------
+  # 分析器镜像：构建 → SBOM → 签名 → provenance
+  #
+  # 镜像比二进制更需要这套：它里面有 spaCy 的整棵依赖树和几百 MB 的模型，
+  # 而模型不是 pip 依赖、没有版本锁、也不在任何 SBOM 的默认覆盖范围里。
+  # ---------------------------------------------------------------------------
+  analyzer-image:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ghcr
+        if: ${{ !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建镜像
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: analyzer
+          file: analyzer/Dockerfile
+          push: ${{ !inputs.dry_run }}
+          tags: ghcr.io/${{ github.repository_owner }}/airlock-analyzer:${{ github.ref_name }}
+          provenance: true
+          sbom: true
+
+      - name: 安装 cosign
+        if: ${{ !inputs.dry_run }}
+        uses: sigstore/cosign-installer@v3
+
+      - name: 签名镜像
+        if: ${{ !inputs.dry_run }}
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign ghcr.io/${{ github.repository_owner }}/airlock-analyzer@${{ steps.build.outputs.digest }}

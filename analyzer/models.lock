@@ -1,0 +1,31 @@
+# spaCy 模型的锁定版本与校验和。
+#
+# # 为什么模型需要单独锁
+# # Why models need a lock of their own
+#
+# 模型不是 pip 依赖：`python -m spacy download zh_core_web_md` 去 spaCy 的
+# 索引取「当前兼容的那一个」，版本随时间漂移，没有版本锁，也不出现在任何
+# requirements 或 SBOM 的默认覆盖范围里。
+#
+# 对这个项目来说漂移不是小事：模型**就是**检测器。换一个版本，
+# 姓名、地址、机构名的召回率会变，而没有任何东西会报错——README 里那个
+# 「非结构化 100%」的数字，是拿某一个具体模型跑出来的。
+#
+# 更直接的是供应链：一个不校验的下载，等于把这几百 MB 的信任完全交给
+# 传输链路和上游索引。锁住 URL 与 sha256 之后，篡改会在构建期失败，
+# 而不是在推理结果里悄悄体现。
+#
+# Models are not pip dependencies: `spacy download` fetches whichever version
+# is currently compatible, with no lock and no presence in any SBOM. Here the
+# model IS the detector — a different version changes recall for names,
+# addresses and organizations with nothing reporting an error, and the
+# "unstructured 100%" figure in the README was measured against one specific
+# model. Pinning the URL and hash makes tampering fail at build time rather
+# than surface quietly in inference results.
+#
+# 更新方法：改版本号，重跑 scripts/lock-models.sh，提交 diff。
+
+SPACY_MODEL_VERSION=3.8.0
+
+zh_core_web_md sha256:bcf300540fbd15b1b0aac358f327f2a31de8992b346162d5600f843514da0e98
+en_core_web_lg sha256:293e9547a655b25499198ab15a525b05b9407a75f10255e405e8c3854329ab63

@@ -72,8 +72,9 @@ store, and that store **is** persistent — it is a PII database.</sub>
   是效用损失不是泄露。契约里的 `language` 字段已支持真正的语言识别，
   但语言识别器本身还没有。
 - **并发饱和下整机吞吐约 40MB/s**，未达 50MB/s 目标；单请求延迟达标。
-- **发布产物没有签名，也没有 SBOM。** 拿到二进制的人无法验证它就是这份源码
-  构建出来的。SLSA provenance / Cosign / 模型校验和都还没做。
+- **还没有打过 tag，因此还没有已签名的 Release。** 发布流水线写好了
+  （Cosign 无密钥签名 + SLSA provenance + SPDX SBOM + 可复现构建，
+  见 [SECURITY.md](SECURITY.md)），但它只在打标签时触发，至今未跑过一次真的发布。
 - 容器镜像与 K8s 清单已写好但**未在真实集群里跑过**——本机验证到进程级为止
 - 多副本部署的会话映射共享。占位符（`PHONE_0`、`PHONE_1`……）是按本副本见过的
   文本顺序分配的递增序号，两个副本对同一会话会给出不同的编号。实测：同一会话下
@@ -849,6 +850,8 @@ internal/            只是为了让集成方式有一份可运行的示例。
 ```
 
 `pii/*`、`gpuload`、`sidecar` 是公开包，可单独 import。
+
+产物的验证方法、SBOM、模型锁与可复现构建见 [SECURITY.md](SECURITY.md)。
 
 ---
 

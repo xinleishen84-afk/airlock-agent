@@ -245,6 +245,26 @@ jobs:
         working-directory: analyzer
         run: python -m unittest discover tests -v
 
+      # 锁文件必须与上游实际产物一致。GitHub release 资产是不可变的，
+      # 因此不一致只有两种可能：锁写错了，或者上游资产被换了——
+      # 后者正是这个校验存在的理由。
+      - name: 模型锁未漂移
+        run: |
+          set -e
+          version="$(grep '^SPACY_MODEL_VERSION=' analyzer/models.lock | cut -d= -f2)"
+          for m in $(grep -oE '^[a-z]+_core_[a-z]+_[a-z]+' analyzer/models.lock); do
+            expected="$(grep "^${m} " analyzer/models.lock | cut -d: -f2)"
+            url="https://github.com/explosion/spacy-models/releases/download/${m}-${version}/${m}-${version}-py3-none-any.whl"
+            actual="$(curl -sL --fail "$url" | sha256sum | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::${m} 的校验和与 analyzer/models.lock 不符"
+              echo "  锁里写的 ${expected}"
+              echo "  实际下载 ${actual}"
+              exit 1
+            fi
+            echo "${m} ✓"
+          done
+
       - name: 下载中文模型
         run: python -m spacy download zh_core_web_md
 
