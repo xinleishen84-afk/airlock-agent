@@ -44,6 +44,7 @@ import (
 
 	"github.com/xinleishen84-afk/airlock-agent/nerclient"
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+	"github.com/xinleishen84-afk/airlock-agent/pii/audit"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect/packs"
 	"github.com/xinleishen84-afk/airlock-agent/pii/verify"
@@ -91,8 +92,8 @@ var (
 
 	// 审计装配与 Core 共用 sidecar 包里的同一份实现，理由见那里的注释：
 	// 安全相关的装配在两个 main 里各写一份就会漂移。
-	auditSink    = flag.String("audit-sink", "", sidecar.AuditSinkFlagUsage)
-	auditKeyFile = flag.String("audit-key-file", "", sidecar.AuditKeyFlagUsage)
+	auditSink    = flag.String("audit-sink", "", audit.SinkFlagUsage)
+	auditKeyFile = flag.String("audit-key-file", "", audit.KeyFlagUsage)
 	maxSessions  = flag.Int("max-sessions", 100_000, "活跃会话上限")
 	logLevel     = flag.String("log-level", "info", "日志级别")
 )
@@ -211,7 +212,7 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("租户隔离已生效", "resolver", resolver.Name())
 
-	auditor, fingerprinter, err := sidecar.BuildAudit(*auditSink, *auditKeyFile, logger)
+	auditor, fingerprinter, err := audit.Build(*auditSink, *auditKeyFile, logger)
 	if err != nil {
 		return err
 	}

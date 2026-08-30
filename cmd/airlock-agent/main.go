@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+	"github.com/xinleishen84-afk/airlock-agent/pii/audit"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
 	"github.com/xinleishen84-afk/airlock-agent/pii/preset"
@@ -55,8 +56,8 @@ var (
 		"启用单姓识别。实测在对抗性语料上召回零增益、误报十四处，因此默认关闭")
 	matrixFile = flag.String("redaction-matrix", "",
 		"脱敏策略矩阵配置。配置后请求必须带 destination 字段")
-	auditSink    = flag.String("audit-sink", "", sidecar.AuditSinkFlagUsage)
-	auditKeyFile = flag.String("audit-key-file", "", sidecar.AuditKeyFlagUsage)
+	auditSink    = flag.String("audit-sink", "", audit.SinkFlagUsage)
+	auditKeyFile = flag.String("audit-key-file", "", audit.KeyFlagUsage)
 
 	hashKeyFile = flag.String("hash-key-file", "",
 		"HMAC 密钥文件（密钥卷挂载点）。矩阵里用到 hash 算子时必填。\n"+
@@ -127,7 +128,7 @@ func main() {
 		fmt.Fprint(os.Stderr, matrix.Describe())
 	}
 
-	auditor, fingerprinter, err := sidecar.BuildAudit(*auditSink, *auditKeyFile, logger)
+	auditor, fingerprinter, err := audit.Build(*auditSink, *auditKeyFile, logger)
 	if err != nil {
 		logger.Error("构造审计轨迹失败", "err", err)
 		os.Exit(1)

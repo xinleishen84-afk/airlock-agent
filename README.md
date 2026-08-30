@@ -706,6 +706,14 @@ LLM 推理的真实约束是 **KV 缓存显存**，不是请求数。一个 10 �
 **fail-closed 返回 200 + `blocked: true`，不返回 5xx。** 这不是服务故障而是安全
 策略生效。返回 5xx 会让网关按「上游故障」重试或降级——而降级的方向往往是放行。
 
+**测试会替二进制把接线补上，然后测补完之后的行为。**
+`sidecar/audit_test.go` 的 `newAuditServer` 自己构造了 `Options{Auditor: …,
+Fingerprinter: …, RosterSizes: …, RecognizerCatalog: …}`——四个字段全填上了，
+于是它测的是「装配正确时的行为」，而真实二进制一个都没填。这不是这四个字段
+特有的：`Options` 里**任何可选字段**都有这个洞，留空没有编译期信号，而测试只要
+自己填了就永远发现不了。唯一挡得住的位置是「起真实二进制、打 /v1/admin/inspect、
+断言 sink 不是 none」——那是测试无法替二进制代劳的地方。
+
 **库层测试再绿，也证明不了装配层接了它。** `pii/audit` 包齐备、测试全绿，
 `sidecar.Options` 有 `Auditor` / `Fingerprinter` / `RosterSizes` /
 `RecognizerCatalog` 四个字段——而两个二进制的 `main` 一个都没赋值。实测：

@@ -26,16 +26,21 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/internal/ratelimit"
 	"github.com/xinleishen84-afk/airlock-agent/internal/routing"
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+	"github.com/xinleishen84-afk/airlock-agent/pii/audit"
 	"github.com/xinleishen84-afk/airlock-agent/pii/detect"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
 )
 
 // 命令行参数。
 var (
-	addr        = flag.String("addr", ":8080", "监听地址")
-	configPath  = flag.String("config", "configs/gateway.yaml", "配置文件路径")
-	cgroupRoot  = flag.String("cgroup-root", cpulimit.DefaultCgroupRoot, "cgroup 挂载点")
-	concurrency = flag.Int("concurrency", 0,
+	addr       = flag.String("addr", ":8080", "监听地址")
+	configPath = flag.String("config", "configs/gateway.yaml", "配置文件路径")
+	cgroupRoot = flag.String("cgroup-root", cpulimit.DefaultCgroupRoot, "cgroup 挂载点")
+
+	// 审计装配与两个 sidecar 共用 pii/audit 里的同一份实现。
+	auditSink    = flag.String("audit-sink", "", audit.SinkFlagUsage)
+	auditKeyFile = flag.String("audit-key-file", "", audit.KeyFlagUsage)
+	concurrency  = flag.Int("concurrency", 0,
 		"工作线程并发度（GOMAXPROCS）。0 表示按 CPU 配额自动推导。\n"+
 			"对应 Envoy 的 --concurrency：显式对齐容器 CPU limit 以避免 CFS 限流")
 	latencyFirst = flag.Bool("latency-first", true,
@@ -336,7 +341,24 @@ func buildHandler(
 	vaults := anonymize.NewVaultRegistry(cfg.SessionTTL.Std(), cfg.MaxSessions)
 	stopVaultJanitor := vaults.StartJanitor(time.Minute)
 
+	// 网关是第三条脱敏路径，不走 sidecar 包，因此审计要在这里单独接。
+	// 两个 sidecar 二进制接上之后，这条路径仍然一条事件都不发，
+	// 而它照常在真实流量上脱敏——审计缺席不会有任何症状。
+	auditor, _, err := audit.Build(*auditSink, *auditKeyFile, logger)
+	if err != nil {
+		logger.Error("构造审计轨迹失败", "err", err)
+		os.Exit(1)
+	}
+	if auditor != nil {
+		defer func() { _ = auditor.Close() }()
+		logger.Info("GDPR 安全审计轨迹已接通", "sink", auditor.SinkName())
+	} else {
+		logger.Warn("未接审计轨迹——不会产生任何 GDPR 审计事件",
+			"补法", "--audit-sink=stderr|<文件>|<SIEM URL> 搭配 --audit-key-file")
+	}
+
 	handler := proxy.NewHandler(proxy.Deps{
+		Auditor:      auditor,
 		Policy:       policy,
 		Breakers:     breakers,
 		Creds:        creds,

@@ -22,6 +22,7 @@ import (
 	"github.com/xinleishen84-afk/airlock-agent/internal/ratelimit"
 	"github.com/xinleishen84-afk/airlock-agent/internal/routing"
 	"github.com/xinleishen84-afk/airlock-agent/pii/anonymize"
+	"github.com/xinleishen84-afk/airlock-agent/pii/audit"
 	"github.com/xinleishen84-afk/airlock-agent/pii/document"
 )
 
@@ -32,9 +33,21 @@ type Deps struct {
 	Creds    map[string]*credential.BackendPolicy
 	Limiter  *ratelimit.Limiter
 	Redactor *anonymize.Redactor
-	Vaults   *anonymize.VaultRegistry
-	Client   *http.Client
-	Logger   *slog.Logger
+
+	// Auditor 发送 GDPR 安全审计事件。为 nil 时不发送。
+	//
+	// 网关是第三条脱敏路径——它不走 sidecar 包，自己在 redactBody /
+	// RestoreBody 上做。审计因此也要在这里单独接：两个 sidecar 二进制接上
+	// 之后，网关仍然一条事件都不发，而它照常在真实流量上脱敏。
+	//
+	// The gateway is a third redaction path that does not go through the
+	// sidecar package, so the trail has to be wired here too: with both
+	// sidecars emitting, this path still emitted nothing while redacting real
+	// traffic.
+	Auditor *audit.Recorder
+	Vaults  *anonymize.VaultRegistry
+	Client  *http.Client
+	Logger  *slog.Logger
 	// GPULoad 提供各后端的 KV 显存压力，用于边缘准入控制。
 	// 为 nil 时退化为纯 token 限流——只看 token 数不看显存，
 	// 会在 GPU 已濒临 OOM 时继续放行。
@@ -250,7 +263,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		scope = anonymize.StrategyScope{Tenant: ref.Tenant, Vault: vault}
-		body, err = h.redactBody(r.Context(), body, scope)
+		body, err = h.redactBody(r.Context(), body, scope, ref.Session)
 		if err != nil {
 			log.Error("出站脱敏失败，已阻断", "err", err)
 			h.reject(w, http.StatusBadGateway, "PII 脱敏失败，请求已阻断")
@@ -717,21 +730,52 @@ func (h *Handler) collectFrom(
 // 列出的路径。协议骨架字段（role / model / function.name /
 // parameters.enum / tool_call_id 等）在物理上根本不会被访问，
 // NER 的概率性输出因此不可能污染协议结构。
-func (h *Handler) redactBody(ctx context.Context, body []byte, scope anonymize.StrategyScope) ([]byte, error) {
+func (h *Handler) redactBody(ctx context.Context, body []byte, scope anonymize.StrategyScope,
+	session string) ([]byte, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("解析请求体失败: %w", err)
 	}
+
+	// 跨整个文档累计，而不是逐段丢掉。
+	//
+	// 一个请求体里有多段自然语言（正文、工具入参、工具描述……），逐段发事件
+	// 会让「这次请求脱敏了什么」散成十几条，运维拿不出一次请求的完整证据；
+	// 而只发最后一段的计数则会漏掉其余全部。审计的单位是一次请求。
+	//
+	// Accumulated across the whole document rather than per span: a body holds
+	// several natural-language regions, and one event per span leaves no record
+	// of what a single request redacted. The unit of audit is the request.
+	start := time.Now()
+	typeCounts := map[string]int{}
+	strategies := map[string]int{}
 
 	err := document.SanitizeDocument(doc, func(_, text string) (string, error) {
 		res, err := h.deps.Redactor.Redact(ctx, text, scope)
 		if err != nil {
 			return "", err
 		}
+		for typ, n := range res.TypeCounts {
+			typeCounts[typ] += n
+		}
+		for name, n := range res.StrategyCounts {
+			strategies[name] += n
+		}
 		return res.Text, nil
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	if h.deps.Auditor != nil {
+		h.deps.Auditor.EmitRedaction(ctx, audit.Redaction{
+			Tenant:      scope.Tenant,
+			Session:     session,
+			Destination: "upstream",
+			TypeCounts:  typeCounts,
+			Strategies:  strategies,
+			Duration:    time.Since(start),
+		})
 	}
 	return document.MarshalPreserving(doc)
 }

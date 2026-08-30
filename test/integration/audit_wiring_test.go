@@ -3,12 +3,17 @@ package integration
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/xinleishen84-afk/airlock-agent/test/integration/chaos"
 	"strings"
 	"testing"
+	"time"
 )
 
 // inspectSnapshot 拉取管理快照。
@@ -209,4 +214,127 @@ func runBinaryExpectingFailure(t *testing.T, bin string, args ...string) (string
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return buf.String(), err
+}
+
+// TestGatewayEmitsAuditTrail 证明网关这条脱敏路径也发审计事件。
+// Proves the gateway's redaction path emits audit events too.
+//
+// # 网关是第三条脱敏路径
+// # The gateway is a third redaction path
+//
+// 它不走 sidecar 包，自己在 internal/proxy 里做 redactBody / RestoreBody。
+// 两个 sidecar 二进制接上审计之后，这条路径仍然一条事件都不发——而它照常在
+// 真实流量上脱敏，PII 该换的都换了，只是没有任何记录。审计缺席不会有症状：
+// 请求成功、脱敏生效、日志正常，唯独拿不出「这次请求处理了什么」的证据。
+//
+// 这条用例只能在二进制层写。库层测试会自己构造 Deps 并把 Auditor 填上，
+// 于是测的是「补完接线之后的行为」——真实二进制漏没漏，它一无所知。
+//
+// It does not go through the sidecar package. With both sidecars wired, this
+// path still emitted nothing while redacting real traffic: requests succeed,
+// redaction works, logs look normal, and no evidence of what was processed
+// exists. This can only be tested at the binary level — a library test supplies
+// its own Deps with an Auditor and therefore measures wiring it added itself.
+func TestGatewayEmitsAuditTrail(t *testing.T) {
+	up := chaos.Start(chaos.DefaultConfig())
+	defer up.Close()
+
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "audit.key")
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("k", 48)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trailPath := filepath.Join(dir, "audit.jsonl")
+
+	// 必须 always_redact：默认配置里上游是 self_hosted，脱敏按设计跳过
+	// （自建后端在企业边界内），不脱敏自然也就没有审计事件——那样这条用例
+	// 会因为前提不成立而绿，而不是因为接线正确而绿。
+	//
+	// always_redact is required: the default fixture's upstream is self_hosted,
+	// so redaction is skipped by design and no event would be emitted — the
+	// test would pass on a false premise rather than on correct wiring.
+	gw := startGateway(t, writeAuditConfig(t, up.BaseURL()),
+		"-audit-sink", trailPath, "-audit-key-file", keyPath)
+	gw.waitReady(t, 20*time.Second)
+
+	const session = "zhangwei@acme.com"
+	const secret = "13800138000"
+	req, err := http.NewRequest(http.MethodPost,
+		gw.URL+"/v1/chat/completions",
+		strings.NewReader(`{"stream":true,"messages":[{"role":"user","content":"联系`+secret+`"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Session-Id", session)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("请求网关: %v\n网关日志：\n%s", err, gw.Logs())
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	raw, err := os.ReadFile(trailPath)
+	if err != nil || len(raw) == 0 {
+		t.Fatalf("网关没有产生审计轨迹——脱敏照常发生，但没有任何记录。"+
+			"err=%v\n网关日志：\n%s", err, gw.Logs())
+	}
+	trail := string(raw)
+	for _, plain := range []string{secret, session} {
+		if strings.Contains(trail, plain) {
+			t.Errorf("审计轨迹里出现了原文 %q——事件本身成了泄露渠道", plain)
+		}
+	}
+	var ev map[string]any
+	if err := json.Unmarshal([]byte(strings.SplitN(trail, "\n", 2)[0]), &ev); err != nil {
+		t.Fatalf("审计事件不是合法 JSON: %v", err)
+	}
+	if fp, _ := ev["session_fingerprint"].(string); fp == "" {
+		t.Error("事件缺少 session_fingerprint——会话无法被追溯")
+	}
+	ents, _ := ev["entities"].(map[string]any)
+	if len(ents) == 0 {
+		t.Error("事件里 entities 为空——脱敏发生了却没记下处理了什么")
+	}
+}
+
+// writeAuditConfig 写一份会真正触发脱敏的网关配置。
+func writeAuditConfig(t *testing.T, upstreamURL string) string {
+	t.Helper()
+	dir := t.TempDir()
+	secretDir := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secretDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(secretDir, "vendor-key"),
+		[]byte("sk-audit-fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf(`
+secrets_mount_path: %s
+targets:
+  - name: audit-upstream
+    tier: 2
+    base_url: %s
+    model: fixture
+    self_hosted: true
+rate_limit:
+  tokens_per_window: 100000000
+  window: 1m
+pii:
+  jurisdictions: [GEN, CN]
+  session_consistency: single-replica
+  fail_closed: true
+  always_redact: true
+gpu:
+  kv_elevated: 0.75
+  kv_critical: 0.90
+  prefix_affinity: true
+  probe_interval: 500ms
+`, secretDir, upstreamURL)
+	path := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
