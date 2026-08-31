@@ -360,24 +360,35 @@ type Cache interface {
 // 这是多副本部署需要的驱动：用进程内库时，副本 A 签发的令牌在副本 B 就是幻影，
 // 而故障表现为「偶发的还原不了的响应」，且与任何东西都关联不上。
 type CacheTokenStore struct {
-	cache  Cache
-	ttl    time.Duration
-	prefix string
+	cache   Cache
+	keyring *Keyring
+	ttl     time.Duration
+	prefix  string
 }
 
 // NewCacheTokenStore builds a cache-backed token store.
 // 构造基于缓存的令牌库。
 //
-// keyPrefix namespaces this store's keys inside a shared cache.
-// keyPrefix 在共享缓存中为本库的键划出命名空间。
-func NewCacheTokenStore(c Cache, ttl time.Duration, keyPrefix string) (*CacheTokenStore, error) {
+// keyring 是必填的：令牌由租户密钥确定性派生，没有密钥就没有令牌。
+// 见 deriveToken 里为什么这样设计。
+//
+// The keyring is required: tokens are derived deterministically under the
+// tenant's key. See deriveToken for why.
+func NewCacheTokenStore(c Cache, keyring *Keyring, ttl time.Duration,
+	keyPrefix string) (*CacheTokenStore, error) {
 	if c == nil {
 		return nil, fmt.Errorf("%w: 缓存驱动不能为空 / cache is required", ErrTokenStore)
+	}
+	if keyring == nil {
+		return nil, fmt.Errorf(
+			"%w: 密钥环不能为空——令牌由租户密钥派生，"+
+				"无密钥的派生可被任何拿到缓存读权限的人用「猜一个值、算一遍、"+
+				"看键在不在」证实 / keyring is required", ErrTokenStore)
 	}
 	if keyPrefix == "" {
 		keyPrefix = "airlock:tok:"
 	}
-	return &CacheTokenStore{cache: c, ttl: ttl, prefix: keyPrefix}, nil
+	return &CacheTokenStore{cache: c, keyring: keyring, ttl: ttl, prefix: keyPrefix}, nil
 }
 
 // tenantPrefix is the key prefix covering one tenant.
@@ -386,18 +397,57 @@ func (s *CacheTokenStore) tenantPrefix(t Tenant) string {
 	return s.prefix + string(t) + ":"
 }
 
-// valueKey is the forward-lookup key, keyed by a digest rather than the value.
-// 是正向查找键，以摘要而非原值作键。
+// deriveToken 由「租户密钥 + 命名空间 + 原值」确定性地算出令牌。
 //
-// The raw value must never appear in a cache key: keys show up in slow-query
-// logs, in monitoring dashboards, in KEYS output during an incident. A digest
-// keeps the lookup working while keeping the PII out of every one of those.
-// 原值绝不能出现在缓存键里：键会出现在慢查询日志、监控面板，
-// 以及事故期间某人敲下的 KEYS 输出中。
-// 用摘要既保住了查找，又让 PII 不出现在上述任何一处。
-func (s *CacheTokenStore) valueKey(k TokenKey, value string) string {
-	sum := sha256.Sum256([]byte(k.composite() + "\x00" + value))
-	return s.tenantPrefix(k.Tenant) + k.Namespace + ":v:" + hex.EncodeToString(sum[:])
+// # 这是本驱动只需要写一个键的原因
+// # This is why the driver writes exactly one key
+//
+// 原来是「随机令牌 + 一个正向索引把值摘要指向它」。两个键意味着两次写，
+// 而缓存是分布式的，两次写之间可以断、可以崩、可以被各自驱逐。无论怎么
+// 排序、怎么调 TTL，都只是把「能观察到撕裂」的窗口挪小，消不掉——
+// Cache 接口只有 Get/SetNX/DeleteByPrefix，没有跨键事务原语，而给它加一个
+// 会逼每个实现都提供跨键原子性，做不到的只能假装。
+//
+// 令牌确定性派生之后，正向索引整个不需要了：同一个值算出同一个令牌，
+// 这件事由函数本身保证，不需要存储去记。于是只剩一个键
+// 「令牌 → 原值」，一次写。**不存在两个键，也就不存在撕裂。**
+//
+// 顺带修掉一处比撕裂更早的弱点：原来的正向索引键是不加密钥的
+// sha256(租户+命名空间+原值)。任何拿到缓存读权限的人，猜一个手机号、
+// 算一遍 sha256、看那个键在不在，就能证实这个号码在不在系统里——
+// 一次不需要解密任何东西的存在性泄露。HMAC 把这条路堵死：没有租户密钥
+// 就算不出键，而密钥在密钥环里，不在缓存里。
+//
+// 截断到 128 位：碰撞概率可忽略，且与原来 newToken 的长度一致，
+// 复原侧的 tokenRe 与既有语料都不受影响。
+//
+// Deterministic derivation removes the forward index entirely: that the same
+// value yields the same token is guaranteed by the function, not recorded by
+// the store. One key remains — token to value — and one write. With no second
+// key there is nothing to tear, which no ordering or TTL tuning could achieve:
+// the Cache interface has no cross-key transaction, and adding one would force
+// every implementation to provide cross-key atomicity or fake it.
+//
+// It also closes an older weakness: the previous forward key was an unkeyed
+// sha256 of tenant, namespace and value, so anyone with read access to the
+// cache could confirm a guessed phone number by computing that digest and
+// checking whether the key existed — an existence oracle requiring no
+// decryption. Under HMAC the key cannot be computed without the tenant key,
+// which lives in the keyring rather than the cache.
+func (s *CacheTokenStore) deriveToken(k TokenKey, value string) (string, error) {
+	tk, err := s.keyring.Key(k.Tenant)
+	if err != nil {
+		return "", err
+	}
+	mac := hmac.New(sha256.New, tk)
+	// 分隔符是命名空间字符集禁止的字节，因此任何两个不同的
+	// (命名空间, 原值) 都不可能产出同一段输入。
+	// The separator is a byte the namespace charset forbids, so no two distinct
+	// (namespace, value) pairs can produce the same input.
+	mac.Write([]byte(k.Namespace))
+	mac.Write([]byte{0})
+	mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil)[:16]), nil
 }
 
 // tokenKey is the reverse-lookup key.
@@ -407,122 +457,78 @@ func (s *CacheTokenStore) tokenKey(k TokenKey, token string) string {
 }
 
 // Issue implements TokenStore.
+//
+// # 一次写，因此没有可观察的中间态
+// # One write, therefore no observable intermediate state
+//
+// 令牌由 deriveToken 从原值确定性算出，所以本方法只需要落一个键
+// 「令牌 → 原值」。安全不变量因此不是靠顺序或补偿撑起来的：
+//
+//   - Issue 返回的令牌立即可 Resolve：返回之前，那个键要么是本次写成功的，
+//     要么是已经存在且经过核对的。
+//   - 不存在「正向存在而反向不存在」：只有一个映射，没有第二个键可以撕裂。
+//   - 并发签发线性化到同一个令牌：并发的各方算出的是同一个令牌，
+//     它们不是竞争一个赢家，而是由构造方式直接达成一致。
+//   - 崩溃与超时：崩在写之前什么都没有，崩在写之后是完整的；
+//     超时含义不明时下一次调用算出同一个令牌，SetNX 要么写入要么发现已在。
+//   - 不依赖进程内 mutex，也不需要补偿回滚——没有第二步可回滚。
+//
+// Tokens are derived from the value, so exactly one key is written. The safety
+// invariants therefore do not rest on ordering or compensation: there is no
+// second key to tear, concurrent callers agree by construction rather than by
+// racing, and a crash either leaves nothing or leaves a complete record.
 func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string) (string, error) {
 	if err := key.Validate(); err != nil {
 		return "", err
 	}
-	vk := s.valueKey(key, value)
-
-	if tok, ok, err := s.cache.Get(ctx, vk); err != nil {
-		return "", fmt.Errorf("%w: 查询令牌失败 / looking up token: %v", ErrTokenStore, err)
-	} else if ok {
-		return tok, nil
-	}
-
-	tok, err := newToken()
+	tok, err := s.deriveToken(key, value)
 	if err != nil {
 		return "", err
 	}
+	tk := s.tokenKey(key, tok)
 
-	// 反向映射先写，正向映射后写。顺序是这里唯一的保护，两个方向都要交代。
-	//
-	// # 写失败时：先写正向会留下一个「谁也还原不了」的令牌，且永久生效
-	//
-	// 曾经是先写正向。反向那次写失败时，Issue 会报错——看起来是安全的，
-	// 但正向那条记录留下了。下一次同一个值进来，走开头的快路径直接命中，
-	// **成功返回**那个令牌，而它在缓存里没有对应的反向记录。
-	//
-	// 实测：那个令牌会进入出站载荷，模型带回来后 Resolve 返回 ok=false，
-	// 被当成模型捏造的幻影，真值永远还不回去。而且这不是一次性的——
-	// 每一次针对同一个值的调用都会返回同一个坏令牌，直到 TTL 到期。
-	//
-	// 反过来写就没有这个状态：反向写失败则什么都没留下；正向写失败则只留下
-	// 一条没人指向的反向记录，它是垃圾但无害，到期自己消失。**不存在
-	// 「正向记录指向一条不存在的反向记录」这个状态。**
-	//
-	// # 过期时：反向必须比正向活得久
-	//
-	// 只调换顺序还不够。两次写差着几毫秒，同样的 TTL 意味着先写的先过期
-	// ——反向先写就先过期，于是在正向过期前的那一小段时间里，快路径又会
-	// 返回一个还原不了的令牌。这正是原来那个顺序碰巧避开的边。
-	//
-	// 所以反向 TTL 加一个余量，让正向**总是先过期**。余量只需覆盖两次写
-	// 之间的间隔与缓存节点间的时钟偏移，不按 TTL 比例放大：反向记录里存的
-	// 是明文原值，多活一秒就是 PII 多留一秒。
-	//
-	// Reverse first, forward second. The ordering is the whole protection here.
-	//
-	// Forward-first left a token nothing could resolve, permanently: when the
-	// reverse write failed, Issue returned an error while the forward entry
-	// survived, so the next call for that value hit the fast path and
-	// *succeeded*, handing back a token with no reverse entry. Measured: it
-	// reaches the model, comes back, Resolve reports ok=false, and it is treated
-	// as a model-invented phantom — for every subsequent call until the TTL.
-	//
-	// Reverse-first has no such state: a failed reverse write leaves nothing,
-	// and a failed forward write leaves only an unreferenced reverse entry that
-	// expires on its own.
-	//
-	// Ordering alone is not enough. The two writes are milliseconds apart, so
-	// with equal TTLs whichever is written first expires first — the reverse
-	// would expire while the forward still answers. The margin makes the forward
-	// always expire first. It covers the inter-write gap and node clock skew
-	// only, and is not scaled with the TTL: the reverse entry holds the
-	// plaintext, so every extra second is a second more of PII retention.
-	if _, err := s.cache.SetNX(ctx, s.tokenKey(key, tok), value, s.reverseTTL()); err != nil {
-		return "", fmt.Errorf("%w: 写入反向映射失败 / storing reverse mapping: %v", ErrTokenStore, err)
-	}
-
-	// 正向映射用「不存在才写」：两个副本同时令牌化同一个值时必须收敛到
-	// 同一个令牌，直接写会让后写者覆盖掉先写者已经返回给调用方的那个。
-	// 竞争失败时，我们刚写的那条反向记录成为无人指向的垃圾，到期消失——
-	// 用一条会自己过期的垃圾换「令牌一定可还原」，这个交换是划算的。
-	//
-	// Set-if-absent on the forward mapping so concurrent replicas converge on
-	// one token. A lost race orphans the reverse entry just written; trading a
-	// self-expiring orphan for "every issued token resolves" is worth it.
-	stored, err := s.cache.SetNX(ctx, vk, tok, s.ttl)
+	stored, err := s.cache.SetNX(ctx, tk, value, s.ttl)
 	if err != nil {
 		return "", fmt.Errorf("%w: 写入令牌失败 / storing token: %v", ErrTokenStore, err)
 	}
-	if !stored {
-		winner, ok, err := s.cache.Get(ctx, vk)
-		if err != nil {
-			return "", fmt.Errorf("%w: 读取竞争结果失败 / reading race winner: %v", ErrTokenStore, err)
-		}
-		if !ok {
-			// 「不存在才写」被拒、键又不在了：它在两次调用之间过期了。
-			// 报错好过返回一个谁也解析不了的令牌。
-			// Set-if-absent refused and the key is gone: it expired between the
-			// two calls. Reporting an error beats returning an unresolvable
-			// token.
-			return "", fmt.Errorf("%w: 令牌在写入竞争中过期，请重试 / token expired mid-race",
-				ErrTokenStore)
-		}
-		return winner, nil
+	if stored {
+		return tok, nil
+	}
+
+	// 键已存在。按派生方式它必然映射到同一个原值，但这里读回来核对一次，
+	// 而不是假定。
+	//
+	// 核对的成本是一次 Get，买到的是「Issue 返回的令牌一定解析成本次调用
+	// 的那个值」这条不变量在运行期被验证过，而不是被推理过。不符只可能出于
+	// 两件事——HMAC 碰撞（可忽略），或者两套不同的密钥环写进了同一个缓存
+	// 前缀（配置错误）。后者会让一个租户的令牌解析出另一份数据，
+	// 必须响亮地失败，不能沉默地返回。
+	//
+	// Reading back costs one Get and buys the invariant being verified at
+	// runtime rather than reasoned about. A mismatch means either an HMAC
+	// collision (negligible) or two different keyrings writing under the same
+	// cache prefix (misconfiguration) — the latter would resolve one tenant's
+	// token to another's data and must fail loudly.
+	existing, ok, err := s.cache.Get(ctx, tk)
+	if err != nil {
+		return "", fmt.Errorf("%w: 核对已有令牌失败 / verifying existing token: %v",
+			ErrTokenStore, err)
+	}
+	if !ok {
+		// 「不存在才写」被拒、键又不在了：它在两次调用之间过期了。
+		// 报错好过返回一个谁也解析不了的令牌。
+		// Set-if-absent refused and the key is gone: it expired between the two
+		// calls. Reporting an error beats returning an unresolvable token.
+		return "", fmt.Errorf("%w: 令牌在写入与核对之间过期，请重试 / token expired mid-write",
+			ErrTokenStore)
+	}
+	if existing != value {
+		return "", fmt.Errorf(
+			"%w: 令牌 %s 已映射到另一个值——同一前缀下混用了不同的密钥环，"+
+				"继续下去会让一个租户的令牌解析出另一份数据 / token collision",
+			ErrTokenStore, tok)
 	}
 	return tok, nil
-}
-
-// reverseTTLMargin 是反向映射比正向多活的时长。
-//
-// 只用来覆盖两次写之间的间隔与缓存节点间的时钟偏移，不随 TTL 比例放大：
-// 反向记录里存的是明文原值，这个余量有多长，PII 就多留多久。
-//
-// Covers the inter-write gap and node clock skew only. It is deliberately not
-// proportional to the TTL: the reverse entry holds the plaintext, so this
-// constant is measured in extra PII retention.
-const reverseTTLMargin = 30 * time.Second
-
-// reverseTTL 返回反向映射的存活时长。
-//
-// ttl 为 0 表示永不过期，此时余量没有意义——两边都不过期，正向不可能先到期。
-// A zero TTL means no expiry, where the margin is meaningless.
-func (s *CacheTokenStore) reverseTTL() time.Duration {
-	if s.ttl == 0 {
-		return 0
-	}
-	return s.ttl + reverseTTLMargin
 }
 
 // Resolve implements TokenStore.

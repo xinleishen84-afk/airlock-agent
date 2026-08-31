@@ -74,7 +74,7 @@ func TestTokenStoreContract(t *testing.T) {
 	drivers := map[string]func(*testing.T) TokenStore{
 		"memory": func(t *testing.T) TokenStore { return NewMemoryTokenStore(time.Hour) },
 		"cache": func(t *testing.T) TokenStore {
-			s, err := NewCacheTokenStore(newFakeCache(), time.Hour, "test:")
+			s, err := NewCacheTokenStore(newFakeCache(), testKeyring(t), time.Hour, "test:")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -232,7 +232,7 @@ func TestConcurrentIssueConverges(t *testing.T) {
 func TestStoreFailureIsNotAPhantom(t *testing.T) {
 	cache := newFakeCache()
 	cache.failGet = true
-	store, err := NewCacheTokenStore(cache, time.Hour, "test:")
+	store, err := NewCacheTokenStore(cache, testKeyring(t), time.Hour, "test:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestStoreFailureIsNotAPhantom(t *testing.T) {
 
 func mustCacheStore(t *testing.T) TokenStore {
 	t.Helper()
-	s, err := NewCacheTokenStore(newFakeCache(), time.Hour, "test:")
+	s, err := NewCacheTokenStore(newFakeCache(), testKeyring(t), time.Hour, "test:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestSQLEraseIsTenantScoped(t *testing.T) {
 // logs, dashboards, and someone's KEYS output during an incident.
 func TestCacheKeysDoNotContainPlaintext(t *testing.T) {
 	cache := newFakeCache()
-	store, err := NewCacheTokenStore(cache, time.Hour, "test:")
+	store, err := NewCacheTokenStore(cache, testKeyring(t), time.Hour, "test:")
 	if err != nil {
 		t.Fatal(err)
 	}
