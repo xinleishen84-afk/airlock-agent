@@ -21,9 +21,14 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeCache struct {
-	mu      sync.Mutex
-	data    map[string]string
-	ttls    map[string]time.Duration
+	mu   sync.Mutex
+	data map[string]string
+	ttls map[string]time.Duration
+	// expiry 记录每个键的到期时刻。替身此前只记 TTL 值却从不真的过期，
+	// 比 Cache 接口要求的语义更宽松——而更宽松的替身是在测一个不存在的世界。
+	// The double recorded TTLs without ever expiring anything, making it laxer
+	// than the contract it stands in for.
+	expiry  map[string]time.Time
 	failGet bool
 	getN    int
 	setN    int
@@ -34,7 +39,10 @@ type fakeCache struct {
 }
 
 func newFakeCache() *fakeCache {
-	return &fakeCache{data: map[string]string{}, ttls: map[string]time.Duration{}}
+	return &fakeCache{
+		data: map[string]string{}, ttls: map[string]time.Duration{},
+		expiry: map[string]time.Time{},
+	}
 }
 
 // ttlOf 返回某个键写入时用的 TTL，供不变量断言使用。
@@ -66,8 +74,17 @@ func (c *fakeCache) Get(_ context.Context, key string) (string, bool, error) {
 	if c.failGet {
 		return "", false, errors.New("模拟的缓存故障 / simulated cache outage")
 	}
+	if c.expiredLocked(key) {
+		return "", false, nil
+	}
 	v, ok := c.data[key]
 	return v, ok, nil
+}
+
+// expiredLocked 判断键是否已过期；调用方必须已持锁。
+func (c *fakeCache) expiredLocked(key string) bool {
+	at, ok := c.expiry[key]
+	return ok && time.Now().After(at)
 }
 
 // FindOrCreate 实现 Cache。
@@ -90,11 +107,15 @@ func (c *fakeCache) FindOrCreate(_ context.Context, key, value string,
 	if c.failWriteFrom > 0 && c.setN >= c.failWriteFrom {
 		return "", false, errors.New("模拟的写入故障 / simulated write failure")
 	}
-	if existing, ok := c.data[key]; ok {
+	if existing, ok := c.data[key]; ok && !c.expiredLocked(key) {
 		return existing, false, nil
 	}
 	c.data[key] = value
 	c.ttls[key] = ttl
+	delete(c.expiry, key)
+	if ttl > 0 {
+		c.expiry[key] = time.Now().Add(ttl)
+	}
 	return value, true, nil
 }
 

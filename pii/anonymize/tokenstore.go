@@ -550,9 +550,11 @@ func NewCacheTokenStore(c Cache, keyring *Keyring, ttl time.Duration,
 	for _, opt := range opts {
 		opt(s)
 	}
-	if s.epoch == "" || s.dataVersion == "" {
-		return nil, fmt.Errorf("%w: 身份 epoch 与数据密钥版本都不能为空 / "+
-			"identity epoch and data key version are required", ErrTokenStore)
+	if err := validateLabel("身份 epoch / identity epoch", string(s.epoch)); err != nil {
+		return nil, err
+	}
+	if err := validateLabel("数据密钥版本 / data key version", string(s.dataVersion)); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -662,6 +664,45 @@ func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string)
 	// data key version (normal during rotation) or from a different keyring
 	// written under the same prefix (misconfiguration): the first must open,
 	// the second must fail loudly rather than hand back an unusable token.
+	rec, decErr := DecodeTokenRecord(current)
+	if decErr != nil {
+		return "", decErr
+	}
+
+	// 已存在的记录若已过期，必须报错，而不是把它的令牌返回出去。
+	//
+	// # 这里曾经违反「返回的令牌立即可 Resolve」
+	// # This used to violate "an issued token resolves immediately"
+	//
+	// 后端还留着键、而记录里的到期时刻已过，是可能出现的：后端 TTL 精度更粗、
+	// 后端根本不过期、或者写入方与读取方之间有时钟偏移。Resolve 对这种记录
+	// 返回 ok=false（它按记录判过期，不信任后端），而 Issue 此前只核对明文
+	// 是否相等——于是 Issue 成功返回了一个 Resolve 一定失败的令牌。
+	//
+	// 不能就地覆盖：FindOrCreate 按定义不覆盖已有键，而引入一个「替换」原语
+	// 会把单次原子调用拆成两步，正是这次整改要消掉的东西。
+	//
+	// 因此响亮地失败。这同时是一个后端契约违规的信号：合规的后端不该返回
+	// 一条已经超过它自己 TTL 的映射。调用方重试即可——届时后端应当已经
+	// 把键清掉，走到正常的创建路径。
+	//
+	// A backend still holding a key whose recorded expiry has passed is
+	// possible: coarser backend TTL, a backend that does not expire at all, or
+	// clock skew. Resolve reports ok=false for such a record, while Issue only
+	// compared plaintexts — so Issue returned a token Resolve was guaranteed to
+	// reject. Overwriting in place is not available: FindOrCreate does not
+	// overwrite by definition, and adding a replace primitive would split the
+	// single atomic call this refactor exists to preserve. Failing loudly also
+	// signals a backend contract violation.
+	if rec.Expired(time.Now()) {
+		return "", fmt.Errorf(
+			"%w: 后端返回了一条已过期的映射（到期于 %s）——"+
+				"合规的后端不该返回超过自身 TTL 的键。请重试；"+
+				"若持续出现，说明该后端的 TTL 语义不满足 Cache 接口的要求 / "+
+				"backend returned an expired mapping",
+			ErrTokenStore, rec.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+
 	plain, err := s.decodeAndOpen(key, tok, current)
 	if err != nil {
 		return "", err

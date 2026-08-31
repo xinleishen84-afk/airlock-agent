@@ -163,3 +163,105 @@ func TestReIssueAfterExpiryReturnsSameTokenNewRecord(t *testing.T) {
 		t.Errorf("重新签发后无法还原 ok=%v got=%q err=%v", ok, got, err)
 	}
 }
+
+// TestLabelsWithSeparatorAreRejected 证明带分隔符的版本或 epoch 在构造期被拒。
+// Proves a version or epoch containing the separator is refused at construction.
+//
+// 记录以 "." 分隔字段。版本号里带一个点——`v1.2` 这种完全合理的写法——会让
+// 编码出来的记录多出一段，解码时报「字段数为 7，期望 6」。那句错误指向记录
+// 格式，而真正的原因在一个构造参数上，排查会从错误的一端开始。
+//
+// 实测过：修之前 Issue 直接失败，错误信息完全没提版本号。
+//
+// Measured before the fix: Issue failed with an error that never mentioned the
+// version string.
+func TestLabelsWithSeparatorAreRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  CacheStoreOption
+	}{
+		{"版本号带点", WithDataKeyVersion("v1.2")},
+		{"epoch 带点", WithIdentityEpoch("e1.0")},
+		{"版本号带大写", WithDataKeyVersion("V1")},
+		{"版本号过长", WithDataKeyVersion("v-with-a-very-long-name")},
+		{"版本号为空", WithDataKeyVersion("")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewCacheTokenStore(newFakeCache(), testKeyring(t),
+				time.Hour, "lbl:", tc.opt)
+			if err == nil {
+				t.Error("非法标识符应在构造期被拒绝——放过去的话，" +
+					"故障会以「记录字段数不对」的形式出现在几百行之外")
+			}
+		})
+	}
+
+	// 合法的写法不能被误杀
+	for _, v := range []DataKeyVersion{"v1", "v2", "v10", "key_2", "2026-q1"} {
+		if _, err := NewCacheTokenStore(newFakeCache(), testKeyring(t),
+			time.Hour, "lbl:", WithDataKeyVersion(v)); err != nil {
+			t.Errorf("合法版本号 %q 被误拒: %v", v, err)
+		}
+	}
+}
+
+// TestIssueRefusesExpiredExistingRecord 钉住不变量 A 在过期边界上的行为。
+// Pins invariant A at the expiration boundary.
+//
+// # 这里曾经返回一个必定还原不了的令牌
+// # This used to return a token guaranteed not to resolve
+//
+// 后端还留着键、而记录里的到期时刻已过，是可能出现的：后端 TTL 精度更粗、
+// 后端根本不过期、或写入方与读取方之间有时钟偏移。
+//
+// Resolve 对这种记录返回 ok=false——它按记录判过期，不信任后端。而 Issue
+// 此前只核对明文是否相等，于是**成功返回了一个 Resolve 一定会拒绝的令牌**，
+// 直接违反「Issue 返回的令牌必须立即可 Resolve」。
+//
+// 现在响亮失败：不能就地覆盖（FindOrCreate 按定义不覆盖，加一个替换原语会
+// 把单次原子调用拆成两步），而返回一个坏令牌比报错糟得多。这同时是后端契约
+// 违规的信号——合规后端不该返回超过自身 TTL 的键。
+//
+// Resolve rejects such a record while Issue only compared plaintexts, so Issue
+// returned a token Resolve was guaranteed to refuse. Failing loudly is the only
+// remaining option: overwriting is unavailable and a bad token is worse.
+func TestIssueRefusesExpiredExistingRecord(t *testing.T) {
+	ctx := context.Background()
+	c := newFakeCache()
+	s, err := NewCacheTokenStore(c, testKeyring(t), time.Hour, "exp:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := TokenKey{Tenant: "acme", Namespace: "phone"}
+	const value = "13800138000"
+
+	tok, err := s.Issue(ctx, key, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 制造「后端还留着键，但记录已过期」：只改记录，不动后端的 TTL。
+	ck := s.tokenKey(key, tok)
+	raw, _, _ := c.Get(ctx, ck)
+	rec, err := DecodeTokenRecord(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.ExpiresAt = time.Now().Add(-time.Hour)
+	c.mu.Lock()
+	c.data[ck] = rec.Encode()
+	c.mu.Unlock()
+
+	// Resolve 必须拒绝
+	if _, ok, err := s.Resolve(ctx, key, tok); ok || err != nil {
+		t.Errorf("过期记录的 Resolve 应返回 (false, nil)，实得 ok=%v err=%v", ok, err)
+	}
+
+	// Issue 必须报错，而不是返回一个还原不了的令牌
+	got, err := s.Issue(ctx, key, value)
+	if err == nil {
+		_, ok, _ := s.Resolve(ctx, key, got)
+		t.Errorf("Issue 返回了令牌 %s（可还原=%v），而后端给的是一条已过期的记录——"+
+			"返回一个 Resolve 一定拒绝的令牌，直接违反不变量 A", got, ok)
+	}
+}

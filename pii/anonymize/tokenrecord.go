@@ -3,6 +3,7 @@ package anonymize
 import (
 	"encoding/base64"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -66,6 +67,36 @@ type TokenRecord struct {
 	// Recorded so backend TTL and record semantics need not trust each other:
 	// if the backend keeps a key longer than intended, Resolve still expires it.
 	ExpiresAt time.Time
+}
+
+// labelPattern 限定密钥版本与身份 epoch 的字符集。
+//
+// # 为什么这个校验必须存在
+// # Why this validation must exist
+//
+// 记录用 "." 分隔字段。版本号里带一个点——`v1.2` 这种完全合理的写法——
+// 会让编码出来的记录多出一段，解码时报「字段数为 7，期望 6」。那句错误指向
+// 记录格式，而真正的原因在几百行之外的一个构造参数上，排查会从错误的一端开始。
+//
+// 与命名空间同理：一个会被拼进结构化文本的标识符，它的字符集是那段文本能否
+// 被正确切分的前提，因此校验属于接受它的地方，而不是使用它的地方。
+//
+// The record is delimited by ".". A version like `v1.2` — an entirely
+// reasonable spelling — adds a field and decoding reports "7 fields, expected
+// 6", pointing at the record format while the cause sits in a constructor
+// argument hundreds of lines away. Validation belongs where the identifier is
+// accepted, not where it is used.
+var labelPattern = regexp.MustCompile(`^[a-z0-9_-]{1,16}$`)
+
+// validateLabel 校验密钥版本或身份 epoch。
+func validateLabel(kind, label string) error {
+	if !labelPattern.MatchString(label) {
+		return fmt.Errorf(
+			"%w: %s %q 非法：只允许小写字母、数字、下划线与短横，最长 16——"+
+				"它会被拼进以「.」分隔的记录，带分隔符的标识符会让记录多出一段字段 / "+
+				"invalid %s", ErrTokenStore, kind, label, kind)
+	}
+	return nil
 }
 
 // recordSchema 是编码格式的版本号。
