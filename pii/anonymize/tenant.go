@@ -89,10 +89,19 @@ func ValidateTenant(t Tenant) error {
 // 两个租户比对各自的数仓导出，就能确认他们共有一位客户——
 // 这是一次谁都没同意的跨租户披露，而且是用双方都以为已经假名化的数据做到的。
 //
-// Tokens do not need this: they are random, so they are already unlinkable.
-// The composite key is what protects them, not a salt.
-// 令牌不需要这个：它们是随机的，本就不可关联。
-// 保护它们的是复合键，而不是盐。
+// # 这段曾经写着「令牌不需要这个：它们是随机的」
+// # This paragraph used to say tokens did not need it because they are random
+//
+// 那个说法对 SQLTokenStore 仍然成立——它的令牌是随机生成后存下来的。
+// 但 CacheTokenStore 的令牌改成了确定性派生，随机性没了，跨租户不可关联
+// 这件事就完全落在密钥上：同一个手机号在两个租户下算出不同的令牌，
+// 靠的是两把在计算上不可关联的租户密钥，而不是靠随机数。
+//
+// That remains true of SQLTokenStore, whose tokens are generated randomly and
+// stored. CacheTokenStore derives its tokens deterministically, so
+// cross-tenant unlinkability rests entirely on the keys: the same phone number
+// yields different tokens in two tenants because their keys are
+// computationally unlinkable, not because a random number was drawn.
 type Keyring struct {
 	root []byte
 	salt []byte
@@ -155,4 +164,109 @@ func (k *Keyring) Key(t Tenant) ([]byte, error) {
 	}
 	k.cached[t] = derived
 	return derived, nil
+}
+
+// ---------------------------------------------------------------------------
+// Purpose-separated subkeys / 按用途分离的子密钥
+// ---------------------------------------------------------------------------
+
+// TokenIdentityEpoch 标识一代令牌身份密钥。
+//
+// # 为什么必须有这个概念，而不能承诺「令牌永远稳定」
+// # Why this exists rather than a promise that tokens are stable forever
+//
+// 派生式令牌的身份来自 K_token，而 K_token 派生自根密钥。根密钥一旦轮换，
+// 同一个 (租户, 命名空间, 原值) 会算出不同的令牌——这不是缺陷，是派生的
+// 定义决定的。承诺「令牌永远稳定」是做不到的，因此这里把它明确成一个有
+// 边界的承诺：**令牌身份在一个 epoch 内稳定，根密钥轮换即开启新 epoch。**
+//
+// 数据密钥的轮换不受此影响：K_data 版本化，与 K_token 各走各的。
+// 也就是说，日常的数据密钥轮换不会动令牌身份；只有根密钥轮换才会。
+//
+// epoch 记进 TokenRecord 并参与 AAD，因此上一代 epoch 的密文无法在新 epoch
+// 下通过认证——不会出现「解出来了但语义已经变了」这种最难查的情形。
+//
+// A derived token's identity comes from K_token, itself derived from the root.
+// Rotating the root changes every token: that is what derivation means, not a
+// defect. Promising indefinite stability would be false, so the promise is
+// bounded instead — identity is stable within an epoch, and rotating the root
+// begins a new one. Data-key rotation is independent and does not touch
+// identity. The epoch is recorded and bound into the AAD, so a previous
+// epoch's ciphertext fails authentication rather than opening with stale
+// semantics.
+type TokenIdentityEpoch string
+
+// DataKeyVersion 标识一代数据加密密钥。
+//
+// 版本只出现在 HKDF 的 info 串里，因此新增一个版本不需要新的密钥材料，
+// 也不需要任何迁移动作——旧记录带着自己的版本号，Resolve 时按号派生。
+//
+// 要写清它保护的是什么：版本化让「某个版本的派生密钥泄漏」不牵连其他版本，
+// 但根密钥泄漏时所有版本一起失效。真正需要抵抗根密钥泄漏的部署，
+// 应当轮换根密钥——那同时会开启新的令牌身份 epoch。
+//
+// The version appears only in the HKDF info string, so adding one needs no new
+// key material and no migration: an old record carries its own version and
+// Resolve derives that one. What versioning buys is containment of a single
+// derived key's compromise; a root compromise invalidates every version, and a
+// deployment that must survive that should rotate the root — which also begins
+// a new token identity epoch.
+type DataKeyVersion string
+
+const (
+	// DefaultTokenIdentityEpoch 是首代令牌身份 epoch。
+	DefaultTokenIdentityEpoch TokenIdentityEpoch = "e1"
+
+	// DefaultDataKeyVersion 是首代数据加密密钥版本。
+	DefaultDataKeyVersion DataKeyVersion = "v1"
+)
+
+// TokenIdentityKey 派生 K_token：只用于 HMAC 计算令牌身份。
+//
+// # 为什么不能与数据密钥共用一把
+// # Why this cannot be the same key as the data key
+//
+// 同一把密钥既当 HMAC 密钥又当 AES-GCM 密钥，是把两套代数结构绑在同一份
+// 密钥材料上。这类复用没有安全证明可依，而分开的成本只是 HKDF info 串里
+// 多一段常量。本仓库此前正是这样：Keyring.Key(tenant) 一把密钥同时用于
+// 令牌 HMAC、值摘要 HMAC、AES-GCM 加解密、哈希算子与审计指纹。
+//
+// Using one key as both an HMAC key and an AES-GCM key ties two algebraic
+// structures to the same material with no security proof to lean on, while
+// separating them costs one constant in an HKDF info string. This repository
+// did exactly that: a single per-tenant key served token HMAC, digest HMAC,
+// AES-GCM, the hash operator and audit fingerprints.
+func (k *Keyring) TokenIdentityKey(t Tenant, epoch TokenIdentityEpoch) ([]byte, error) {
+	if epoch == "" {
+		return nil, fmt.Errorf("令牌身份 epoch 不能为空 / identity epoch is required")
+	}
+	return k.derive("airlock/token-identity/"+string(epoch)+"/"+string(t), t)
+}
+
+// DataKey 派生 K_data_vN：只用于 AEAD 加解密 PII。
+func (k *Keyring) DataKey(t Tenant, version DataKeyVersion) ([]byte, error) {
+	if version == "" {
+		return nil, fmt.Errorf("数据密钥版本不能为空 / data key version is required")
+	}
+	return k.derive("airlock/token-data/"+string(version)+"/"+string(t), t)
+}
+
+// derive 是按 info 串派生子密钥的共用路径。
+//
+// 不走 Key() 的缓存：那份缓存以租户为键，而这里同一个租户会有多把不同用途、
+// 不同版本的子密钥。派生是一次 HKDF，几微秒，不值得为它引入一个更复杂的
+// 缓存键去换——而一个键设计错了的缓存，会把两把不同的密钥混成一把。
+//
+// Not routed through Key()'s cache, which is keyed by tenant alone while a
+// tenant now has several subkeys of different purposes and versions. One HKDF
+// is microseconds; a miskeyed cache would conflate two distinct keys.
+func (k *Keyring) derive(info string, t Tenant) ([]byte, error) {
+	if err := ValidateTenant(t); err != nil {
+		return nil, err
+	}
+	out, err := hkdf.Key(sha256.New, k.root, k.salt, info, 32)
+	if err != nil {
+		return nil, fmt.Errorf("派生子密钥失败 / deriving subkey: %w", err)
+	}
+	return out, nil
 }

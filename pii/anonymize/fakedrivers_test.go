@@ -156,6 +156,8 @@ func (r fakeResult) RowsAffected() (int64, error) { return r.n, nil }
 type fakeRowRec struct {
 	tenant, namespace, token, digest string
 	cipher                           []byte
+	nonce                            []byte
+	keyVersion                       string
 }
 
 type fakeDB struct {
@@ -173,10 +175,30 @@ func (d *fakeDB) ExecContext(_ context.Context, query string, args ...any) (SQLR
 
 	switch {
 	case strings.HasPrefix(strings.TrimSpace(query), "INSERT"):
+		// 真的执行 UNIQUE (tenant, namespace, value_digest) 约束。
+		//
+		// 不执行的话，这个替身比真数据库更宽松，而 SELECT 与 INSERT 之间的
+		// 竞争在它上面永远不会发生——SQLTokenStore 曾经把唯一冲突当成写入
+		// 故障直接抛出，真库语义下 32 次并发有 4 次失败，而这个替身让那条
+		// 路径从未被走到。测试替身比被测系统更严格是安全的，更宽松则是在
+		// 测一个不存在的世界。
+		//
+		// Enforcing the constraint for real: without it this double is laxer
+		// than a database, the SELECT-INSERT race never happens, and the path
+		// where a unique violation was raised as a write failure is never
+		// exercised. A double stricter than production is safe; a laxer one
+		// tests a world that does not exist.
+		for _, r := range d.rows {
+			if r.tenant == args[0].(string) && r.namespace == args[1].(string) &&
+				r.digest == args[3].(string) {
+				return nil, fmt.Errorf("UNIQUE constraint failed: %s.value_digest", "tokens")
+			}
+		}
 		d.rows = append(d.rows, fakeRowRec{
 			tenant: args[0].(string), namespace: args[1].(string),
 			token: args[2].(string), digest: args[3].(string),
-			cipher: args[4].([]byte),
+			cipher: args[4].([]byte), nonce: args[5].([]byte),
+			keyVersion: args[6].(string),
 		})
 		return fakeResult{n: 1}, nil
 
@@ -213,7 +235,7 @@ func (d *fakeDB) QueryRowContext(_ context.Context, query string, args ...any) S
 	case strings.Contains(query, "token = ?"):
 		for _, r := range d.rows {
 			if r.tenant == tenant && r.namespace == namespace && r.token == args[2].(string) {
-				return fakeRow{values: []any{r.cipher}}
+				return fakeRow{values: []any{r.cipher, r.nonce, r.keyVersion}}
 			}
 		}
 	}

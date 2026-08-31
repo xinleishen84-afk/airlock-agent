@@ -2,8 +2,6 @@ package anonymize
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -320,6 +318,68 @@ func hasPrefix(s, prefix string) bool {
 // 刻意小到用 Redis、DynamoDB、Memcached 或任意云 KV 都能几十行实现完，
 // 也刻意不含任何厂商类型——本包签名里出现 redis.Client，
 // 会让本库的每个使用者都依赖那个客户端的版本。
+// # 这个接口不是「任意 KV 都能实现」的
+// # This interface is not implementable by any KV store
+//
+// 名字叫 Cache 是历史遗留，它的语义要求比「缓存」严格得多。想接一个后端
+// 进来，先对着下面这几条逐条确认；有任何一条做不到，**不要接**。
+// 为了「支持更多后端」而放松其中任何一条，等于把安全保证降级到最弱的那个
+// 实现的水平，而使用者无从知道自己用的是哪一档。
+//
+// 一、FindOrCreate 必须是原子且线性化的。
+//
+//	两个并发调用必须恰好一个 created=true，其余拿到同一个 current。
+//	用 GET 再 SET 组合出来的不算——那中间有间隙。
+//
+// 二、TTL 语义必须稳定。ttl 只在创建时生效，命中已有键不得续期。
+//
+//	后端若自带滑动过期且关不掉，不要接：一个被反复读到的 PII 映射会
+//	因此永不过期。
+//
+// 三、租户隔离靠键前缀，因此 DeleteByPrefix 必须真的删干净。
+//
+//	做不到前缀删除的后端应当自行维护每租户索引集合，而不是在生产集群上
+//	全量扫描键空间。
+//
+// 四、正常运行中不得静默丢映射。这一条把大多数「缓存」排除在外：
+//
+//	Memcached 与配了 allkeys-lru 的 Redis 会在内存压力下驱逐任意键，
+//	而**令牌映射是恢复原值的唯一来源**——丢一条，就有一个已经发给模型
+//	的令牌永远还不回去，且没有任何错误提示。
+//	这个库存的不是缓存，是 PII 映射数据库，只是恰好放在一个 KV 里。
+//
+// 五、持久性由部署方显式选择。是否落盘、是否复制、丢失窗口多大，
+//
+//	这些必须是写下来的决定，不能是默认值碰巧如此。
+//
+// Naming it Cache is historical; the semantics are far stricter. Check each
+// requirement before wiring a backend in, and if any cannot be met, do not wire
+// it in: relaxing one to "support more backends" silently downgrades the
+// guarantee to the weakest implementation, with no way for a user to tell which
+// one they have. Requirement four excludes most caches — Memcached and Redis
+// under allkeys-lru evict arbitrary keys, while this mapping is the only source
+// from which a value can be recovered.
+//
+// # Redis 部署要求
+// # Redis deployment requirements
+//
+// 单条命令做到 FindOrCreate 需要 Redis 7.0 起的 SET key val NX GET
+// （6.2 引入了 SET ... GET，但与 NX 组合的行为在 7.0 才稳定下来）。
+// 更早的版本用 Lua 脚本或 Redis Function。
+//
+// 本设计只写一个键，因此 Redis Cluster 下不涉及跨槽（CROSSSLOT）问题——
+// 脚本若将来要触碰多个键，必须先保证它们落在同一个哈希槽。
+//
+// 生产上必须显式配置：
+//
+//	maxmemory-policy noeviction   驱逐会让已发出的令牌永久失去原值
+//	容量监控                       noeviction 下内存打满表现为写入报错，
+//	                              需要在到达之前就看见
+//	持久化与复制                   由部署方按丢失窗口的容忍度选择
+//
+// One key per mapping means no CROSSSLOT concern in Redis Cluster. Eviction
+// permanently orphans tokens already handed to a model, so noeviction is
+// mandatory and capacity must be monitored before it is reached.
 type Cache interface {
 	// Get returns a value; ok=false means the key is absent.
 	// 取值；ok=false 表示键不存在。
@@ -411,6 +471,43 @@ type CacheTokenStore struct {
 	keyring *Keyring
 	ttl     time.Duration
 	prefix  string
+
+	// epoch 决定令牌身份用哪一代 K_token。轮换它会改变全部令牌身份，
+	// 因此它跟随根密钥的生命周期，而不是运维随手可调的旋钮。
+	// Rotating this changes every token identity, so it follows the root key's
+	// lifecycle rather than being an operational dial.
+	epoch TokenIdentityEpoch
+
+	// dataVersion 是新记录使用的数据密钥版本。它可以随时向前推进：
+	// 旧记录带着自己的版本号，Resolve 按记录里的版本派生。
+	// Advancing this is safe at any time: old records name their own version.
+	dataVersion DataKeyVersion
+}
+
+// CacheStoreOption 调整可选参数。
+type CacheStoreOption func(*CacheTokenStore)
+
+// WithIdentityEpoch 指定令牌身份 epoch。
+//
+// 只有根密钥轮换时才该动它。改了它，同一个 (租户, 命名空间, 原值) 会算出
+// 新令牌，旧令牌仍可 Resolve（它们的记录还在），但不会再被签发出来。
+//
+// Change only when the root key rotates: the same input then yields a new
+// token while old tokens remain resolvable but are never issued again.
+func WithIdentityEpoch(e TokenIdentityEpoch) CacheStoreOption {
+	return func(s *CacheTokenStore) { s.epoch = e }
+}
+
+// WithDataKeyVersion 指定新记录使用的数据密钥版本。
+//
+// 向前推进它即完成一次数据密钥轮换：新记录用新版本加密，旧记录照旧可解，
+// 而**令牌身份完全不变**——这正是把两把密钥分开的目的。
+//
+// Advancing it performs a data-key rotation: new records use the new version,
+// old ones still open, and token identity does not move — which is the point
+// of separating the two keys.
+func WithDataKeyVersion(v DataKeyVersion) CacheStoreOption {
+	return func(s *CacheTokenStore) { s.dataVersion = v }
 }
 
 // NewCacheTokenStore builds a cache-backed token store.
@@ -422,7 +519,7 @@ type CacheTokenStore struct {
 // The keyring is required: tokens are derived deterministically under the
 // tenant's key. See deriveToken for why.
 func NewCacheTokenStore(c Cache, keyring *Keyring, ttl time.Duration,
-	keyPrefix string) (*CacheTokenStore, error) {
+	keyPrefix string, opts ...CacheStoreOption) (*CacheTokenStore, error) {
 	if c == nil {
 		return nil, fmt.Errorf("%w: 缓存驱动不能为空 / cache is required", ErrTokenStore)
 	}
@@ -432,10 +529,32 @@ func NewCacheTokenStore(c Cache, keyring *Keyring, ttl time.Duration,
 				"无密钥的派生可被任何拿到缓存读权限的人用「猜一个值、算一遍、"+
 				"看键在不在」证实 / keyring is required", ErrTokenStore)
 	}
+	if ttl < 0 {
+		// 负 TTL 会被 `if s.ttl > 0` 判成「不设到期时刻」，也就是永不过期
+		// ——与调用方想表达的恰好相反。这类输入必须拒绝而不是猜。
+		//
+		// A negative TTL falls through the `> 0` check into "no expiry", the
+		// opposite of what the caller meant. Refuse rather than guess.
+		return nil, fmt.Errorf(
+			"%w: TTL 不能为负（%s）——负值会被当成「永不过期」，"+
+				"与调用方的本意相反；不过期请显式传 0 / negative TTL",
+			ErrTokenStore, ttl)
+	}
 	if keyPrefix == "" {
 		keyPrefix = "airlock:tok:"
 	}
-	return &CacheTokenStore{cache: c, keyring: keyring, ttl: ttl, prefix: keyPrefix}, nil
+	s := &CacheTokenStore{
+		cache: c, keyring: keyring, ttl: ttl, prefix: keyPrefix,
+		epoch: DefaultTokenIdentityEpoch, dataVersion: DefaultDataKeyVersion,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.epoch == "" || s.dataVersion == "" {
+		return nil, fmt.Errorf("%w: 身份 epoch 与数据密钥版本都不能为空 / "+
+			"identity epoch and data key version are required", ErrTokenStore)
+	}
+	return s, nil
 }
 
 // tenantPrefix is the key prefix covering one tenant.
@@ -444,57 +563,32 @@ func (s *CacheTokenStore) tenantPrefix(t Tenant) string {
 	return s.prefix + string(t) + ":"
 }
 
-// deriveToken 由「租户密钥 + 命名空间 + 原值」确定性地算出令牌。
+// deriveToken 由 K_token 确定性地算出令牌身份。
 //
-// # 这是本驱动只需要写一个键的原因
-// # This is why the driver writes exactly one key
+// # 这是本驱动只需要写一条记录的原因
+// # This is why the driver writes exactly one record
 //
-// 原来是「随机令牌 + 一个正向索引把值摘要指向它」。两个键意味着两次写，
-// 而缓存是分布式的，两次写之间可以断、可以崩、可以被各自驱逐。无论怎么
-// 排序、怎么调 TTL，都只是把「能观察到撕裂」的窗口挪小，消不掉——
-// Cache 接口只有 Get/SetNX/DeleteByPrefix，没有跨键事务原语，而给它加一个
-// 会逼每个实现都提供跨键原子性，做不到的只能假装。
+// 原来是「随机令牌 + 一个正向索引把值摘要指向它」。两条记录意味着两次写，
+// 而缓存是分布式的：两次写之间可以断、可以崩、可以被各自驱逐。无论怎么
+// 排序、怎么调 TTL，都只是把能观察到撕裂的窗口挪小，消不掉。
 //
-// 令牌确定性派生之后，正向索引整个不需要了：同一个值算出同一个令牌，
-// 这件事由函数本身保证，不需要存储去记。于是只剩一个键
-// 「令牌 → 原值」，一次写。**不存在两个键，也就不存在撕裂。**
+// 令牌确定性派生之后，正向索引整个不需要了——同一个值算出同一个令牌这件事
+// 由函数保证，不需要存储去记。于是只剩一条记录，一次写。
 //
-// 顺带修掉一处比撕裂更早的弱点：原来的正向索引键是不加密钥的
-// sha256(租户+命名空间+原值)。任何拿到缓存读权限的人，猜一个手机号、
-// 算一遍 sha256、看那个键在不在，就能证实这个号码在不在系统里——
-// 一次不需要解密任何东西的存在性泄露。HMAC 把这条路堵死：没有租户密钥
-// 就算不出键，而密钥在密钥环里，不在缓存里。
+// 用的是 K_token 而不是那把通用租户密钥：后者同时被 AES-GCM 用作加密密钥，
+// 一把密钥承担两种代数结构没有安全证明可依，而分开只需在 HKDF 的 info 串里
+// 多一段常量。见 Keyring.TokenIdentityKey。
 //
-// 截断到 128 位：碰撞概率可忽略，且与原来 newToken 的长度一致，
-// 复原侧的 tokenRe 与既有语料都不受影响。
-//
-// Deterministic derivation removes the forward index entirely: that the same
-// value yields the same token is guaranteed by the function, not recorded by
-// the store. One key remains — token to value — and one write. With no second
-// key there is nothing to tear, which no ordering or TTL tuning could achieve:
-// the Cache interface has no cross-key transaction, and adding one would force
-// every implementation to provide cross-key atomicity or fake it.
-//
-// It also closes an older weakness: the previous forward key was an unkeyed
-// sha256 of tenant, namespace and value, so anyone with read access to the
-// cache could confirm a guessed phone number by computing that digest and
-// checking whether the key existed — an existence oracle requiring no
-// decryption. Under HMAC the key cannot be computed without the tenant key,
-// which lives in the keyring rather than the cache.
+// Derivation removes the forward index: that the same value yields the same
+// token is guaranteed by the function rather than recorded by the store, so one
+// record and one write remain. It uses K_token rather than the general-purpose
+// tenant key, which also served as an AES-GCM key.
 func (s *CacheTokenStore) deriveToken(k TokenKey, value string) (string, error) {
-	tk, err := s.keyring.Key(k.Tenant)
+	ik, err := s.keyring.TokenIdentityKey(k.Tenant, s.epoch)
 	if err != nil {
 		return "", err
 	}
-	mac := hmac.New(sha256.New, tk)
-	// 分隔符是命名空间字符集禁止的字节，因此任何两个不同的
-	// (命名空间, 原值) 都不可能产出同一段输入。
-	// The separator is a byte the namespace charset forbids, so no two distinct
-	// (namespace, value) pairs can produce the same input.
-	mac.Write([]byte(k.Namespace))
-	mac.Write([]byte{0})
-	mac.Write([]byte(value))
-	return hex.EncodeToString(mac.Sum(nil)[:16]), nil
+	return deriveTokenIdentity(ik, k.Namespace, value), nil
 }
 
 // tokenKey is the reverse-lookup key.
@@ -505,23 +599,23 @@ func (s *CacheTokenStore) tokenKey(k TokenKey, token string) string {
 
 // Issue implements TokenStore.
 //
-// # 一次调用，因此没有可观察的中间态
-// # One call, therefore no observable intermediate state
+// # 一次调用，一条记录，缓存里没有明文
+// # One call, one record, and no plaintext in the cache
 //
-// 令牌由 deriveToken 从原值确定性算出，映射由 Cache.FindOrCreate 一步落定。
-// 安全不变量因此不是靠顺序、补偿或进程内锁撑起来的：
+// 令牌身份由 K_token 确定性算出；原值用 K_data_vN 加密后连同 nonce、
+// 密钥版本、身份 epoch、到期时刻组成一条 TokenRecord，经 FindOrCreate 一步落定。
 //
-//   - Issue 返回的令牌立即可 Resolve：FindOrCreate 返回的 current 就是此后
-//     权威的那个值，不需要再补一次读去确认。
-//   - 不存在「forward 存在而 reverse 不存在」：只有一个映射，没有第二个键。
-//   - 并发签发线性化：各方算出同一个令牌，FindOrCreate 保证恰好一个创建、
-//     其余拿到同一个 current。
-//   - 崩溃与超时：单次调用要么发生要么没发生；超时含义不明时，下一次调用
-//     算出同一个令牌，FindOrCreate 要么创建要么返回已有的。
-//   - 不依赖进程内 mutex，也没有第二步可回滚。
+// 安全不变量因此不靠顺序、补偿或进程内锁：
 //
-// Tokens are derived from the value and the mapping lands in one call. The
-// invariants rest on neither ordering, compensation, nor an in-process lock.
+//   - 返回的令牌立即可 Resolve：FindOrCreate 返回的就是此后权威的那条记录。
+//   - 不存在 partial mapping：只有一条记录，没有第二条可以撕裂。
+//   - 并发签发线性化：各方算出同一个令牌，恰好一个创建，其余采纳赢家的记录。
+//   - 提交后超时重试：下一次调用算出同一个令牌，FindOrCreate 返回已有记录。
+//   - 令牌身份不含随机数；加密用的随机 nonce 只在密文里，不参与身份。
+//
+// Identity is derived; the value is encrypted and lands as one TokenRecord in a
+// single FindOrCreate. The invariants rest on neither ordering, compensation,
+// nor an in-process lock.
 func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string) (string, error) {
 	if err := key.Validate(); err != nil {
 		return "", err
@@ -531,26 +625,48 @@ func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string)
 		return "", err
 	}
 
-	current, _, err := s.cache.FindOrCreate(ctx, s.tokenKey(key, tok), value, s.ttl)
+	dk, err := s.keyring.DataKey(key.Tenant, s.dataVersion)
+	if err != nil {
+		return "", err
+	}
+	aad := aeadAAD(key.Tenant, key.Namespace, tok, s.dataVersion, s.epoch)
+	nonce, ct, err := sealValue(dk, value, aad)
+	if err != nil {
+		return "", err
+	}
+	rec := TokenRecord{
+		KeyVersion:    s.dataVersion,
+		IdentityEpoch: s.epoch,
+		Nonce:         nonce,
+		Ciphertext:    ct,
+	}
+	if s.ttl > 0 {
+		rec.ExpiresAt = time.Now().Add(s.ttl)
+	}
+
+	current, _, err := s.cache.FindOrCreate(ctx, s.tokenKey(key, tok), rec.Encode(), s.ttl)
 	if err != nil {
 		return "", fmt.Errorf("%w: 签发令牌失败 / issuing token: %v", ErrTokenStore, err)
 	}
 
-	// 键已存在时，按派生方式它必然映射到同一个原值。这里核对而不是假定。
+	// 无论是本次创建的还是已存在的，都把权威记录解开核对一次再返回。
 	//
-	// 不符只可能出于两件事——HMAC 碰撞（可忽略），或者两套不同的密钥环写进了
-	// 同一个缓存前缀（配置错误）。后者会让一个租户的令牌解析出另一份数据，
-	// 必须响亮地失败，不能沉默地返回。
+	// 这不是多余的谨慎：Issue 的契约是「返回的令牌立即可 Resolve」，而这条
+	// 契约的唯一诚实证明方式，就是在返回之前真的解一次。已存在的记录可能
+	// 来自另一个数据密钥版本（轮换期间的正常情况），也可能来自另一套密钥环
+	// 误写进同一前缀（配置错误）——前者必须解得开，后者必须响亮失败，
+	// 而不是沉默地把一个解不开的令牌交出去。
 	//
-	// 核对现在是纯本地比较：FindOrCreate 已经把权威值带回来了，不再需要
-	// 一次额外的读，因此这条检查也不再有自己的过期窗口。
-	//
-	// A mismatch means either an HMAC collision (negligible) or two keyrings
-	// under one cache prefix (misconfiguration) — the latter would resolve one
-	// tenant's token to another's data and must fail loudly. The check is now a
-	// local comparison: FindOrCreate already returned the authoritative value,
-	// so it no longer carries an expiry window of its own.
-	if current != value {
+	// Issue promises the token resolves immediately, and the only honest proof
+	// is to open it before returning. An existing record may come from another
+	// data key version (normal during rotation) or from a different keyring
+	// written under the same prefix (misconfiguration): the first must open,
+	// the second must fail loudly rather than hand back an unusable token.
+	plain, err := s.decodeAndOpen(key, tok, current)
+	if err != nil {
+		return "", err
+	}
+	if plain != value {
 		return "", fmt.Errorf(
 			"%w: 令牌 %s 已映射到另一个值——同一前缀下混用了不同的密钥环，"+
 				"继续下去会让一个租户的令牌解析出另一份数据 / token collision",
@@ -559,16 +675,61 @@ func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string)
 	return tok, nil
 }
 
+// decodeAndOpen 解析记录并认证解密。
+//
+// 记录里的 KeyVersion 决定用哪一代数据密钥，而不是用当前版本去撞——
+// 这正是轮换之后旧记录仍然解得开的原因。IdentityEpoch 与 KeyVersion 同时
+// 进 AAD，因此改标签不会让记录降级到另一把密钥，只会认证失败。
+//
+// The record names the data key version to derive, rather than the current one
+// being assumed, which is why rotation does not orphan old records. Both labels
+// enter the AAD, so relabelling fails authentication instead of downgrading.
+func (s *CacheTokenStore) decodeAndOpen(key TokenKey, token, raw string) (string, error) {
+	rec, err := DecodeTokenRecord(raw)
+	if err != nil {
+		return "", err
+	}
+	dk, err := s.keyring.DataKey(key.Tenant, rec.KeyVersion)
+	if err != nil {
+		return "", err
+	}
+	aad := aeadAAD(key.Tenant, key.Namespace, token, rec.KeyVersion, rec.IdentityEpoch)
+	return openValue(dk, rec.Nonce, rec.Ciphertext, aad)
+}
+
 // Resolve implements TokenStore.
 func (s *CacheTokenStore) Resolve(ctx context.Context, key TokenKey, token string) (string, bool, error) {
 	if err := key.Validate(); err != nil {
 		return "", false, err
 	}
-	v, ok, err := s.cache.Get(ctx, s.tokenKey(key, token))
+	raw, ok, err := s.cache.Get(ctx, s.tokenKey(key, token))
 	if err != nil {
 		return "", false, fmt.Errorf("%w: 解析令牌失败 / resolving token: %v", ErrTokenStore, err)
 	}
-	return v, ok, nil
+	if !ok {
+		return "", false, nil
+	}
+
+	rec, err := DecodeTokenRecord(raw)
+	if err != nil {
+		return "", false, err
+	}
+	// 记录里存了到期时刻，因此不必信任后端的 TTL：后端把键留久了，
+	// 这里仍然按记录判过期。过期返回 (false, nil) 而不是报错——
+	// 「这个令牌已经不在了」是确定的答案，不是故障。
+	//
+	// The record carries its own expiry, so a backend keeping the key longer
+	// than intended does not extend the mapping. An expired record is a
+	// definite answer, not a failure.
+	if rec.Expired(time.Now()) {
+		return "", false, nil
+	}
+
+	plain, err := s.decodeAndOpen(key, token, raw)
+	if err != nil {
+		return "", false, err
+	}
+	return plain, true, nil
 }
 
 // Clear implements TokenStore.
@@ -650,6 +811,11 @@ type SQLTokenStore struct {
 	keyring *Keyring
 	table   string
 	ttl     time.Duration
+
+	// dataVersion 是新行使用的数据密钥版本。旧行的 key_version 为空，
+	// 按遗留方式解密——见 openRow。
+	// New rows use this version; legacy rows have an empty key_version.
+	dataVersion DataKeyVersion
 }
 
 // NewSQLTokenStore builds a database-backed token store.
@@ -667,7 +833,10 @@ func NewSQLTokenStore(db SQLExecutor, keyring *Keyring, table string, ttl time.D
 	if !safeIdentifier(table) {
 		return nil, fmt.Errorf("%w: 表名 %q 非法 / invalid table name", ErrTokenStore, table)
 	}
-	return &SQLTokenStore{db: db, keyring: keyring, table: table, ttl: ttl}, nil
+	return &SQLTokenStore{
+		db: db, keyring: keyring, table: table, ttl: ttl,
+		dataVersion: DefaultDataKeyVersion,
+	}, nil
 }
 
 // Schema returns the DDL this store expects.
@@ -683,6 +852,8 @@ func (s *SQLTokenStore) Schema() string {
   token         CHAR(32)     NOT NULL,
   value_digest  CHAR(64)     NOT NULL,
   value_cipher  BLOB         NOT NULL,
+  value_nonce   BLOB         NULL,
+  key_version   VARCHAR(16)  NULL,
   expires_at    BIGINT       NULL,
   PRIMARY KEY (tenant_id, namespace, token),
   UNIQUE (tenant_id, namespace, value_digest)
@@ -703,63 +874,91 @@ func (s *SQLTokenStore) digest(key TokenKey, value string) (string, error) {
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
-// seal encrypts a value under the tenant's key.
-// 用租户密钥加密一个值。
-func (s *SQLTokenStore) seal(tenant Tenant, value string) ([]byte, error) {
-	k, err := s.keyring.Key(tenant)
+// sealRow 加密一行的值，返回 nonce、密文与所用的密钥版本。
+//
+// 用 K_data_vN 而不是那把通用租户密钥：后者同时被 HMAC 用作 digest 密钥，
+// 一把密钥承担 HMAC 与 AES-GCM 两种代数结构没有安全证明可依。
+// 见 Keyring.DataKey。
+//
+// AAD 绑定 (租户, 命名空间, 令牌, 密钥版本, 身份 epoch)。旧版只绑租户，
+// 因此一行密文可以被搬到同租户的另一个令牌下照常解开——那正是这次收紧
+// 要堵的搬运。
+//
+// Uses K_data_vN rather than the general-purpose tenant key, which also served
+// as an HMAC key. The AAD now binds the namespace, token, key version and
+// epoch: the previous version bound only the tenant, so a ciphertext could be
+// moved to another token in the same tenant and still open.
+func (s *SQLTokenStore) sealRow(key TokenKey, token, value string) (
+	nonce, ct []byte, version DataKeyVersion, err error) {
+	dk, err := s.keyring.DataKey(key.Tenant, s.dataVersion)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
-	gcm, err := newGCM(k)
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("%w: 生成 nonce 失败 / generating nonce: %v", ErrTokenStore, err)
-	}
-	// The tenant is authenticated additional data: a ciphertext row moved to
-	// another tenant's rows then fails to open rather than decrypting cleanly.
-	// 租户作为附加认证数据：一行密文被挪到另一个租户名下时会解不开，
-	// 而不是干干净净地解密出来。
-	return gcm.Seal(nonce, nonce, []byte(value), []byte(tenant)), nil
+	aad := aeadAAD(key.Tenant, key.Namespace, token, s.dataVersion, sqlIdentityEpoch)
+	nonce, ct, err = sealValue(dk, value, aad)
+	return nonce, ct, s.dataVersion, err
 }
 
-// open decrypts a value.
-// 解密一个值。
-func (s *SQLTokenStore) open(tenant Tenant, cipherText []byte) (string, error) {
-	k, err := s.keyring.Key(tenant)
+// openRow 解密一行，按行里记录的密钥版本选择密钥。
+//
+// # 空的 key_version 是遗留行，必须仍然解得开
+// # An empty key_version marks a legacy row that must still open
+//
+// 本次整改之前写入的行没有 key_version、没有独立 nonce（nonce 拼在密文
+// 前面），且 AAD 只绑了租户。直接切到新方案会让这些行全部解不开——
+// 那不是「轮换」，那是数据丢失。因此保留一条遗留路径，按老规则解它们。
+//
+// 遗留路径只读不写：新行一律走新方案。随着 TTL 到期，遗留行自然消失。
+//
+// Rows written before this change carry no key version, no separate nonce (it
+// was prefixed to the ciphertext) and an AAD binding only the tenant. Switching
+// outright would make every one of them unreadable, which is data loss rather
+// than rotation. The legacy path is read-only; new rows always use the new
+// scheme and legacy rows drain away with their TTL.
+func (s *SQLTokenStore) openRow(key TokenKey, token string, version DataKeyVersion,
+	nonce, ct []byte) (string, error) {
+	if version == "" {
+		legacyKey, err := s.keyring.Key(key.Tenant)
+		if err != nil {
+			return "", err
+		}
+		gcm, err := newGCM(legacyKey)
+		if err != nil {
+			return "", err
+		}
+		if len(ct) < gcm.NonceSize() {
+			return "", fmt.Errorf("%w: 遗留密文过短 / legacy ciphertext too short",
+				ErrTokenStore)
+		}
+		n, body := ct[:gcm.NonceSize()], ct[gcm.NonceSize():]
+		plain, err := gcm.Open(nil, n, body, []byte(key.Tenant))
+		if err != nil {
+			return "", fmt.Errorf("%w: 遗留行认证解密失败 / legacy decryption failed",
+				ErrTokenStore)
+		}
+		return string(plain), nil
+	}
+
+	dk, err := s.keyring.DataKey(key.Tenant, version)
 	if err != nil {
 		return "", err
 	}
-	gcm, err := newGCM(k)
-	if err != nil {
-		return "", err
-	}
-	if len(cipherText) < gcm.NonceSize() {
-		return "", fmt.Errorf("%w: 密文过短 / ciphertext too short", ErrTokenStore)
-	}
-	nonce, body := cipherText[:gcm.NonceSize()], cipherText[gcm.NonceSize():]
-	plain, err := gcm.Open(nil, nonce, body, []byte(tenant))
-	if err != nil {
-		return "", fmt.Errorf("%w: 解密失败 / decryption failed: %v", ErrTokenStore, err)
-	}
-	return string(plain), nil
+	aad := aeadAAD(key.Tenant, key.Namespace, token, version, sqlIdentityEpoch)
+	return openValue(dk, nonce, ct, aad)
 }
 
-// newGCM builds an AES-GCM cipher.
-// 构造 AES-GCM。
-func newGCM(key []byte) (cipher.AEAD, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("%w: 构造分组密码失败 / building cipher: %v", ErrTokenStore, err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("%w: 构造 GCM 失败 / building GCM: %v", ErrTokenStore, err)
-	}
-	return gcm, nil
-}
+// sqlIdentityEpoch 是 SQL 后端在 AAD 里使用的身份 epoch 常量。
+//
+// SQL 的令牌是随机生成后存下来的，不是派生的，因此它没有「身份随密钥轮换
+// 而改变」的问题，也就不需要一个会变的 epoch。这里放一个固定值只是为了让
+// 两个后端共用同一个 AAD 组装函数——把它做成可变量会暗示一个 SQL 并不具备
+// 的语义。
+//
+// SQL tokens are random and stored rather than derived, so they have no
+// identity-rotation problem and need no varying epoch. The constant exists so
+// both backends share one AAD builder; making it configurable would imply a
+// semantic SQL does not have.
+const sqlIdentityEpoch TokenIdentityEpoch = "sql"
 
 // Issue implements TokenStore.
 func (s *SQLTokenStore) Issue(ctx context.Context, key TokenKey, value string) (string, error) {
@@ -790,7 +989,11 @@ func (s *SQLTokenStore) Issue(ctx context.Context, key TokenKey, value string) (
 	if err != nil {
 		return "", err
 	}
-	sealed, err := s.seal(key.Tenant, value)
+	// 令牌先生成再加密：令牌进 AAD，因此密文与它绑定，
+	// 一行密文被搬到另一个令牌下会认证失败。
+	// The token is generated first because it enters the AAD, binding the
+	// ciphertext to it: moving a row to another token fails authentication.
+	nonce, sealed, version, err := s.sealRow(key, tok, value)
 	if err != nil {
 		return "", err
 	}
@@ -800,9 +1003,44 @@ func (s *SQLTokenStore) Issue(ctx context.Context, key TokenKey, value string) (
 	}
 
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(
-		`INSERT INTO %s (tenant_id, namespace, token, value_digest, value_cipher, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`, s.table),
-		string(key.Tenant), key.Namespace, tok, dig, sealed, expires); err != nil {
+		`INSERT INTO %s (tenant_id, namespace, token, value_digest, value_cipher,
+		                 value_nonce, key_version, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, s.table),
+		string(key.Tenant), key.Namespace, tok, dig, sealed,
+		nonce, string(version), expires); err != nil {
+		// 插入失败时先回头看一眼：唯一约束是并发的正常结果，不是故障。
+		//
+		// # 输家必须采纳赢家，而不是报错
+		// # The loser must adopt the winner rather than fail
+		//
+		// SELECT 与 INSERT 之间有间隙，两个副本会同时落空、同时插入，
+		// 而 UNIQUE (tenant, namespace, value_digest) 会拒绝后到的那个。
+		// 原来的代码把这个拒绝当成写入故障直接抛出——实测真库语义下
+		// 32 次并发签发有 4 次直接失败。它没有产生第二个令牌（约束挡住了），
+		// 但调用方拿到的是错误，而正确结果是赢家那个令牌。
+		//
+		// 这不是补偿回滚：没有任何东西被撤销。原子性来自数据库的唯一约束
+		// 本身，这里只是把「约束告诉我已经有一个了」翻译成「用那一个」。
+		//
+		// 之前这个缺陷被假 DB 藏住了：它用一把全局锁把 SELECT 与 INSERT
+		// 串起来，比真数据库更原子，于是冲突从未发生。
+		//
+		// The gap between SELECT and INSERT lets two replicas both miss and
+		// both insert, with the UNIQUE constraint rejecting the later one. That
+		// rejection was raised as a write failure — measured, 4 of 32
+		// concurrent issues failed outright. No second token was created, but
+		// the caller got an error where the winner's token was the right
+		// answer. This is not a compensating rollback: nothing is undone.
+		// Atomicity comes from the constraint itself; this only translates
+		// "one already exists" into "use that one".
+		var winner string
+		row := s.db.QueryRowContext(ctx, fmt.Sprintf(
+			`SELECT token FROM %s WHERE tenant_id = ? AND namespace = ? AND value_digest = ?
+			   AND (expires_at IS NULL OR expires_at > ?)`, s.table),
+			string(key.Tenant), key.Namespace, dig, time.Now().Unix())
+		if scanErr := row.Scan(&winner); scanErr == nil {
+			return winner, nil
+		}
 		return "", fmt.Errorf("%w: 写入令牌失败 / storing token: %v", ErrTokenStore, err)
 	}
 	return tok, nil
@@ -814,19 +1052,26 @@ func (s *SQLTokenStore) Resolve(ctx context.Context, key TokenKey, token string)
 		return "", false, err
 	}
 
-	var sealed []byte
+	var (
+		sealed  []byte
+		nonce   []byte
+		version string
+	)
 	row := s.db.QueryRowContext(ctx, fmt.Sprintf(
-		`SELECT value_cipher FROM %s WHERE tenant_id = ? AND namespace = ? AND token = ?
+		`SELECT value_cipher, value_nonce, key_version FROM %s
+		   WHERE tenant_id = ? AND namespace = ? AND token = ?
 		   AND (expires_at IS NULL OR expires_at > ?)`, s.table),
 		string(key.Tenant), key.Namespace, token, time.Now().Unix())
-	switch err := row.Scan(&sealed); {
+	switch err := row.Scan(&sealed, &nonce, &version); {
 	case errors.Is(err, ErrSQLNoRows):
 		return "", false, nil
 	case err != nil:
 		return "", false, fmt.Errorf("%w: 解析令牌失败 / resolving token: %v", ErrTokenStore, err)
 	}
 
-	value, err := s.open(key.Tenant, sealed)
+	// 按行里记的版本解密。空版本是本次整改之前写入的遗留行，走遗留路径。
+	// Decrypt under the version the row names; an empty one is a legacy row.
+	value, err := s.openRow(key, token, DataKeyVersion(version), nonce, sealed)
 	if err != nil {
 		return "", false, err
 	}
