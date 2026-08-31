@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,13 +23,45 @@ import (
 type fakeCache struct {
 	mu      sync.Mutex
 	data    map[string]string
+	ttls    map[string]time.Duration
 	failGet bool
 	getN    int
 	setN    int
+
+	// failSetNXFrom 让第 N 次（1 起数）及之后的写入失败，用于制造两键写
+	// 只成功一半的撕裂状态——那是分布式缓存里真实会发生的事，
+	// 而它的后果不在失败的那次调用上，在之后每一次调用上。
+	//
+	// Makes the Nth SetNX onward fail, producing the half-written state a
+	// distributed cache really produces. Its damage lands not on the failing
+	// call but on every call after it.
+	failSetNXFrom int
 }
 
 func newFakeCache() *fakeCache {
-	return &fakeCache{data: map[string]string{}}
+	return &fakeCache{data: map[string]string{}, ttls: map[string]time.Duration{}}
+}
+
+// ttlOf 返回某个键写入时用的 TTL，供不变量断言使用。
+func (c *fakeCache) ttlOf(key string) (time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.ttls[key]
+	return d, ok
+}
+
+// keysWith 返回含某个中缀的键，用来分辨正向与反向映射。
+func (c *fakeCache) keysWith(infix string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for k := range c.data {
+		if strings.Contains(k, infix) {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (c *fakeCache) Get(_ context.Context, key string) (string, bool, error) {
@@ -42,14 +75,18 @@ func (c *fakeCache) Get(_ context.Context, key string) (string, bool, error) {
 	return v, ok, nil
 }
 
-func (c *fakeCache) SetNX(_ context.Context, key, value string, _ time.Duration) (bool, error) {
+func (c *fakeCache) SetNX(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.setN++
+	if c.failSetNXFrom > 0 && c.setN >= c.failSetNXFrom {
+		return false, errors.New("模拟的写入故障 / simulated write failure")
+	}
 	if _, exists := c.data[key]; exists {
 		return false, nil
 	}
 	c.data[key] = value
+	c.ttls[key] = ttl
 	return true, nil
 }
 

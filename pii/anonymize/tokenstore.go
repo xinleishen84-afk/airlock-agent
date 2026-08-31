@@ -424,11 +424,63 @@ func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string)
 		return "", err
 	}
 
-	// Forward mapping first, set-if-absent: whoever wins this race defines the
-	// token, and the loser adopts it. Writing the reverse mapping first would
-	// leave an orphan token→value entry behind on every lost race.
-	// 先写正向映射，且「不存在才写」：竞争的胜者定义令牌，败者采纳它。
-	// 先写反向映射会让每一次竞争失败都留下一条孤儿的「令牌→原值」记录。
+	// 反向映射先写，正向映射后写。顺序是这里唯一的保护，两个方向都要交代。
+	//
+	// # 写失败时：先写正向会留下一个「谁也还原不了」的令牌，且永久生效
+	//
+	// 曾经是先写正向。反向那次写失败时，Issue 会报错——看起来是安全的，
+	// 但正向那条记录留下了。下一次同一个值进来，走开头的快路径直接命中，
+	// **成功返回**那个令牌，而它在缓存里没有对应的反向记录。
+	//
+	// 实测：那个令牌会进入出站载荷，模型带回来后 Resolve 返回 ok=false，
+	// 被当成模型捏造的幻影，真值永远还不回去。而且这不是一次性的——
+	// 每一次针对同一个值的调用都会返回同一个坏令牌，直到 TTL 到期。
+	//
+	// 反过来写就没有这个状态：反向写失败则什么都没留下；正向写失败则只留下
+	// 一条没人指向的反向记录，它是垃圾但无害，到期自己消失。**不存在
+	// 「正向记录指向一条不存在的反向记录」这个状态。**
+	//
+	// # 过期时：反向必须比正向活得久
+	//
+	// 只调换顺序还不够。两次写差着几毫秒，同样的 TTL 意味着先写的先过期
+	// ——反向先写就先过期，于是在正向过期前的那一小段时间里，快路径又会
+	// 返回一个还原不了的令牌。这正是原来那个顺序碰巧避开的边。
+	//
+	// 所以反向 TTL 加一个余量，让正向**总是先过期**。余量只需覆盖两次写
+	// 之间的间隔与缓存节点间的时钟偏移，不按 TTL 比例放大：反向记录里存的
+	// 是明文原值，多活一秒就是 PII 多留一秒。
+	//
+	// Reverse first, forward second. The ordering is the whole protection here.
+	//
+	// Forward-first left a token nothing could resolve, permanently: when the
+	// reverse write failed, Issue returned an error while the forward entry
+	// survived, so the next call for that value hit the fast path and
+	// *succeeded*, handing back a token with no reverse entry. Measured: it
+	// reaches the model, comes back, Resolve reports ok=false, and it is treated
+	// as a model-invented phantom — for every subsequent call until the TTL.
+	//
+	// Reverse-first has no such state: a failed reverse write leaves nothing,
+	// and a failed forward write leaves only an unreferenced reverse entry that
+	// expires on its own.
+	//
+	// Ordering alone is not enough. The two writes are milliseconds apart, so
+	// with equal TTLs whichever is written first expires first — the reverse
+	// would expire while the forward still answers. The margin makes the forward
+	// always expire first. It covers the inter-write gap and node clock skew
+	// only, and is not scaled with the TTL: the reverse entry holds the
+	// plaintext, so every extra second is a second more of PII retention.
+	if _, err := s.cache.SetNX(ctx, s.tokenKey(key, tok), value, s.reverseTTL()); err != nil {
+		return "", fmt.Errorf("%w: 写入反向映射失败 / storing reverse mapping: %v", ErrTokenStore, err)
+	}
+
+	// 正向映射用「不存在才写」：两个副本同时令牌化同一个值时必须收敛到
+	// 同一个令牌，直接写会让后写者覆盖掉先写者已经返回给调用方的那个。
+	// 竞争失败时，我们刚写的那条反向记录成为无人指向的垃圾，到期消失——
+	// 用一条会自己过期的垃圾换「令牌一定可还原」，这个交换是划算的。
+	//
+	// Set-if-absent on the forward mapping so concurrent replicas converge on
+	// one token. A lost race orphans the reverse entry just written; trading a
+	// self-expiring orphan for "every issued token resolves" is worth it.
 	stored, err := s.cache.SetNX(ctx, vk, tok, s.ttl)
 	if err != nil {
 		return "", fmt.Errorf("%w: 写入令牌失败 / storing token: %v", ErrTokenStore, err)
@@ -439,21 +491,38 @@ func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string)
 			return "", fmt.Errorf("%w: 读取竞争结果失败 / reading race winner: %v", ErrTokenStore, err)
 		}
 		if !ok {
-			// Set-if-absent refused and the key is gone: it expired between the
-			// two calls. Reporting an error beats returning a token nothing
-			// can resolve.
 			// 「不存在才写」被拒、键又不在了：它在两次调用之间过期了。
 			// 报错好过返回一个谁也解析不了的令牌。
+			// Set-if-absent refused and the key is gone: it expired between the
+			// two calls. Reporting an error beats returning an unresolvable
+			// token.
 			return "", fmt.Errorf("%w: 令牌在写入竞争中过期，请重试 / token expired mid-race",
 				ErrTokenStore)
 		}
 		return winner, nil
 	}
-
-	if _, err := s.cache.SetNX(ctx, s.tokenKey(key, tok), value, s.ttl); err != nil {
-		return "", fmt.Errorf("%w: 写入反向映射失败 / storing reverse mapping: %v", ErrTokenStore, err)
-	}
 	return tok, nil
+}
+
+// reverseTTLMargin 是反向映射比正向多活的时长。
+//
+// 只用来覆盖两次写之间的间隔与缓存节点间的时钟偏移，不随 TTL 比例放大：
+// 反向记录里存的是明文原值，这个余量有多长，PII 就多留多久。
+//
+// Covers the inter-write gap and node clock skew only. It is deliberately not
+// proportional to the TTL: the reverse entry holds the plaintext, so this
+// constant is measured in extra PII retention.
+const reverseTTLMargin = 30 * time.Second
+
+// reverseTTL 返回反向映射的存活时长。
+//
+// ttl 为 0 表示永不过期，此时余量没有意义——两边都不过期，正向不可能先到期。
+// A zero TTL means no expiry, where the margin is meaningless.
+func (s *CacheTokenStore) reverseTTL() time.Duration {
+	if s.ttl == 0 {
+		return 0
+	}
+	return s.ttl + reverseTTLMargin
 }
 
 // Resolve implements TokenStore.
