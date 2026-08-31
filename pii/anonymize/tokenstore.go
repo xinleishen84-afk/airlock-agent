@@ -325,18 +325,65 @@ type Cache interface {
 	// 取值；ok=false 表示键不存在。
 	Get(ctx context.Context, key string) (string, bool, error)
 
-	// SetNX stores a value only if the key is absent, reporting whether it
-	// stored. TTL of zero means no expiry.
-	// 仅当键不存在时写入，并报告是否写入。ttl 为 0 表示不过期。
+	// FindOrCreate atomically returns the value under key, creating it with
+	// value when absent. It returns whichever value is authoritative afterward.
+	// 原子地返回 key 上的值；键不存在时以 value 创建。
+	// 无论走哪条路，返回的都是此后权威的那个值。
 	//
-	// Set-if-absent rather than Set: two gateway replicas tokenizing the same
-	// value at the same moment must converge on one token, and a plain Set
-	// lets the later writer overwrite the token the earlier one already
-	// returned to a caller.
-	// 用「不存在才写」而非「直接写」：两个网关副本同时令牌化同一个值时
-	// 必须收敛到同一个令牌，而直接写会让后写者覆盖掉先写者已经返回给
-	// 调用方的那个令牌。
-	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
+	// # 这个接口为什么是「映射级」而不是「原语级」
+	// # Why this is a mapping-level operation rather than a primitive
+	//
+	// 它取代的是 SetNX。SetNX 返回的是「我存进去了吗」，而调用方真正要的是
+	// 「这个键上权威的值是什么」——于是每个调用方都得在 SetNX 返回 false 之后
+	// 再补一次 Get。那次补读不在同一个原子步骤里：两次调用之间键可能过期，
+	// 于是每个调用方还得各自处理「刚被拒绝、现在又不存在了」这个状态。
+	//
+	// 把「检查—创建—取回」压成一个操作，是把正确性的负担从每一个调用方
+	// 移到唯一的实现方。这不是省一次往返的问题：组合处正是撕裂发生的地方，
+	// 而组合是每个调用方各写一遍的。
+	//
+	// SetNX answers "did I store it" while callers need "what is authoritative
+	// here", forcing every caller to follow up with a Get that is not in the
+	// same atomic step — and to handle the key having expired in between.
+	// Collapsing check-create-read into one operation moves the correctness
+	// burden from every call site to the single implementation. The point is
+	// not the saved round trip: composition is where tearing happens, and
+	// composition is what each caller writes for itself.
+	//
+	// # 实现方必须保证的
+	// # What an implementation must guarantee
+	//
+	// 原子：不存在任何时刻，别的调用方能观察到「键已被检查但尚未创建」。
+	// 两个并发调用必须线性化——恰好一个拿到 created=true，其余拿到
+	// created=false 与同一个 current 值。
+	//
+	// 直接写（Set）不行：两个副本同时令牌化同一个值时必须收敛到同一个令牌，
+	// 而直接写会让后写者覆盖掉先写者已经返回给调用方的那个。
+	//
+	// Redis 6.2 起可用 SET key val NX GET EX ttl 一条命令做到；更早的版本
+	// 用 Lua 脚本。做不到原子的存储不应实现这个接口——一个「大概率原子」的
+	// 实现比没有更糟，因为调用方会按契约去信任它。
+	//
+	// Atomic: no other caller may observe a moment where the key has been
+	// checked but not yet created. Two concurrent calls must linearize —
+	// exactly one gets created=true, the rest get created=false and the same
+	// current value. A plain Set is not acceptable: concurrent replicas
+	// tokenizing one value must converge, and Set lets a later writer clobber
+	// the token an earlier one already returned to its caller.
+	//
+	// Redis 6.2+ does this in one command (SET key val NX GET EX ttl); earlier
+	// versions need a Lua script. A store that cannot do it atomically should
+	// not implement this interface: a "usually atomic" implementation is worse
+	// than none, because callers trust the contract.
+	//
+	// ttl 为 0 表示不过期。仅在 created=true 时设置 ttl——键已存在时不得
+	// 续期，否则一条被反复读到的映射会永远不过期，而 TTL 正是 PII 保留期。
+	//
+	// A zero TTL means no expiry. The TTL applies only when created: an
+	// existing key must not be refreshed, or a frequently-read mapping would
+	// never expire — and that TTL is the PII retention period.
+	FindOrCreate(ctx context.Context, key, value string, ttl time.Duration) (
+		current string, created bool, err error)
 
 	// DeleteByPrefix removes every key under a prefix and returns the count.
 	// 删除某前缀下的全部键并返回条数。
@@ -458,25 +505,23 @@ func (s *CacheTokenStore) tokenKey(k TokenKey, token string) string {
 
 // Issue implements TokenStore.
 //
-// # 一次写，因此没有可观察的中间态
-// # One write, therefore no observable intermediate state
+// # 一次调用，因此没有可观察的中间态
+// # One call, therefore no observable intermediate state
 //
-// 令牌由 deriveToken 从原值确定性算出，所以本方法只需要落一个键
-// 「令牌 → 原值」。安全不变量因此不是靠顺序或补偿撑起来的：
+// 令牌由 deriveToken 从原值确定性算出，映射由 Cache.FindOrCreate 一步落定。
+// 安全不变量因此不是靠顺序、补偿或进程内锁撑起来的：
 //
-//   - Issue 返回的令牌立即可 Resolve：返回之前，那个键要么是本次写成功的，
-//     要么是已经存在且经过核对的。
-//   - 不存在「正向存在而反向不存在」：只有一个映射，没有第二个键可以撕裂。
-//   - 并发签发线性化到同一个令牌：并发的各方算出的是同一个令牌，
-//     它们不是竞争一个赢家，而是由构造方式直接达成一致。
-//   - 崩溃与超时：崩在写之前什么都没有，崩在写之后是完整的；
-//     超时含义不明时下一次调用算出同一个令牌，SetNX 要么写入要么发现已在。
-//   - 不依赖进程内 mutex，也不需要补偿回滚——没有第二步可回滚。
+//   - Issue 返回的令牌立即可 Resolve：FindOrCreate 返回的 current 就是此后
+//     权威的那个值，不需要再补一次读去确认。
+//   - 不存在「forward 存在而 reverse 不存在」：只有一个映射，没有第二个键。
+//   - 并发签发线性化：各方算出同一个令牌，FindOrCreate 保证恰好一个创建、
+//     其余拿到同一个 current。
+//   - 崩溃与超时：单次调用要么发生要么没发生；超时含义不明时，下一次调用
+//     算出同一个令牌，FindOrCreate 要么创建要么返回已有的。
+//   - 不依赖进程内 mutex，也没有第二步可回滚。
 //
-// Tokens are derived from the value, so exactly one key is written. The safety
-// invariants therefore do not rest on ordering or compensation: there is no
-// second key to tear, concurrent callers agree by construction rather than by
-// racing, and a crash either leaves nothing or leaves a complete record.
+// Tokens are derived from the value and the mapping lands in one call. The
+// invariants rest on neither ordering, compensation, nor an in-process lock.
 func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string) (string, error) {
 	if err := key.Validate(); err != nil {
 		return "", err
@@ -485,44 +530,27 @@ func (s *CacheTokenStore) Issue(ctx context.Context, key TokenKey, value string)
 	if err != nil {
 		return "", err
 	}
-	tk := s.tokenKey(key, tok)
 
-	stored, err := s.cache.SetNX(ctx, tk, value, s.ttl)
+	current, _, err := s.cache.FindOrCreate(ctx, s.tokenKey(key, tok), value, s.ttl)
 	if err != nil {
-		return "", fmt.Errorf("%w: 写入令牌失败 / storing token: %v", ErrTokenStore, err)
-	}
-	if stored {
-		return tok, nil
+		return "", fmt.Errorf("%w: 签发令牌失败 / issuing token: %v", ErrTokenStore, err)
 	}
 
-	// 键已存在。按派生方式它必然映射到同一个原值，但这里读回来核对一次，
-	// 而不是假定。
+	// 键已存在时，按派生方式它必然映射到同一个原值。这里核对而不是假定。
 	//
-	// 核对的成本是一次 Get，买到的是「Issue 返回的令牌一定解析成本次调用
-	// 的那个值」这条不变量在运行期被验证过，而不是被推理过。不符只可能出于
-	// 两件事——HMAC 碰撞（可忽略），或者两套不同的密钥环写进了同一个缓存
-	// 前缀（配置错误）。后者会让一个租户的令牌解析出另一份数据，
+	// 不符只可能出于两件事——HMAC 碰撞（可忽略），或者两套不同的密钥环写进了
+	// 同一个缓存前缀（配置错误）。后者会让一个租户的令牌解析出另一份数据，
 	// 必须响亮地失败，不能沉默地返回。
 	//
-	// Reading back costs one Get and buys the invariant being verified at
-	// runtime rather than reasoned about. A mismatch means either an HMAC
-	// collision (negligible) or two different keyrings writing under the same
-	// cache prefix (misconfiguration) — the latter would resolve one tenant's
-	// token to another's data and must fail loudly.
-	existing, ok, err := s.cache.Get(ctx, tk)
-	if err != nil {
-		return "", fmt.Errorf("%w: 核对已有令牌失败 / verifying existing token: %v",
-			ErrTokenStore, err)
-	}
-	if !ok {
-		// 「不存在才写」被拒、键又不在了：它在两次调用之间过期了。
-		// 报错好过返回一个谁也解析不了的令牌。
-		// Set-if-absent refused and the key is gone: it expired between the two
-		// calls. Reporting an error beats returning an unresolvable token.
-		return "", fmt.Errorf("%w: 令牌在写入与核对之间过期，请重试 / token expired mid-write",
-			ErrTokenStore)
-	}
-	if existing != value {
+	// 核对现在是纯本地比较：FindOrCreate 已经把权威值带回来了，不再需要
+	// 一次额外的读，因此这条检查也不再有自己的过期窗口。
+	//
+	// A mismatch means either an HMAC collision (negligible) or two keyrings
+	// under one cache prefix (misconfiguration) — the latter would resolve one
+	// tenant's token to another's data and must fail loudly. The check is now a
+	// local comparison: FindOrCreate already returned the authoritative value,
+	// so it no longer carries an expiry window of its own.
+	if current != value {
 		return "", fmt.Errorf(
 			"%w: 令牌 %s 已映射到另一个值——同一前缀下混用了不同的密钥环，"+
 				"继续下去会让一个租户的令牌解析出另一份数据 / token collision",

@@ -83,11 +83,11 @@ func TestIssuedTokenAlwaysResolves(t *testing.T) {
 			c := newFakeCache()
 			s := newTestCacheStore(t, c, time.Hour)
 
-			c.failSetNXFrom = tc.failNth
+			c.failWriteFrom = tc.failNth
 			if _, err := s.Issue(ctx, atomicityKey, value); tc.failNth > 0 && err == nil {
 				t.Fatal("写失败时 Issue 必须报错，不能悄悄返回一个没落地的令牌")
 			}
-			c.failSetNXFrom = 0
+			c.failWriteFrom = 0
 
 			tok, err := s.Issue(ctx, atomicityKey, value)
 			if err != nil {

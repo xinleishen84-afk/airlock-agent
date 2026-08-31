@@ -28,14 +28,9 @@ type fakeCache struct {
 	getN    int
 	setN    int
 
-	// failSetNXFrom 让第 N 次（1 起数）及之后的写入失败，用于制造两键写
-	// 只成功一半的撕裂状态——那是分布式缓存里真实会发生的事，
-	// 而它的后果不在失败的那次调用上，在之后每一次调用上。
-	//
-	// Makes the Nth SetNX onward fail, producing the half-written state a
-	// distributed cache really produces. Its damage lands not on the failing
-	// call but on every call after it.
-	failSetNXFrom int
+	// failWriteFrom 让第 N 次（1 起数）及之后的写入失败。
+	// Makes the Nth write onward fail.
+	failWriteFrom int
 }
 
 func newFakeCache() *fakeCache {
@@ -75,19 +70,32 @@ func (c *fakeCache) Get(_ context.Context, key string) (string, bool, error) {
 	return v, ok, nil
 }
 
-func (c *fakeCache) SetNX(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+// FindOrCreate 实现 Cache。
+//
+// 整个方法在同一把锁下完成「查—建—取回」，这正是接口要求的原子性：
+// 不存在任何时刻，别的调用方能观察到「键已被检查但尚未创建」。
+// 真实实现（Redis）用 SET NX GET 一条命令或 Lua 脚本达到同样效果。
+//
+// 注意 ttl 只在创建时写入：键已存在时不得续期，否则一条被反复读到的映射
+// 会永远不过期，而 TTL 正是 PII 的保留期。
+//
+// The whole method runs under one lock, which is the atomicity the interface
+// demands. The TTL is applied only on creation: refreshing an existing mapping
+// would make a frequently-read one immortal, and that TTL is PII retention.
+func (c *fakeCache) FindOrCreate(_ context.Context, key, value string,
+	ttl time.Duration) (string, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.setN++
-	if c.failSetNXFrom > 0 && c.setN >= c.failSetNXFrom {
-		return false, errors.New("模拟的写入故障 / simulated write failure")
+	if c.failWriteFrom > 0 && c.setN >= c.failWriteFrom {
+		return "", false, errors.New("模拟的写入故障 / simulated write failure")
 	}
-	if _, exists := c.data[key]; exists {
-		return false, nil
+	if existing, ok := c.data[key]; ok {
+		return existing, false, nil
 	}
 	c.data[key] = value
 	c.ttls[key] = ttl
-	return true, nil
+	return value, true, nil
 }
 
 func (c *fakeCache) DeleteByPrefix(_ context.Context, prefix string) (int, error) {
